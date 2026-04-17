@@ -1,0 +1,244 @@
+# Portico
+
+**Multi-location OpenVPN HTTP proxy gateway** — Docker Compose stack with a web control plane, Redis-backed assignment state, and on-demand per-port VPN workers.
+
+| | |
+|---|---|
+| **Repository** | [github.com/cipher-x-sudo/portico-proxy](https://github.com/cipher-x-sudo/portico-proxy) |
+| **Deployment** | Docker Compose (Linux, Windows Docker Desktop, macOS Docker Desktop) |
+| **License** | Add a `LICENSE` to your fork when redistributing; this README does not grant rights beyond upstream components. |
+
+---
+
+## Table of contents
+
+1. [Overview](#overview)  
+2. [Architecture](#architecture)  
+3. [Requirements](#requirements)  
+4. [Repository layout](#repository-layout)  
+5. [Quick start](#quick-start)  
+6. [Configuration](#configuration)  
+7. [Networking and endpoints](#networking-and-endpoints)  
+8. [Runtime behavior](#runtime-behavior)  
+9. [Operations](#operations)  
+10. [Security](#security)  
+11. [Troubleshooting](#troubleshooting)  
+12. [Host utilities](#host-utilities)  
+13. [Disclaimer](#disclaimer)
+
+---
+
+## Overview
+
+Portico exposes **one TCP listener per logical location** (configurable count). Until a port is **activated**, connections are rejected. After activation, the gateway starts a **worker container** running OpenVPN plus an HTTP proxy, forwards client traffic when the proxy is ready, and tears workers down after **idle** periods (no proxy traffic; activity resets the timer). A **dashboard** drives assignments, activation, and diagnostics; state persists in **Redis** and/or a JSON assignments file.
+
+**Design goals**
+
+- No OpenVPN or TAP installation on the host — workers carry the VPN data plane.  
+- Explicit activation and proxy authentication — avoid accidental open proxies.  
+- Observable stack: container logs, control API, dashboard status.
+
+---
+
+## Architecture
+
+Services are defined in `docker-compose.yml` and communicate on the internal **`proxynet`** bridge.
+
+```mermaid
+flowchart TB
+  subgraph clients["Clients"]
+    C["curl / apps / emulator"]
+  end
+  subgraph compose["Docker Compose"]
+    FE["portico-frontend :8080"]
+    GW["portico-gateway + Docker socket"]
+    R[("portico-redis AOF")]
+    W["portico-worker instances proxy-PORT"]
+  end
+  C -->|HTTP| FE
+  FE -->|/api/*| GW
+  GW --> R
+  GW -->|orchestrate| W
+```
+
+| Service | Image / name | Role |
+|--------|----------------|------|
+| **Frontend** | `portico-frontend` | Serves the SPA; reverse-proxies `/api/*` to the gateway. |
+| **Gateway** | `portico-gateway` | Config, listeners, control API, starts/stops workers via Docker API. |
+| **Redis** | `portico-redis` | Optional persistence for assignments and `activePorts` (see env). |
+| **Worker** | `portico-worker` (build) | Long-running image; runtime instances are **`proxy-<listenerPort>`**. |
+
+---
+
+## Requirements
+
+| Item | Notes |
+|------|--------|
+| **Docker** | Engine **24+** recommended; **Compose V2** (`docker compose`). |
+| **OS** | Linux x86_64/arm64 (as supported by base images), or **Docker Desktop** on Windows 10/11 / macOS. |
+| **Resources** | RAM and CPU scale with concurrent workers (`maxSlots`). Many listeners may require higher **`nofile`** ulimit (see `docker-compose.yml`). |
+| **Privileges** | Gateway mounts **`/var/run/docker.sock`** to orchestrate workers — treat the host as trusted. |
+| **Compliance** | You are responsible for VPN provider **terms of service** and local law; this software is infrastructure only. |
+
+---
+
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `docker-compose.yml` | Stack definition, published ports, env wiring. |
+| `backend/` | Gateway (`gateway.py`), Docker helpers, worker image context, **example** JSON configs. |
+| `frontend/` | Vite/React dashboard; production image serves static build via Nginx. |
+| `ovpn/` | Example tree layout; production `.ovpn` content usually supplied via **`OVPN_HOST_PATH`**. |
+| `.env.example` | Template for secrets and paths (copy to `.env`, never commit). |
+
+---
+
+## Quick start
+
+1. **Clone** and enter the repository root (directory containing `docker-compose.yml`).
+
+2. **Provision local files** from tracked templates:
+
+   ```bash
+   cp backend/openvpn-proxy-config.example.json backend/openvpn-proxy-config.json
+   cp backend/openvpn-proxy-assignments.example.json backend/openvpn-proxy-assignments.json
+   cp .env.example .env
+   ```
+
+   **Windows (PowerShell):**
+
+   ```powershell
+   Copy-Item backend\openvpn-proxy-config.example.json backend\openvpn-proxy-config.json
+   Copy-Item backend\openvpn-proxy-assignments.example.json backend\openvpn-proxy-assignments.json
+   Copy-Item .env.example .env
+   ```
+
+3. **Edit `.env`** — set at minimum:
+   - **`OVPN_HOST_PATH`** — absolute path to your `.ovpn` directory if `./ovpn` is incorrect (Windows: forward slashes, e.g. `E:/vpn/profiles`).
+   - **`OPENVPN_USERNAME`** / **`OPENVPN_PASSWORD`** if you are not using per-provider **`auth.txt`** files under `ovpn/`.
+
+4. **Build and start:**
+
+   ```bash
+   docker compose build
+   docker compose up -d
+   ```
+
+5. **Verify** — open the [dashboard](http://127.0.0.1:8080) and confirm **Status** loads without HTTP 502. Inspect services: `docker compose ps` and `docker compose logs -f gateway`.
+
+---
+
+## Configuration
+
+Runtime JSON is mounted at **`/config/openvpn-proxy-config.json`** inside the gateway. OpenVPN runs **inside workers**; you typically **omit** host-only keys such as `openvpnPath` and `forceBindIPPath` for Docker.
+
+| Key / group | Purpose |
+|---------------|---------|
+| **`locationSpec`** | Preferred template: `count`, `defaultOvpn` (path under the `ovpn` mount), `labelPrefix`, `randomAccessFirstN`. `count` must not exceed the number of published host ports in Compose (default **516** mappings, host **58000–58515** → container **50000–50515**). |
+| **`portBase`** | First listener port **inside** the gateway network namespace (default `50000`). |
+| **`proxyUsername`** / **`proxyPassword`** | HTTP proxy authentication presented to clients (optional; gateway may apply defaults — see dashboard). |
+| **`proxyListenHost`** | Bind address inside the gateway container (`127.0.0.1` vs `0.0.0.0`). Widen only with auth and host firewall awareness. |
+| **`internalPortBase`** | Internal pproxy port range for slots (default `51000`). |
+| **`maxSlots`** | Upper bound on concurrent worker containers. |
+| **`idleTimeoutMinutes`** | Idle eviction when no bytes traverse the proxy for a slot. |
+| **`autoActivateOnStartup`** | Whether persisted **`activePorts`** are started after gateway restart. |
+| **`useDocker`** / **`dockerImage`** / **`dockerNetwork`** / **`dockerOvpnVolume`** | Docker backend (`USE_DOCKER=1` in Compose). Defaults align with **`portico-worker`** and **`proxynet`**. |
+| **`randomizeCountry`** | Restricts random profile selection (`random` or ISO country code); see `backend/ovpn_filter.py`. |
+
+Legacy keys (`openvpnPath`, `forceBindIPPath`, `pythonPath`, `maxLocations`) exist for **non-container** runs of `gateway.py` and are **out of scope** for this deployment guide.
+
+---
+
+## Networking and endpoints
+
+| Exposure | Default bind | Description |
+|----------|----------------|-------------|
+| **Dashboard** | `127.0.0.1:8080` | Static UI; `/api/*` proxied to gateway. |
+| **Control API** | `127.0.0.1:49999` | JSON REST used by the UI (`/api/status`, `/api/activate`, …). |
+| **HTTP proxies** | `127.0.0.1:58000+` (host) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) must match the **left-hand** side of the port range in `docker-compose.yml`. |
+
+**Clients on the same machine** use `127.0.0.1` and the **published** host port. **Android emulator** uses host alias **`10.0.2.2`** (e.g. `10.0.2.2:58000`). For LAN devices, set gateway env **`CLIENT_PROXY_HOST`** to your host IP and ensure firewall rules allow the published ports.
+
+---
+
+## Runtime behavior
+
+1. **Inactive ports** — TCP connections are refused until an `.ovpn` is assigned and the port is **activated** (UI or `POST /api/activate?port=<port>`).  
+2. **Activation** — Gateway validates profile paths against the **`ovpn`** volume, schedules a worker, waits for HTTP proxy readiness, then forwards traffic.  
+3. **Concurrency** — At most **`maxSlots`** workers; additional activations queue or fail per implementation and logs.  
+4. **Idle shutdown** — Workers stop after **`idleTimeoutMinutes`** without proxy traffic; timer resets on payload bytes.  
+5. **Random-access rows** — `POST /api/randomize-port`, `POST /api/refresh-port`, `POST /api/extend-port` (see gateway and UI).  
+6. **Shutdown** — `docker compose down` signals the gateway; it stops dynamic **`proxy-<port>`** containers. **`stop_grace_period: 60s`** allows orderly teardown.
+
+---
+
+## Operations
+
+### Upgrades
+
+```bash
+docker compose pull   # if you later publish images to a registry
+docker compose build --no-cache
+docker compose up -d
+```
+
+### Backups
+
+- **`redis_data`** volume: AOF persistence for Redis state. Snapshot or replicate per your DR policy.  
+- **`backend/openvpn-proxy-assignments.json`**: file-based mirror of picks and `activePorts` when not using Redis, or when **`REDIS_ASSIGNMENTS_MIRROR_FILE=1`**.  
+- **Config**: keep `openvpn-proxy-config.json` and `.env` in a **secrets manager** or encrypted backup — not in Git.
+
+### Observability
+
+- `docker compose logs -f gateway` — control plane and worker spawn errors.  
+- `docker compose logs -f portico-frontend` — Nginx access/errors (upstream 502 indicates gateway unreachable).  
+- `docker logs proxy-<port>` — per-worker OpenVPN/pproxy output when the container still exists.
+
+### Windows host port reservations
+
+Hyper-V may reserve TCP ranges in the **51xxx** band. This project defaults to **58000–58515** on the host. Override with **`DOCKER_PROXY_HOST_PORT_FIRST`**, **`DOCKER_PROXY_HOST_LAST`**, and **`PUBLISHED_PROXY_PORT_BASE`** in `.env` if your environment conflicts.
+
+### Assignments file path
+
+Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount target if you use a custom compose layout.
+
+---
+
+## Security
+
+- **Docker socket** — The gateway can start arbitrary worker containers; isolate the daemon and restrict who can access the compose project directory.  
+- **Bind addresses** — Default Compose binds the UI, API, and proxy map to **127.0.0.1**. Expanding to `0.0.0.0` requires explicit threat modeling, **mandatory proxy authentication**, and host/network firewall rules.  
+- **Secrets** — Provider credentials belong in `.env` or `ovpn/**/auth.txt`, not in tracked JSON. Rotate credentials if a workstation or volume was compromised.  
+- **Control API** — Equivalent to administrative access; do not expose **`49999`** to untrusted networks without TLS termination and authentication in front (not included by default).
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Action |
+|--------|----------------|--------|
+| **502** on `/api/status` | Gateway not listening (crash loop, port bind, old image). | `docker compose logs gateway`; rebuild gateway; confirm config JSON exists and is valid. |
+| **`Rejecting connection on inactive port`** | Port not activated. | Assign `.ovpn`, activate in UI, wait for **active** state. |
+| **Wrong port from host** | Using container port instead of **published** port. | Use host map (e.g. **58000**), not **50000**, unless you intentionally publish 50000. |
+| **`files: []`** from `/api/ovpn-files` | Empty or wrong **`ovpn_data`** mount. | `docker exec portico-gateway ls -la /ovpn`; fix **`OVPN_HOST_PATH`**, recreate **`ovpn_data`** if needed (`docker compose down` then `docker volume rm ovpn_data` — **data loss**). |
+| **`exec /entrypoint.sh: no such file or directory`** | CRLF in worker `entrypoint.sh`. | `docker compose build worker --no-cache`; ensure `.gitattributes` keeps `*.sh` as LF. |
+| **Worker start timeout** | Bad profile, auth, or provider blocking. | Read `docker logs proxy-<port>` and gateway stderr for OpenVPN errors. |
+
+---
+
+## Host utilities
+
+Optional scripts (run on the host, outside containers):
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/align-location-ovpn-to-folder.py` | Bulk-align `locations[].ovpn` with files on disk. |
+| `scripts/scan_ovpn_providers.py` | Summarize `.ovpn` counts per top-level folder. |
+| `scripts/free-docker-proxy-ports.ps1` | Windows: address Hyper-V excluded TCP ranges (elevated PowerShell; see script header). |
+
+---
+
+## Disclaimer
+
+Portico is **infrastructure software**. You are solely responsible for compliance with your **VPN provider’s terms**, applicable **export and cryptography** rules, and **local regulations**. The authors and maintainers do not endorse unlawful use. **No warranty** is implied; operate production stacks under your organization’s change management, monitoring, and backup policies.

@@ -1,0 +1,100 @@
+# Portico — dynamic VPN proxy gateway + on-demand worker containers (Linux / Windows Docker Desktop).
+# One proxy port per location; gateway listens on portBase, portBase+1, ... (e.g. 50000-50515). Port range size must be >= number of locations.
+# ovpn_data: set OVPN_HOST_PATH in .env to your .ovpn folder (e.g. E:/FB/protonusa/ovpn on Windows). Default ./ovpn (run compose from repo root).
+#
+# The gateway may start extra worker containers (proxy-<port>) on proxynet. On SIGTERM/SIGINT it stops them
+# before exit; stop_grace_period on the gateway gives time for that during "docker compose down".
+
+services:
+  worker:
+    build:
+      context: ./backend
+      dockerfile: docker/worker/Dockerfile
+    image: portico-worker
+    entrypoint: ["/usr/bin/true"]
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    container_name: portico-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - proxynet
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ./backend
+      dockerfile: docker/gateway/Dockerfile
+    image: portico-gateway
+    container_name: portico-gateway
+    depends_on:
+      - worker
+      - redis
+    environment:
+      - USE_DOCKER=1
+      - DOCKER_IMAGE=portico-worker
+      - DOCKER_NETWORK=proxynet
+      - DOCKER_OVPN_VOLUME=ovpn_data
+      # OpenVPN provider credentials (set in .env; do not commit secrets)
+      - OPENVPN_USERNAME=${OPENVPN_USERNAME:-}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      # Path where ovpn_data is mounted inside gateway (must match worker /ovpn)
+      - DOCKER_OVPN_MOUNT=/ovpn
+      # Host-side ports shown in the UI (must match left side of proxy port mapping below).
+      # Default 58000+ avoids common Windows Hyper-V excluded ranges that break binds in 51k (e.g. 51273).
+      - PUBLISHED_PROXY_PORT_BASE=${PUBLISHED_PROXY_PORT_BASE:-58000}
+      # OVPN picks + activePorts (survives compose restarts; AOF volume below)
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_STATE_KEY=portico:assignments-state
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./backend/openvpn-proxy-config.json:/config/openvpn-proxy-config.json
+      - ./backend/openvpn-proxy-assignments.json:/config/openvpn-proxy-assignments.json
+      # Same bind/volume as workers so gateway can list and validate real .ovpn files (fixes UI showing config-only names missing on disk).
+      - ovpn_data:/ovpn:ro
+    ports:
+      - "127.0.0.1:49999:49999"           # control API bound to localhost only
+      # Container ports must equal portBase..portBase+N-1 from openvpn-proxy-config.json (here: 50000-50515 for up to 516 locations).
+      # Override DOCKER_PROXY_HOST_PORT_FIRST / DOCKER_PROXY_HOST_LAST (+ PUBLISHED_PROXY_PORT_BASE) in .env if these host ports conflict.
+      - "127.0.0.1:${DOCKER_PROXY_HOST_PORT_FIRST:-58000}-${DOCKER_PROXY_HOST_PORT_LAST:-58515}:50000-50515"
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    init: true
+    stop_grace_period: 60s
+    networks:
+      - proxynet
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: portico-frontend
+    container_name: portico-frontend
+    depends_on:
+      - gateway
+    ports:
+      - "127.0.0.1:8080:80"
+    networks:
+      - proxynet
+    restart: unless-stopped
+
+networks:
+  proxynet:
+    driver: bridge
+
+volumes:
+  redis_data:
+  # Bind-mount host folder with .ovpn files. On Windows set OVPN_HOST_PATH in .env to absolute path (e.g. E:\FB\protonusa\ovpn).
+  ovpn_data:
+    name: ovpn_data
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${OVPN_HOST_PATH:-./ovpn}

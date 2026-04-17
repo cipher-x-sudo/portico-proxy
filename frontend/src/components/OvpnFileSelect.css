@@ -1,0 +1,215 @@
+.ovpn-file-select {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.ovpn-file-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.65rem 0.85rem 0.65rem 1rem;
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.875rem;
+  line-height: 1.35;
+  color: var(--text-main);
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.ovpn-file-select-trigger:hover:not(:disabled) {
+  border-color: rgba(59, 130, 246, 0.45);
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.ovpn-file-select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+}
+
+.ovpn-file-select-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ovpn-file-select-trigger-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ovpn-file-select-trigger-chevron {
+  flex-shrink: 0;
+  font-size: 1.25rem;
+  color: var(--text-muted);
+  transition: transform 0.2s ease;
+}
+
+.ovpn-file-select-trigger[aria-expanded='true'] .ovpn-file-select-trigger-chevron {
+  transform: rotate(180deg);
+  color: var(--primary);
+}
+
+.ovpn-file-select-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1040;
+  background: transparent;
+}
+
+.ovpn-file-select-panel {
+  position: fixed;
+  z-index: 1050;
+  display: flex;
+  flex-direction: column;
+  max-height: min(22rem, 55vh);
+  overflow: hidden;
+  background: var(--bg-surface);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-md);
+  box-shadow:
+    0 18px 40px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+.ovpn-file-select-search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  padding: 0.45rem 0.5rem 0.45rem 0.65rem;
+  border-bottom: 1px solid var(--border-color);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.ovpn-file-select-search-row .material-symbols-outlined {
+  font-size: 1.15rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.ovpn-file-select-search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 0.875rem;
+  padding: 0.4rem 0.25rem;
+  outline: none;
+}
+
+.ovpn-file-select-search-input::placeholder {
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+.ovpn-file-select-search-input::-webkit-search-cancel-button {
+  filter: invert(0.75);
+  cursor: pointer;
+}
+
+.ovpn-file-select-list {
+  margin: 0;
+  padding: 0.35rem;
+  list-style: none;
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1;
+  min-height: 0;
+  -webkit-overflow-scrolling: touch;
+}
+
+.ovpn-file-select-item {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  border-radius: var(--radius-sm);
+  color: var(--text-main);
+  transition: background 0.12s ease;
+}
+
+.ovpn-file-select-item:hover,
+.ovpn-file-select-item:focus-visible {
+  outline: none;
+  background: rgba(59, 130, 246, 0.14);
+}
+
+.ovpn-file-select-item.is-selected {
+  background: rgba(59, 130, 246, 0.22);
+}
+
+.ovpn-file-select-item-inner {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+  padding: 0.55rem 0.65rem 0.55rem 0.6rem;
+  min-height: 2.65rem;
+}
+
+.ovpn-file-select-id {
+  flex-shrink: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--primary);
+  min-width: 2.25rem;
+}
+
+.ovpn-file-select-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.ovpn-file-select-loc {
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.ovpn-file-select-proto {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.ovpn-file-select-fallback {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.ovpn-file-select-empty {
+  padding: 0.75rem 0.65rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.ovpn-file-select-placeholder {
+  color: var(--text-muted);
+  font-family: inherit;
+  font-weight: 500;
+}

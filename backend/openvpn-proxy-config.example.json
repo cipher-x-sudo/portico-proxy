@@ -1,0 +1,24 @@
+{
+  "ovpnRoot": "../ovpn",
+  "openvpnPath": "C:\\Program Files\\OpenVPN\\bin\\openvpn.exe",
+  "forceBindIPPath": "",
+  "portBase": 50000,
+  "proxyUsername": "",
+  "proxyPassword": "",
+  "proxyListenHost": "127.0.0.1",
+  "internalPortBase": 51000,
+  "maxSlots": 50,
+  "idleTimeoutMinutes": 45,
+  "autoActivateOnStartup": true,
+  "randomizeCountry": "US",
+  "controlPort": 49999,
+  "saveRunFile": false,
+  "username": "",
+  "password": "",
+  "locationSpec": {
+    "count": 128,
+    "defaultOvpn": "NC/NCVPN-US-Chicago-UDP.ovpn",
+    "labelPrefix": "proxy",
+    "randomAccessFirstN": 3
+  }
+}
