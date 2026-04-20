@@ -163,6 +163,48 @@
   background: rgba(59, 130, 246, 0.06);
 }
 
+.dashboard-ports-launcher-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.dashboard-ports-launcher-search {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: min(100%, 12rem);
+  max-width: 22rem;
+  color: var(--text-muted);
+}
+
+.dashboard-ports-launcher-search .material-symbols-outlined {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+}
+
+.dashboard-ports-launcher-search-input {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+  outline: none;
+}
+
+.dashboard-ports-launcher-search-input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
 .dashboard-launcher-id-cell {
   min-width: 6rem;
   max-width: 11rem;

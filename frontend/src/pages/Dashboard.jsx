@@ -12,6 +12,7 @@ export default function Dashboard() {
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
   const [savingLauncherIdPort, setSavingLauncherIdPort] = useState(null);
+  const [launcherIdFilter, setLauncherIdFilter] = useState('');
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
 
@@ -190,6 +191,14 @@ export default function Dashboard() {
     allPortRows.push({ loc, idx });
   }
 
+  const launcherIdQuery = launcherIdFilter.trim().toLowerCase();
+  const filteredPortRows = launcherIdQuery
+    ? allPortRows.filter(({ loc }) => {
+        const id = typeof loc.launcherId === 'string' ? loc.launcherId : '';
+        return id.toLowerCase().includes(launcherIdQuery);
+      })
+    : allPortRows;
+
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
       ? 'Host proxy port'
@@ -305,7 +314,28 @@ export default function Dashboard() {
             <span className="material-symbols-outlined text-primary">table_view</span>
             <h3 className="font-bold">Ports Launcher</h3>
           </div>
-          <span className="badge-primary">{totalPorts} locations</span>
+          <span className="badge-primary">
+            {launcherIdQuery
+              ? `${filteredPortRows.length} of ${totalPorts} shown`
+              : `${totalPorts} locations`}
+          </span>
+        </div>
+        <div className="dashboard-ports-launcher-toolbar">
+          <label className="dashboard-ports-launcher-search">
+            <span className="material-symbols-outlined" aria-hidden>
+              search
+            </span>
+            <input
+              type="search"
+              className="dashboard-ports-launcher-search-input"
+              value={launcherIdFilter}
+              onChange={(e) => setLauncherIdFilter(e.target.value)}
+              placeholder="Search by ID…"
+              aria-label="Filter ports by launcher ID"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
         </div>
         <div className="table-container">
           <table className="data-table">
@@ -324,8 +354,14 @@ export default function Dashboard() {
                 <tr>
                   <td colSpan="6" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
+              ) : filteredPortRows.length === 0 ? (
+                <tr>
+                  <td colSpan="6" className="text-center p-6 text-muted">
+                    No ports match this ID search.
+                  </td>
+                </tr>
               ) : (
-                allPortRows.map(({ loc, idx }) => {
+                filteredPortRows.map(({ loc, idx }) => {
                   const port = internalPortForIndex(status, idx);
                   const displayPort = publishedPortForIndex(status, idx);
                   const portKey = String(port);
