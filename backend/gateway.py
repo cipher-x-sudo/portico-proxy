@@ -648,13 +648,19 @@ def _redis_save_json(url: str, key: str, payload: Dict[str, Any]) -> None:
 def assignments_state_payload(
     assignments: Dict[int, str],
     active_ports: Optional[Iterable[int]],
+    launcher_ids: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
     ap_list = sorted(set(active_ports)) if active_ports is not None else []
-    return {
+    lid = launcher_ids or {}
+    lid_out = {str(p): s for p, s in sorted(lid.items()) if (s or "").strip()}
+    payload: Dict[str, Any] = {
         "version": ASSIGNMENTS_STATE_VERSION,
         "assignments": {str(p): name for p, name in sorted(assignments.items())},
         "activePorts": ap_list,
     }
+    if lid_out:
+        payload["launcherIds"] = lid_out
+    return payload
 
 
 def _parse_assignments_block(
@@ -694,6 +700,34 @@ def _parse_assignments_block(
     return out
 
 
+def _parse_launcher_ids_block(
+    raw_ids: Any,
+    port_base: int,
+    num_ports: int,
+) -> Dict[int, str]:
+    """Optional per-listener-port user IDs from assignments JSON."""
+    out: Dict[int, str] = {}
+    if not isinstance(raw_ids, dict) or num_ports <= 0:
+        return out
+    port_max = port_base + num_ports - 1
+    for k, v in raw_ids.items():
+        try:
+            port = int(str(k))
+        except (TypeError, ValueError):
+            continue
+        if port < port_base or port > port_max:
+            continue
+        s = (str(v) if v is not None else "").strip()
+        if not s:
+            continue
+        if len(s) > 256:
+            s = s[:256]
+        if any(c in s for c in "\r\n\t\x00"):
+            continue
+        out[port] = s
+    return out
+
+
 def _ingest_assignments_raw(
     raw: Dict[str, Any],
     port_base: int,
@@ -702,18 +736,19 @@ def _ingest_assignments_raw(
     cfg_path: Path,
     use_docker: bool,
     source_label: str,
-) -> Tuple[Dict[int, str], List[int]]:
-    """Parse stored JSON blob (same shape as openvpn-proxy-assignments.json) into assignments + active ports."""
+) -> Tuple[Dict[int, str], List[int], Dict[int, str]]:
+    """Parse stored JSON blob (same shape as openvpn-proxy-assignments.json) into assignments + active ports + launcherIds."""
     assignments: Dict[int, str] = {}
     active_listener_ports: List[int] = []
+    launcher_ids: Dict[int, str] = {}
     if num_ports <= 0:
-        return assignments, active_listener_ports
+        return assignments, active_listener_ports, launcher_ids
     if isinstance(raw, dict) and isinstance(raw.get("assignments"), dict):
         data = raw["assignments"]
     elif isinstance(raw, dict):
         data = {k: v for k, v in raw.items() if str(k) not in ("version", "activePorts")}
     else:
-        return assignments, active_listener_ports
+        return assignments, active_listener_ports, launcher_ids
     nkeys = len(data) if isinstance(data, dict) else 0
     allowed = set(list_allowed_ovpn_files(runtime_config, cfg_path, use_docker))
     _log(
@@ -739,7 +774,8 @@ def _ingest_assignments_raw(
                 continue
             if port_base <= p <= port_max:
                 active_listener_ports.append(p)
-    return assignments, sorted(set(active_listener_ports))
+    launcher_ids = _parse_launcher_ids_block(raw.get("launcherIds"), port_base, num_ports)
+    return assignments, sorted(set(active_listener_ports)), launcher_ids
 
 
 def load_gateway_assignments_state(
@@ -751,10 +787,10 @@ def load_gateway_assignments_state(
     runtime_config: Dict[str, Any],
     cfg_path: Path,
     use_docker: bool,
-) -> Tuple[Dict[int, str], List[int]]:
-    """Load OVPN picks + activePorts from Redis when configured, else JSON file; migrate file→Redis if needed."""
+) -> Tuple[Dict[int, str], List[int], Dict[int, str]]:
+    """Load OVPN picks + activePorts + launcherIds from Redis when configured, else JSON file; migrate file→Redis if needed."""
     if num_ports <= 0:
-        return {}, []
+        return {}, [], {}
     raw: Optional[Dict[str, Any]] = None
     source = ""
     loaded_from_redis = False
@@ -817,9 +853,10 @@ def save_port_assignments_file(
     path: Path,
     assignments: Dict[int, str],
     active_ports: Optional[Iterable[int]] = None,
+    launcher_ids: Optional[Dict[int, str]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = assignments_state_payload(assignments, active_ports)
+    payload = assignments_state_payload(assignments, active_ports, launcher_ids)
     tmp = path.parent / (path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -877,8 +914,9 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
         with state["lock"]:
             snap_assign = dict(state["port_ovpn_assignment"])
             snap_active = set(state["active_ports"])
+            snap_launcher_ids = dict(state.get("launcher_ids_by_port") or {})
         snap_assign = _anti_wipe_merge_assignments(state, snap_assign, port_base, num_ports)
-        payload = assignments_state_payload(snap_assign, snap_active)
+        payload = assignments_state_payload(snap_assign, snap_active, snap_launcher_ids)
         if redis_url:
             try:
                 _redis_save_json(redis_url, redis_key, payload)
@@ -888,12 +926,12 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             if p.exists() and not p.is_file():
                 _log(f"Cannot persist assignments: path is not a file: {p}")
             else:
-                save_port_assignments_file(p, snap_assign, snap_active)
+                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids)
         elif mirror_file:
             if p.exists() and not p.is_file():
                 _log(f"REDIS_ASSIGNMENTS_MIRROR_FILE set but path is not a file: {p}")
             else:
-                save_port_assignments_file(p, snap_assign, snap_active)
+                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids)
     except Exception as e:
         _log(f"Could not persist assignments: {e}")
 
@@ -1747,6 +1785,7 @@ def _control_api_handler_factory(
             num_ports = state.get("num_ports") or len(locations)
             now = time.monotonic()
             with lock:
+                launcher_ids = dict(state.get("launcher_ids_by_port") or {})
                 active = []
                 for port, slot in list(port_to_slot.items()):
                     loc_idx = slot.get("location_index")
@@ -1826,8 +1865,9 @@ def _control_api_handler_factory(
                         "label": loc.get("label", ""),
                         "ovpn": loc.get("ovpn", ""),
                         "randomAccess": bool(loc.get("randomAccess")),
+                        "launcherId": launcher_ids.get(port_base + i, ""),
                     }
-                    for loc in locations
+                    for i, loc in enumerate(locations)
                 ],
                 "activeSlots": active,
                 "randomizeCountry": randomize_country,
@@ -1976,6 +2016,8 @@ def _control_api_handler_factory(
                 self._handle_post_shutdown()
             elif path == "/api/evict":
                 self._handle_post_evict(parsed.query)
+            elif path == "/api/set-launcher-id":
+                self._handle_post_set_launcher_id(parsed.query)
             else:
                 self.send_error(404)
 
@@ -2080,6 +2122,48 @@ def _control_api_handler_factory(
                 state["port_ovpn_assignment"][port] = ovpn
             persist_assignments_snapshot(state)
             self._send_json({"ok": True, "port": port, "ovpn": ovpn})
+
+        def _handle_post_set_launcher_id(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            ports = params.get("port", [])
+            if not ports:
+                self._send_error_body("Missing port", 400)
+                return
+            try:
+                port = int(ports[0])
+            except ValueError:
+                self._send_error_body("Invalid port", 400)
+                return
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length < 0 or content_length > 4096:
+                self._send_error_body("Invalid Content-Length", 400)
+                return
+            try:
+                body = (self.rfile.read(content_length).decode("utf-8") if content_length else "{}")
+                payload = json.loads(body)
+            except Exception as e:
+                self._send_error_body(str(e), 400)
+                return
+            raw = payload.get("launcherId")
+            s = (str(raw) if raw is not None else "").strip()
+            if len(s) > 256:
+                s = s[:256]
+            if any(c in s for c in "\r\n\t\x00"):
+                self._send_error_body("launcherId contains invalid characters", 400)
+                return
+            port_base = state["port_base"]
+            num_ports = state.get("num_ports") or len(state["locations"])
+            if port < port_base or port >= port_base + num_ports:
+                self._send_error_body("Port out of location range", 400)
+                return
+            with state["lock"]:
+                lids = state.setdefault("launcher_ids_by_port", {})
+                if not s:
+                    lids.pop(port, None)
+                else:
+                    lids[port] = s
+            persist_assignments_snapshot(state)
+            self._send_json({"ok": True, "port": port, "launcherId": s})
 
         def _handle_post_activate(self, query: str) -> None:
             params = urllib.parse.parse_qs(query)
@@ -2646,7 +2730,7 @@ def main() -> int:
     redis_key = _redis_state_key()
     if redis_url:
         _log(f"Assignment store: Redis key={redis_key!r}")
-    _loaded_assign, _loaded_active_ports = load_gateway_assignments_state(
+    _loaded_assign, _loaded_active_ports, _loaded_launcher_ids = load_gateway_assignments_state(
         assignments_path,
         redis_url,
         redis_key,
@@ -2657,9 +2741,11 @@ def main() -> int:
         use_docker,
     )
     port_ovpn_assignment.update(_loaded_assign)
+    launcher_ids_by_port: Dict[int, str] = dict(_loaded_launcher_ids)
     _log(
         f"Assignments ({assignments_path}): loaded {len(_loaded_assign)} OVPN pick(s), "
-        f"{len(_loaded_active_ports)} persisted active port(s)"
+        f"{len(_loaded_active_ports)} persisted active port(s), "
+        f"{len(launcher_ids_by_port)} launcher ID(s)"
     )
 
     activation_state_by_port: Dict[int, str] = {}
@@ -2676,6 +2762,7 @@ def main() -> int:
         "port_to_slot": port_to_slot,
         "active_ports": active_ports,
         "port_ovpn_assignment": port_ovpn_assignment,
+        "launcher_ids_by_port": launcher_ids_by_port,
         "activation_state_by_port": activation_state_by_port,
         "activation_error_by_port": activation_error_by_port,
         "activation_cancelled_ports": activation_cancelled_ports,

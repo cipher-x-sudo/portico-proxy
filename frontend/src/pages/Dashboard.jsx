@@ -11,6 +11,7 @@ export default function Dashboard() {
   const [ovpnFilesHint, setOvpnFilesHint] = useState('');
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
+  const [savingLauncherIdPort, setSavingLauncherIdPort] = useState(null);
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
 
@@ -87,6 +88,33 @@ export default function Dashboard() {
       setError(`Failed to ${activate ? 'activate' : 'deactivate'} port: ` + err.message);
     } finally {
       setBusyPort(null);
+    }
+  };
+
+  const saveLauncherId = async (port, trimmedValue, previousFromServer) => {
+    const next = (trimmedValue || '').trim();
+    const prev = (previousFromServer || '').trim();
+    if (next === prev) return;
+    setSavingLauncherIdPort(port);
+    setError('');
+    try {
+      const res = await fetch(`/api/set-launcher-id?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ launcherId: next }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to save ID');
+        return;
+      }
+      const refreshed = await fetch('/api/status').then((r) => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
+    } catch (err) {
+      setError('Failed to save ID: ' + err.message);
+    } finally {
+      setSavingLauncherIdPort(null);
     }
   };
 
@@ -283,6 +311,7 @@ export default function Dashboard() {
           <table className="data-table">
             <thead>
               <tr>
+                <th>ID</th>
                 <th>{portColumnLabel}</th>
                 <th>Location</th>
                 <th>Selected OVPN File</th>
@@ -293,7 +322,7 @@ export default function Dashboard() {
             <tbody>
               {totalPorts === 0 || locations.length === 0 ? (
                 <tr>
-                  <td colSpan="5" className="text-center p-6 text-muted">No locations configured.</td>
+                  <td colSpan="6" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
               ) : (
                 allPortRows.map(({ loc, idx }) => {
@@ -301,6 +330,7 @@ export default function Dashboard() {
                   const displayPort = publishedPortForIndex(status, idx);
                   const portKey = String(port);
                   const selected = selectedByPort[portKey] || '';
+                  const launcherIdServer = typeof loc.launcherId === 'string' ? loc.launcherId : '';
                   const activationState = activationStateByPort[portKey] || (enabledPorts.has(port) ? 'active' : 'inactive');
                   const isStarting = activationState === 'starting';
                   const isActive = activationState === 'active';
@@ -309,6 +339,22 @@ export default function Dashboard() {
                   const selectedLocation = selected ? formatOvpnRichLabel(selected) : '';
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
+                      <td className="dashboard-launcher-id-cell">
+                        <input
+                          type="text"
+                          className="dashboard-launcher-id-input"
+                          name={`launcher-id-${port}`}
+                          defaultValue={launcherIdServer}
+                          key={`${port}-${launcherIdServer}`}
+                          disabled={savingLauncherIdPort === port}
+                          maxLength={256}
+                          placeholder="—"
+                          title="Your label for this port (saved when you leave the field)"
+                          onBlur={(e) =>
+                            saveLauncherId(port, e.target.value, launcherIdServer)
+                          }
+                        />
+                      </td>
                       <td className="text-primary text-mono font-bold">
                         {displayPort}
                         {displayPort !== port && (
