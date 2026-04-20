@@ -6,6 +6,9 @@
 # the gateway auto-detects public IPv4 when empty (see autoDetectClientProxyHost); set clientProxyHost for DNS/LAN.
 # For local-only, use 127.0.0.1 instead of 0.0.0.0 on the frontend :8080 and gateway proxy range lines below.
 #
+# HTTPS (free): use Cloudflare Tunnel — `docker compose --profile tunnel up -d` with CLOUDFLARE_TUNNEL_TOKEN in .env.
+# In Zero Trust → Networks → Tunnels → your tunnel → Public Hostname: proxy.prismacreative.online → http://frontend:80
+#
 # The gateway may start extra worker containers (proxy-<port>) on proxynet. On SIGTERM/SIGINT it stops them
 # before exit; stop_grace_period on the gateway gives time for that during "docker compose down".
 
@@ -88,13 +91,27 @@ services:
     depends_on:
       - gateway
     ports:
-      # 0.0.0.0: dashboard on public IP. Use 127.0.0.1:8080:80 for local-only.
+      # 0.0.0.0: dashboard on public IP. With Cloudflare Tunnel only, prefer 127.0.0.1:8080:80 so the UI is not exposed on :8080.
       - "0.0.0.0:8080:80"
-      # HTTPS (self-signed in image). Mount your own cert/key over /etc/nginx/ssl/*.pem for a real CA.
-      - "0.0.0.0:8443:443"
     networks:
       - proxynet
     restart: unless-stopped
+
+  # Free HTTPS at the edge via Cloudflare; tunnel reaches nginx on Docker network (no origin TLS required).
+  # Create token: Zero Trust → Networks → Tunnels → Configure → Docker copy token. Set CLOUDFLARE_TUNNEL_TOKEN in .env.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: portico-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - proxynet
+    depends_on:
+      - frontend
+    profiles:
+      - tunnel
 
 networks:
   proxynet:
