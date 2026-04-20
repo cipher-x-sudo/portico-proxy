@@ -13,7 +13,7 @@ export default function Actions() {
   
   const [evictPort, setEvictPort] = useState('');
   
-  const logsEndRef = useRef(null);
+  const logsViewerRef = useRef(null);
 
   // Fetch active slots for the worker dropdown
   useEffect(() => {
@@ -47,11 +47,11 @@ export default function Actions() {
     return () => clearInterval(interval);
   }, [logsPaused]);
 
-  // Auto scroll gateway logs
+  // Keep newest log lines visible inside the log panel only (avoid scrollIntoView — it scrolls the whole page).
   useEffect(() => {
-    if (!logsPaused && logsEndRef.current) {
-      logsEndRef.current.scrollIntoView();
-    }
+    if (logsPaused || !logsViewerRef.current) return;
+    const el = logsViewerRef.current;
+    el.scrollTop = el.scrollHeight;
   }, [gatewayLogs, logsPaused]);
 
   const handleStopGateway = async () => {
@@ -177,7 +177,7 @@ export default function Actions() {
           </div>
         </div>
         
-        <div className="logs-viewer">
+        <div className="logs-viewer" ref={logsViewerRef}>
           {filteredLogs.length === 0 ? (
             <div className="text-muted p-4 text-sm font-mono">No logs to display...</div>
           ) : (
@@ -185,7 +185,6 @@ export default function Actions() {
               <div key={i} className="log-line">{line}</div>
             ))
           )}
-          <div ref={logsEndRef} />
         </div>
       </section>
 

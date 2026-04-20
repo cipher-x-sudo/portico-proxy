@@ -1,7 +1,9 @@
 .page-container {
   flex: 1;
+  min-height: 0;
   padding: 2rem;
   overflow-y: auto;
+  overflow-x: hidden;
   position: relative;
 }
 

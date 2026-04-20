@@ -1,11 +1,15 @@
 .sidebar {
   width: 260px;
+  height: 100%;
+  align-self: stretch;
   background-color: var(--bg-surface);
   border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
   z-index: 20;
+  overflow-x: hidden;
+  overflow-y: auto;
   transition: width 0.3s ease, transform 0.3s ease;
 }
 

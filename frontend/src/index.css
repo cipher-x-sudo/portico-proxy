@@ -36,6 +36,12 @@
   padding: 0;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   font-family: var(--font-sans);
   background-color: var(--bg-dark);
@@ -44,14 +50,16 @@ body {
   background-image: radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.05), transparent 25%),
                     radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.03), transparent 25%);
   background-attachment: fixed;
-  min-height: 100vh;
+  overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
 /* Base Layout Classes */
 .app-layout {
   display: flex;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .main-content {
@@ -59,6 +67,8 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0; /* allows truncation */
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* Glass panel utility */
