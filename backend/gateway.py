@@ -1505,22 +1505,23 @@ def _control_api_handler_factory(
                 activation_error = {str(k): v for k, v in activation_error_by_port.items()}
             port_max = port_base + num_ports - 1
             listen_h = state.get("listen_host", "127.0.0.1") or "127.0.0.1"
-            client_host_override = (os.environ.get("CLIENT_PROXY_HOST") or "").strip()
-            if client_host_override:
-                client_proxy_host = client_host_override
-            elif listen_h in ("0.0.0.0", "::", "[::]"):
-                client_proxy_host = "127.0.0.1"
-            else:
-                client_proxy_host = listen_h
             randomize_country = "random"
             randomize_country_pool = "any country"
+            cfg_client = ""
             try:
                 with open(state["config_path"], encoding="utf-8") as _cf:
                     _cfg = json.load(_cf)
                 randomize_country = normalize_randomize_country(_cfg.get("randomizeCountry"))
                 randomize_country_pool = randomize_country_status_label(_cfg.get("randomizeCountry"))
+                cfg_client = (str(_cfg.get("clientProxyHost") or "")).strip()
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                 pass
+            if cfg_client:
+                client_proxy_host = cfg_client
+            elif listen_h in ("0.0.0.0", "::", "[::]"):
+                client_proxy_host = "127.0.0.1"
+            else:
+                client_proxy_host = listen_h
             self._send_json({
                 "running": True,
                 "portBase": state["port_base"],

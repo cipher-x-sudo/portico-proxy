@@ -5,6 +5,7 @@
   "portBase": 50000,
   "proxyUsername": "",
   "proxyPassword": "",
+  "clientProxyHost": "",
   "proxyListenHost": "127.0.0.1",
   "internalPortBase": 51000,
   "maxSlots": 50,

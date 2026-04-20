@@ -262,6 +262,20 @@ export default function Config() {
               onChange={e => handleChange('proxyListenHost', e.target.value)}
             />
           </div>
+          <div className="form-group">
+            <label>Client proxy host</label>
+            <input
+              type="text"
+              className="premium-input"
+              placeholder="e.g. VPS public IP (empty = auto)"
+              value={config.clientProxyHost ?? ''}
+              onChange={(e) => handleChange('clientProxyHost', e.target.value)}
+            />
+            <p className="text-muted text-sm mt-1 mb-0">
+              Hostname or IP shown in the dashboard for HTTP proxy URLs. Set when clients connect via a public
+              IP or DNS name; leave empty for local-only hints.
+            </p>
+          </div>
         </section>
 
         {/* Gateway Settings */}

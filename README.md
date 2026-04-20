@@ -138,6 +138,7 @@ Runtime JSON is mounted at **`/config/openvpn-proxy-config.json`** inside the ga
 | **`locationSpec`** | Preferred template: `count`, `defaultOvpn` (path under the `ovpn` mount), `labelPrefix`, `randomAccessFirstN`. `count` must not exceed the number of published host ports in Compose (default **516** mappings, host **58000–58515** → container **50000–50515**). |
 | **`portBase`** | First listener port **inside** the gateway network namespace (default `50000`). |
 | **`proxyUsername`** / **`proxyPassword`** | HTTP proxy authentication presented to clients (optional; gateway may apply defaults — see dashboard). |
+| **`clientProxyHost`** | Hostname or IP shown in the dashboard for HTTP proxy URLs when clients reach you by public IP or DNS (e.g. VPS). Empty string keeps automatic hints (`127.0.0.1` when listeners are `0.0.0.0` under Docker). |
 | **`proxyListenHost`** | Bind address inside the gateway container (`127.0.0.1` vs `0.0.0.0`). Widen only with auth and host firewall awareness. |
 | **`internalPortBase`** | Internal pproxy port range for slots (default `51000`). |
 | **`maxSlots`** | Upper bound on concurrent worker containers. |
@@ -154,11 +155,18 @@ Legacy keys (`openvpnPath`, `forceBindIPPath`, `pythonPath`, `maxLocations`) exi
 
 | Exposure | Default bind | Description |
 |----------|----------------|-------------|
-| **Dashboard** | `127.0.0.1:8080` | Static UI; `/api/*` proxied to gateway. |
-| **Control API** | `127.0.0.1:49999` | JSON REST used by the UI (`/api/status`, `/api/activate`, …). |
-| **HTTP proxies** | `127.0.0.1:58000+` (host) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) must match the **left-hand** side of the port range in `docker-compose.yml`. |
+| **Dashboard** | `127.0.0.1:8080` (default in Compose) | Static UI; `/api/*` proxied to gateway. For a VPS, edit **`docker-compose.yml`** and change the published bind from **`127.0.0.1`** to **`0.0.0.0`** on the frontend **`8080`** line. |
+| **Control API** | `127.0.0.1:49999` | JSON REST used by the UI (`/api/status`, `/api/activate`, …). Always localhost on the host. |
+| **HTTP proxies** | `127.0.0.1:58000+` (host, default) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) must match the **left-hand** side of the port range in `docker-compose.yml`. For a VPS, change the leading **`127.0.0.1`** to **`0.0.0.0`** on the gateway proxy port range line. |
 
-**Clients on the same machine** use `127.0.0.1` and the **published** host port. **Android emulator** uses host alias **`10.0.2.2`** (e.g. `10.0.2.2:58000`). For LAN devices, set gateway env **`CLIENT_PROXY_HOST`** to your host IP and ensure firewall rules allow the published ports.
+**Clients on the same machine** use `127.0.0.1` and the **published** host port. **Android emulator** uses host alias **`10.0.2.2`** (e.g. `10.0.2.2:58000`). For LAN or internet clients, set **`clientProxyHost`** in **`openvpn-proxy-config.json`** (or the Config page) to the hostname or IP clients use, and allow those TCP ports in the firewall.
+
+### Remote / VPS
+
+1. In **`docker-compose.yml`**, change **`127.0.0.1`** to **`0.0.0.0`** on the **frontend** `8080` mapping and on the **gateway** proxy host-port range line so the dashboard and HTTP proxies listen on all interfaces (the control API **`49999`** line stays **`127.0.0.1`**; the UI still reaches the gateway over the Docker network).
+2. Set **`clientProxyHost`** in **`openvpn-proxy-config.json`** to your VPS **public IP** or **hostname** so `/api/status` and the dashboard show the correct host for proxy URLs.
+3. Open the host firewall only for **TCP `8080`** and the **TCP range** you actually use: **`PUBLISHED_PROXY_PORT_BASE`** through **`PUBLISHED_PROXY_PORT_BASE + locationSpec.count - 1`**, aligned with **`DOCKER_PROXY_HOST_PORT_FIRST`** / **`DOCKER_PROXY_HOST_LAST`** in Compose if you override them. You do not need to expose every mapped slot if your config uses fewer locations.
+4. Hardening: use **strong** `proxyUsername` / `proxyPassword`; do not expose **`49999`** publicly; consider TLS or SSH tunneling for **`8080`** on untrusted networks.
 
 ---
 
@@ -208,7 +216,7 @@ Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount tar
 ## Security
 
 - **Docker socket** — The gateway can start arbitrary worker containers; isolate the daemon and restrict who can access the compose project directory.  
-- **Bind addresses** — Default Compose binds the UI, API, and proxy map to **127.0.0.1**. Expanding to `0.0.0.0` requires explicit threat modeling, **mandatory proxy authentication**, and host/network firewall rules.  
+- **Bind addresses** — Default Compose keeps the UI and proxy host ports on **127.0.0.1**; the control API stays on **127.0.0.1** only. Publishing **`0.0.0.0`** on a VPS (by editing **`docker-compose.yml`**) requires explicit threat modeling, **mandatory proxy authentication**, and host/network firewall rules.  
 - **Secrets** — Provider credentials belong in `.env` or `ovpn/**/auth.txt`, not in tracked JSON. Rotate credentials if a workstation or volume was compromised.  
 - **Control API** — Equivalent to administrative access; do not expose **`49999`** to untrusted networks without TLS termination and authentication in front (not included by default).
 
