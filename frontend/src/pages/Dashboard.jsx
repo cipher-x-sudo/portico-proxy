@@ -21,6 +21,12 @@ export default function Dashboard() {
   const [newEntryOvpn, setNewEntryOvpn] = useState('');
   const [creatingEntry, setCreatingEntry] = useState(false);
 
+  const [showEditEntry, setShowEditEntry] = useState(false);
+  const [editTargetPort, setEditTargetPort] = useState(null);
+  const [editEntryId, setEditEntryId] = useState('');
+  const [editEntryOvpn, setEditEntryOvpn] = useState('');
+  const [isEditingEntry, setIsEditingEntry] = useState(false);
+
   useEffect(() => {
     const loadStatus = () => {
       fetch('/api/status')
@@ -219,6 +225,46 @@ export default function Dashboard() {
       setError('Failed to create entry: ' + err.message);
     } finally {
       setCreatingEntry(false);
+    }
+  };
+
+  const openEditModal = (port, currentId, currentOvpn) => {
+    setEditTargetPort(port);
+    setEditEntryId(currentId || '');
+    setEditEntryOvpn(currentOvpn || '');
+    setShowEditEntry(true);
+  };
+
+  const handleEditEntrySubmit = async (e) => {
+    e.preventDefault();
+    if (!editTargetPort) return;
+    setIsEditingEntry(true);
+    setError('');
+
+    try {
+      const setLauncherRes = await fetch(`/api/set-launcher-id?port=${encodeURIComponent(editTargetPort)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ launcherId: editEntryId.trim() }),
+      });
+      
+      if (!setLauncherRes.ok) {
+        const errorData = await setLauncherRes.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to update Launcher ID');
+      }
+
+      await assignOvpn(editTargetPort, editEntryOvpn);
+
+      setShowEditEntry(false);
+      setEditTargetPort(null);
+      
+      const refreshed = await fetch('/api/status').then(r => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
+    } catch (err) {
+      setError('Failed to edit entry: ' + err.message);
+    } finally {
+      setIsEditingEntry(false);
     }
   };
 
@@ -518,6 +564,61 @@ export default function Dashboard() {
             </div>
           </div>
         )}
+        
+        {showEditEntry && (
+          <div className="dashboard-modal-overlay" onClick={() => setShowEditEntry(false)}>
+            <div
+              className="dashboard-modal-panel glass-panel"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+            >
+              <div className="dashboard-modal-header">
+                <h3 className="dashboard-modal-title">Edit Entry Configuration</h3>
+                <button
+                  type="button"
+                  onClick={() => setShowEditEntry(false)}
+                  className="dashboard-modal-close"
+                  aria-label="Close"
+                >
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+              <form className="dashboard-modal-body" onSubmit={handleEditEntrySubmit}>
+                <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Launcher ID</span>
+                  <input
+                    type="text"
+                    className="dashboard-modal-input"
+                    value={editEntryId}
+                    onChange={(e) => setEditEntryId(e.target.value)}
+                    placeholder="Enter a unique ID…"
+                    required
+                  />
+                </label>
+                <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Location Configuration</span>
+                  <OvpnFileSelect
+                    files={sortedOvpnFiles}
+                    value={editEntryOvpn}
+                    onChange={setEditEntryOvpn}
+                    disabled={isEditingEntry}
+                    placeholder="Select location .ovpn…"
+                  />
+                </label>
+                <div className="dashboard-modal-actions">
+                  <button
+                    type="submit"
+                    className="btn-primary dashboard-modal-submit"
+                    disabled={isEditingEntry || !editEntryId.trim()}
+                  >
+                    {isEditingEntry ? 'Saving...' : 'Save Changes'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
         <div className="table-container">
           <table className="data-table">
             <thead>
@@ -525,7 +626,6 @@ export default function Dashboard() {
                 <th style={{ width: '40px', textAlign: 'center' }}>#</th>
                 <th>ID</th>
                 <th>{portColumnLabel}</th>
-                <th>Location</th>
                 <th>Selected OVPN File</th>
                 <th>Status</th>
                 <th className="text-right">Actions</th>
@@ -561,20 +661,24 @@ export default function Dashboard() {
                         {arrayIndex + 1}
                       </td>
                       <td className="dashboard-launcher-id-cell">
-                        <input
-                          type="text"
-                          className="dashboard-launcher-id-input"
-                          name={`launcher-id-${port}`}
-                          defaultValue={launcherIdServer}
-                          key={`${port}-${launcherIdServer}`}
-                          disabled={savingLauncherIdPort === port}
-                          maxLength={256}
-                          placeholder="—"
-                          title="Your label for this port (saved when you leave the field)"
-                          onBlur={(e) =>
-                            saveLauncherId(port, e.target.value, launcherIdServer)
-                          }
-                        />
+                        <div
+                          className="dashboard-copy-line text-mono"
+                          style={{ padding: '0.45rem 0.55rem', border: '1px solid var(--border-color)', background: 'rgba(0,0,0,0.2)' }}
+                          title="Click to copy ID"
+                          onClick={() => {
+                            if (!launcherIdServer) return;
+                            copyToClipboard(launcherIdServer);
+                            setCopiedToken(`id-${port}`);
+                            setTimeout(() => setCopiedToken(null), 2000);
+                          }}
+                        >
+                          <span className="dashboard-copy-code" style={{ fontSize: '0.85rem' }}>
+                            {launcherIdServer || '—'}
+                          </span>
+                          {copiedToken === `id-${port}` && (
+                            <span className="dashboard-copy-toast">Copied!</span>
+                          )}
+                        </div>
                       </td>
                       <td className="text-primary text-mono font-bold">
                         {displayPort}
@@ -583,19 +687,11 @@ export default function Dashboard() {
                         )}
                       </td>
                       <td>
-                        {selectedLocation || loc.label || `Location #${idx}`}
-                        {selectedLocation && (
-                          <div className="text-muted text-xs">
-                            Config: {loc.label || `Location #${idx}`}
-                          </div>
-                        )}
-                      </td>
-                      <td>
                         <OvpnFileSelect
                           files={sortedOvpnFiles}
                           value={selected}
                           onChange={(file) => onSelectRowFile(port, file)}
-                          disabled={busyPort === port || isActive || isStarting}
+                          disabled={true}
                           placeholder="Select profile…"
                         />
                       </td>
@@ -621,12 +717,23 @@ export default function Dashboard() {
                               </button>
                               <button
                                 type="button"
+                                className="btn-secondary"
+                                title="Edit Configuration"
+                                disabled={busyPort === port || isStarting}
+                                onClick={() => openEditModal(port, launcherIdServer, selected)}
+                                style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
+                              >
+                                <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
+                              </button>
+                              <button
+                                type="button"
                                 className="btn-danger"
                                 title="Delete this entry completely"
                                 disabled={busyPort === port}
                                 onClick={() => deleteEntry(port)}
+                                style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
-                                Delete
+                                <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>delete</span>
                               </button>
                             </>
                           ) : (
@@ -636,9 +743,9 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 disabled={busyPort === port || isStarting}
                                 onClick={() => extendPort(port)}
-                                title="Add 30 minutes before idle auto-close (no proxy traffic)."
+                                title="Add 30 minutes before idle auto-close"
                               >
-                                {busyPort === port ? 'Working...' : 'Extend +30m'}
+                                {busyPort === port ? 'Working...' : '+30m'}
                               </button>
                               <button
                                 type="button"
@@ -646,7 +753,17 @@ export default function Dashboard() {
                                 disabled={busyPort === port || isStarting}
                                 onClick={() => setActivation(port, false)}
                               >
-                                {busyPort === port ? 'Working...' : 'Stop Port'}
+                                {busyPort === port ? 'Working...' : 'Stop'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-secondary"
+                                title="Edit Configuration"
+                                disabled={busyPort === port || isStarting}
+                                onClick={() => openEditModal(port, launcherIdServer, selected)}
+                                style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
+                              >
+                                <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
                               </button>
                               <button
                                 type="button"
@@ -654,14 +771,15 @@ export default function Dashboard() {
                                 title="Delete this entry completely"
                                 disabled={busyPort === port || isStarting}
                                 onClick={() => deleteEntry(port)}
-                                style={{backgroundColor: '#e74c3c'}}
+                                style={{ padding: '0.4rem', display: 'flex', alignItems: 'center', backgroundColor: '#e74c3c' }}
                               >
-                                Delete
+                                <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>delete</span>
                               </button>
                             </>
                           )}
                         </div>
                       </td>
+
                     </tr>
                   );
                 })
