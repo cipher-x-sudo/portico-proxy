@@ -267,6 +267,100 @@ def compute_docker_publish_alignment(
     }
 
 
+def _docker_container_publish_slot_count() -> Optional[int]:
+    c_first = _optional_env_positive_port("DOCKER_PROXY_CONTAINER_PORT_FIRST")
+    c_last = _optional_env_positive_port("DOCKER_PROXY_CONTAINER_PORT_LAST")
+    if c_first is None or c_last is None or c_first > c_last:
+        return None
+    return c_last - c_first + 1
+
+
+def _normalize_locations_to_slot_count(
+    raw_locations: List[Dict[str, Any]],
+    target_slot_count: int,
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return exactly target_slot_count location dicts; pad or trim."""
+    if target_slot_count < 1:
+        return []
+    raw = [dict(loc) for loc in raw_locations]
+    if len(raw) >= target_slot_count:
+        return raw[:target_slot_count]
+
+    spec = config.get("locationSpec") if isinstance(config.get("locationSpec"), dict) else None
+    default_ovpn = ""
+    if spec:
+        default_ovpn = (spec.get("defaultOvpn") or "").strip()
+    if not default_ovpn and raw:
+        default_ovpn = (str(raw[0].get("ovpn") or "")).strip()
+    prefix = "slot"
+    if spec:
+        prefix = (str(spec.get("labelPrefix") or "slot")).strip() or "slot"
+
+    template_user = (str(raw[0].get("username") or "")).strip() if raw else (str(config.get("username") or "")).strip()
+    template_pass: Any = ""
+    if raw:
+        template_pass = raw[0].get("password") or ""
+    if template_pass is None or template_pass == "":
+        template_pass = config.get("password") or ""
+
+    out = list(raw)
+    i = len(out)
+    while len(out) < target_slot_count:
+        out.append(
+            {
+                "label": f"{prefix}-{i}",
+                "ovpn": default_ovpn,
+                "username": template_user,
+                "password": template_pass,
+                "randomAccess": False,
+            }
+        )
+        i += 1
+    return out
+
+
+def apply_docker_published_listener_slots(
+    locations_raw: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    use_docker: bool,
+) -> List[Dict[str, Any]]:
+    """
+    In Docker mode, when DOCKER_PROXY_CONTAINER_PORT_FIRST/LAST is set, use exactly that many
+    TCP listeners: trim extra JSON rows or pad with synthetic slots (same defaults as locationSpec).
+    """
+    if not use_docker:
+        return list(locations_raw)
+    if not locations_raw:
+        return []
+    span = _docker_container_publish_slot_count()
+    if span is None:
+        return list(locations_raw)
+    n_raw = len(locations_raw)
+    if n_raw > span:
+        _log(
+            f"Docker publishes {span} container port(s); "
+            f"using the first {span} location row(s), ignoring {n_raw - span} extra config row(s)."
+        )
+        return _normalize_locations_to_slot_count(locations_raw, span, config)
+    if n_raw < span:
+        _log(
+            f"Docker publishes {span} container port(s); "
+            f"padding from {n_raw} config row(s) to {span} listener(s) "
+            f"(synthetic rows use locationSpec.defaultOvpn or the first location's OVPN)."
+        )
+        return _normalize_locations_to_slot_count(locations_raw, span, config)
+    return list(locations_raw)
+
+
+def merge_expanded_locations_from_disk(runtime_config: Dict[str, Any], use_docker: bool) -> Dict[str, Any]:
+    """After load_disk_config_expanded: align locations[] with Docker publish span when applicable."""
+    out = dict(runtime_config)
+    raw = list(runtime_config.get("locations") or [])
+    out["locations"] = apply_docker_published_listener_slots(raw, runtime_config, use_docker)
+    return out
+
+
 def _enforce_default_proxy_auth(config: Dict[str, Any]) -> None:
     user = (config.get("proxyUsername") or "").strip()
     password = config.get("proxyPassword") or ""
@@ -1763,6 +1857,9 @@ def _control_api_handler_factory(
             if load_err:
                 self._send_error_body(load_err, load_status)
                 return
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config, bool(state.get("use_docker"))
+            )
             payload = build_ovpn_files_payload(
                 runtime_config,
                 config_path,
@@ -2008,6 +2105,9 @@ def _control_api_handler_factory(
             if load_err:
                 self._send_error_body(load_err, load_status)
                 return
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config, bool(state.get("use_docker"))
+            )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
             assigned_ovpn = ""
@@ -2147,6 +2247,9 @@ def _control_api_handler_factory(
             if load_err:
                 self._send_error_body(load_err, load_status)
                 return
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config, bool(state.get("use_docker"))
+            )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
 
@@ -2295,6 +2398,9 @@ def _control_api_handler_factory(
             if load_err:
                 self._send_error_body(load_err, load_status)
                 return
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config, bool(state.get("use_docker"))
+            )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
 
@@ -2431,18 +2537,26 @@ def main() -> int:
     except ValueError as e:
         print(f"Invalid locationSpec: {e}", file=sys.stderr)
         return 1
+    use_docker = config.get("useDocker") is True or os.environ.get("USE_DOCKER", "").lower() in ("1", "true", "yes")
+
+    locations_raw = list(config.get("locations") or [])
+    _log(f"Config loaded: {len(locations_raw)} location row(s) from {config_path}")
+    locations = apply_docker_published_listener_slots(locations_raw, config, use_docker)
+    config["locations"] = locations
+    if locations_raw and len(locations) != len(locations_raw):
+        _log(
+            f"Effective TCP listeners: {len(locations)} (Docker DOCKER_PROXY_CONTAINER_PORT_FIRST/LAST publish span)."
+        )
+
     _enforce_default_proxy_auth(config)
     apply_openvpn_auth_env(config)
 
-    locations = config.get("locations") or []
-    _log(f"Config loaded: {len(locations)} locations from {config_path}")
     if not locations:
         _log(
             "No locations in config (add a locations[] array or a valid locationSpec). "
             "Control API will start so the dashboard can load; add locations and restart the gateway for proxy listeners."
         )
 
-    use_docker = config.get("useDocker") is True or os.environ.get("USE_DOCKER", "").lower() in ("1", "true", "yes")
     docker_image = config.get("dockerImage") or os.environ.get("DOCKER_IMAGE", "portico-worker")
     docker_network = config.get("dockerNetwork") or os.environ.get("DOCKER_NETWORK", "proxynet")
     ovpn_volume_name = config.get("dockerOvpnVolume") or os.environ.get("DOCKER_OVPN_VOLUME", "ovpn_data")

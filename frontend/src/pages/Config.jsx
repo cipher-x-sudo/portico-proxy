@@ -24,6 +24,7 @@ export default function Config() {
     dockerPublishedHostPortFirst: null,
     dockerPublishedHostPortLast: null,
     dockerPublishedPortSpan: null,
+    gatewayListenerCount: null,
     publishMismatch: false,
     publishMismatchHint: '',
   });
@@ -71,6 +72,7 @@ export default function Config() {
               typeof data.dockerPublishedHostPortLast === 'number' ? data.dockerPublishedHostPortLast : null,
             dockerPublishedPortSpan:
               typeof data.dockerPublishedPortSpan === 'number' ? data.dockerPublishedPortSpan : null,
+            gatewayListenerCount: typeof data.totalPorts === 'number' ? data.totalPorts : null,
             publishMismatch: !!data.publishMismatch,
             publishMismatchHint: typeof data.publishMismatchHint === 'string' ? data.publishMismatchHint : '',
           });
@@ -554,6 +556,16 @@ export default function Config() {
         {hostRangeSummary ? (
           <p className="config-host-range-hint text-muted text-sm px-4 pt-3 mb-0">{hostRangeSummary}</p>
         ) : null}
+        {statusPorts.gatewayListenerCount != null &&
+          config.locations.length > 0 &&
+          statusPorts.gatewayListenerCount > config.locations.length && (
+            <p className="text-muted text-sm px-4 pt-2 mb-0" role="status">
+              The gateway is listening on <strong>{statusPorts.gatewayListenerCount}</strong> port(s) (Docker publish
+              span). This file only defines <strong>{config.locations.length}</strong> row(s); extra slots use{' '}
+              <code className="text-xs">locationSpec.defaultOvpn</code> (or the first configured OVPN path) until you
+              edit JSON. Use the <strong>Dashboard</strong> to pick any profile per port.
+            </p>
+          )}
         <div className="table-container">
           <table className="data-table">
             <thead>

@@ -161,7 +161,7 @@ Runtime JSON is mounted at **`/config/openvpn-proxy-config.json`** inside the ga
 
 | Key / group | Purpose |
 |---------------|---------|
-| **`locationSpec`** | Preferred template: `count`, `defaultOvpn` (path under the `ovpn` mount), `labelPrefix`, `randomAccessFirstN`. `count` must not exceed the published TCP span in Compose (`DOCKER_PROXY_HOST_PORT_LAST - DOCKER_PROXY_HOST_PORT_FIRST + 1`; default **516**, host **58000–58515** → container **50000–50515** via `.env` / `docker-compose.yml`). |
+| **`locationSpec`** | Preferred template: `count`, `defaultOvpn` (path under the `ovpn` mount), `labelPrefix`, `randomAccessFirstN`. `count` must not exceed the published TCP span in Compose. If **`USE_DOCKER`** and **`DOCKER_PROXY_CONTAINER_PORT_*`** are set, **`count` may be smaller** than that span: the gateway **pads** extra listener slots at runtime (defaults from `defaultOvpn` or the first row). If `count` is **larger** than the span, extra JSON rows are ignored. |
 | **`portBase`** | First listener port **inside** the gateway network namespace (default `50000`). |
 | **`proxyUsername`** / **`proxyPassword`** | HTTP proxy authentication presented to clients (optional; gateway may apply defaults — see dashboard). |
 | **`clientProxyHost`** | Hostname or IP shown in the dashboard for HTTP proxy URLs. When empty and **`proxyListenHost`** binds all interfaces (`0.0.0.0`), the gateway **auto-detects your public IPv4** (cached HTTP checks to ifconfig.me / ipify / icanhazip) unless **`autoDetectClientProxyHost`** is **`false`**. Set **`clientProxyHost`** explicitly for a DNS name, LAN IP, or to disable any outbound probe while still controlling the displayed host. |
@@ -201,7 +201,7 @@ On Linux there is **no** Windows `select(512)` listener cap; the gateway uses **
 
 1. Set **`DOCKER_PROXY_HOST_PORT_FIRST`** / **`DOCKER_PROXY_HOST_PORT_LAST`** and **`DOCKER_PROXY_CONTAINER_PORT_FIRST`** / **`DOCKER_PROXY_CONTAINER_PORT_LAST`** in **`.env`** so both sides span the **same** number of TCP ports (see [`.env.example`](.env.example)).
 2. Set **`PUBLISHED_PROXY_PORT_BASE`** to the same value as **`DOCKER_PROXY_HOST_PORT_FIRST`** so dashboard URLs match the map.
-3. Set **`portBase`** in **`openvpn-proxy-config.json`** to **`DOCKER_PROXY_CONTAINER_PORT_FIRST`**, and ensure **`locationSpec.count`** (or `locations.length`) is **≤** that span.
+3. Set **`portBase`** in **`openvpn-proxy-config.json`** to **`DOCKER_PROXY_CONTAINER_PORT_FIRST`**. With **`USE_DOCKER`** and **`DOCKER_PROXY_CONTAINER_PORT_FIRST/LAST`** set, the gateway opens **that full span** of TCP listeners. If **`locationSpec.count`** (or `locations.length`) is **smaller**, extra slots are **padded at runtime** (synthetic labels; defaults from **`locationSpec.defaultOvpn`** or the first row’s **`ovpn`**); use the Dashboard to assign any `.ovpn` per port. If JSON defines **more** rows than the Docker span, only the **first N** rows are used and a trim warning is logged.
 4. **`docker compose up -d`** after edits. Very large mappings (thousands of rules) can make Compose and iptables updates slower; that is expected.
 5. Raise gateway **`ulimits.nofile`** in [`docker-compose.yml`](docker-compose.yml) if you run **many** locations **and** heavy concurrency (for example **131072** soft/hard) and align the **host** daemon limits if the kernel still returns “too many open files”.
 

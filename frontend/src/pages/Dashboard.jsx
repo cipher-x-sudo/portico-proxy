@@ -303,9 +303,10 @@ export default function Dashboard() {
           <span className="badge-primary">{totalPorts} locations</span>
         </div>
         <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-          <strong>{totalPorts} rows</strong> = <strong>{totalPorts} listeners</strong> from{' '}
-          <code className="text-xs">locationSpec.count</code> / saved locations in Configuration — not a dashboard cap.
-          Pick an .ovpn, then <strong>Open Port</strong>. Host port is what clients use on the VPS when published.
+          <strong>{totalPorts} rows</strong> = <strong>{totalPorts} TCP listeners</strong> on the gateway. In Docker,
+          when <code className="text-xs">DOCKER_PROXY_CONTAINER_PORT_FIRST/LAST</code> is set, the gateway opens that
+          many ports even if your JSON has fewer rows (extra rows are auto-filled for OVPN pick + Open Port). Pick an
+          .ovpn per row, then <strong>Open Port</strong>. Host port is what clients use when published.
         </p>
         {impliedHostFirst != null && impliedHostLast != null && (
           <p className="text-muted text-sm px-4 pt-1 pb-0 mb-0">
@@ -318,11 +319,10 @@ export default function Dashboard() {
         )}
         {unusedDockerSlots > 0 && (
           <div className="dashboard-docker-capacity-banner" role="status">
-            Docker maps <strong>{publishedDockerSpan}</strong> host ports, but this config only defines{' '}
-            <strong>{totalPorts}</strong> gateway listener(s). <strong>{unusedDockerSlots}</strong> published port(s)
-            are unused until you raise <code className="text-xs">locationSpec.count</code> (up to{' '}
-            {publishedDockerSpan}), keep <code className="text-xs">portBase</code> aligned with compose, save, and
-            restart the gateway.
+            Docker maps <strong>{publishedDockerSpan}</strong> TCP slots, but this gateway only has{' '}
+            <strong>{totalPorts}</strong> listener(s). Raise{' '}
+            <code className="text-xs">DOCKER_PROXY_CONTAINER_PORT_LAST</code> (and matching host range /{' '}
+            <code className="text-xs">portBase</code>), then restart the stack.
           </div>
         )}
         {unusedDockerSlots === 0 &&
@@ -330,9 +330,10 @@ export default function Dashboard() {
           publishedDockerSpan === totalPorts &&
           totalPorts > 0 && (
             <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-              Listener count matches Docker publish width. To get <em>more</em> rows, increase{' '}
-              <code className="text-xs">locationSpec.count</code> and widen the same-width host + container ranges in{' '}
-              <code className="text-xs">.env</code> / <code className="text-xs">docker-compose.yml</code>, then restart.
+              Listener count matches Docker publish width. For <em>more</em> rows, widen the same-width host +
+              container ranges in <code className="text-xs">.env</code> / <code className="text-xs">docker-compose.yml</code>{' '}
+              and restart (keep <code className="text-xs">portBase</code> aligned with{' '}
+              <code className="text-xs">DOCKER_PROXY_CONTAINER_PORT_FIRST</code>).
             </p>
           )}
         <div className="table-container">
