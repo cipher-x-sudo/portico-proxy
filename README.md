@@ -12,19 +12,28 @@
 
 ## Table of contents
 
-1. [Overview](#overview)  
-2. [Architecture](#architecture)  
-3. [Requirements](#requirements)  
-4. [Repository layout](#repository-layout)  
-5. [Quick start](#quick-start)  
-6. [Configuration](#configuration)  
-7. [Networking and endpoints](#networking-and-endpoints)  
-8. [Runtime behavior](#runtime-behavior)  
-9. [Operations](#operations)  
-10. [Security](#security)  
-11. [Troubleshooting](#troubleshooting)  
-12. [Host utilities](#host-utilities)  
-13. [Disclaimer](#disclaimer)
+- [Portico](#portico)
+  - [Table of contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Architecture](#architecture)
+  - [Requirements](#requirements)
+    - [Linux host: install Docker (Debian / Ubuntu)](#linux-host-install-docker-debian--ubuntu)
+  - [Repository layout](#repository-layout)
+  - [Quick start](#quick-start)
+  - [Configuration](#configuration)
+  - [Networking and endpoints](#networking-and-endpoints)
+    - [Remote / VPS](#remote--vps)
+  - [Runtime behavior](#runtime-behavior)
+  - [Operations](#operations)
+    - [Upgrades](#upgrades)
+    - [Backups](#backups)
+    - [Observability](#observability)
+    - [Windows host port reservations](#windows-host-port-reservations)
+    - [Assignments file path](#assignments-file-path)
+  - [Security](#security)
+  - [Troubleshooting](#troubleshooting)
+  - [Host utilities](#host-utilities)
+  - [Disclaimer](#disclaimer)
 
 ---
 
@@ -79,6 +88,18 @@ flowchart TB
 | **Resources** | RAM and CPU scale with concurrent workers (`maxSlots`). Many listeners may require higher **`nofile`** ulimit (see `docker-compose.yml`). |
 | **Privileges** | Gateway mounts **`/var/run/docker.sock`** to orchestrate workers — treat the host as trusted. |
 | **Compliance** | You are responsible for VPN provider **terms of service** and local law; this software is infrastructure only. |
+
+### Linux host: install Docker (Debian / Ubuntu)
+
+On a fresh VPS or workstation, install Docker and grant your user access to the daemon:
+
+```bash
+sudo apt install docker.io docker-compose -y
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+After `usermod`, you may need to log out and back in instead of `newgrp docker` for the group change to apply in all sessions. Use **`docker compose`** (with a space) for this project’s Compose V2 workflows when your install provides it.
 
 ---
 
