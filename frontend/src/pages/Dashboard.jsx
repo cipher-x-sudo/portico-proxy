@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import './Dashboard.css';
 import OvpnFileSelect from '../components/OvpnFileSelect';
-import { formatOvpnDisplayLabel, formatOvpnRichLabel, sortOvpnFiles } from '../utils/ovpnFiles';
+import { formatOvpnDisplayLabel, sortOvpnFiles } from '../utils/ovpnFiles';
 import { copyToClipboard } from '../utils/copyToClipboard';
 import { internalPortForIndex, internalToPublishedPort, publishedPortForIndex } from '../utils/portDisplay';
 
@@ -12,7 +12,6 @@ export default function Dashboard() {
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
   const [savingLauncherIdPort, setSavingLauncherIdPort] = useState(null);
-  const [savingProxyTypePort, setSavingProxyTypePort] = useState(null);
   const [launcherIdFilter, setLauncherIdFilter] = useState('');
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
@@ -20,12 +19,15 @@ export default function Dashboard() {
   const [showCreateEntry, setShowCreateEntry] = useState(false);
   const [newEntryId, setNewEntryId] = useState('');
   const [newEntryOvpn, setNewEntryOvpn] = useState('');
+  const [newEntryProxyType, setNewEntryProxyType] = useState('http');
   const [creatingEntry, setCreatingEntry] = useState(false);
 
   const [showEditEntry, setShowEditEntry] = useState(false);
   const [editTargetPort, setEditTargetPort] = useState(null);
   const [editEntryId, setEditEntryId] = useState('');
   const [editEntryOvpn, setEditEntryOvpn] = useState('');
+  const [editEntryProxyType, setEditEntryProxyType] = useState('http');
+  const [editProxyTypeInitial, setEditProxyTypeInitial] = useState('http');
   const [isEditingEntry, setIsEditingEntry] = useState(false);
 
   useEffect(() => {
@@ -107,8 +109,9 @@ export default function Dashboard() {
   const saveProxyType = async (port, nextType, previousFromServer) => {
     const next = nextType === 'socks5' ? 'socks5' : 'http';
     const prev = previousFromServer === 'socks5' ? 'socks5' : 'http';
-    if (next === prev) return;
-    setSavingProxyTypePort(port);
+    if (next === prev) {
+      return true;
+    }
     setError('');
     try {
       const res = await fetch(`/api/set-proxy-type?port=${encodeURIComponent(port)}`, {
@@ -119,15 +122,15 @@ export default function Dashboard() {
       const data = await res.json();
       if (!data.ok) {
         setError(data.error || 'Failed to save proxy type');
-        return;
+        return false;
       }
       const refreshed = await fetch('/api/status').then((r) => r.json());
       setStatus(refreshed);
       setSelectedByPort(refreshed.assignedOvpnByPort || {});
+      return true;
     } catch (err) {
       setError('Failed to save proxy type: ' + err.message);
-    } finally {
-      setSavingProxyTypePort(null);
+      return false;
     }
   };
 
@@ -233,6 +236,11 @@ export default function Dashboard() {
           throw new Error(errorData.error || `Failed to set Launcher ID for ${currentId}`);
         }
 
+        const proxyOk = await saveProxyType(targetPort, newEntryProxyType, 'http');
+        if (!proxyOk) {
+          throw new Error(`Failed to set proxy type for ${currentId}`);
+        }
+
         if (newEntryOvpn) {
           const assignSuccess = await assignOvpn(targetPort, newEntryOvpn);
           if (!assignSuccess) {
@@ -243,6 +251,7 @@ export default function Dashboard() {
 
       setNewEntryId('');
       setNewEntryOvpn('');
+      setNewEntryProxyType('http');
       setShowCreateEntry(false);
       
       // Update ui immediately
@@ -256,10 +265,13 @@ export default function Dashboard() {
     }
   };
 
-  const openEditModal = (port, currentId, currentOvpn) => {
+  const openEditModal = (port, currentId, currentOvpn, currentProxyType) => {
     setEditTargetPort(port);
     setEditEntryId(currentId || '');
     setEditEntryOvpn(currentOvpn || '');
+    const pt = currentProxyType === 'socks5' ? 'socks5' : 'http';
+    setEditEntryProxyType(pt);
+    setEditProxyTypeInitial(pt);
     setShowEditEntry(true);
   };
 
@@ -282,6 +294,11 @@ export default function Dashboard() {
       }
 
       await assignOvpn(editTargetPort, editEntryOvpn);
+
+      const proxyOk = await saveProxyType(editTargetPort, editEntryProxyType, editProxyTypeInitial);
+      if (!proxyOk) {
+        throw new Error('Failed to update proxy type');
+      }
 
       setShowEditEntry(false);
       setEditTargetPort(null);
@@ -312,7 +329,12 @@ export default function Dashboard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ovpn: '' }),
       });
-      
+      await fetch(`/api/set-proxy-type?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxyType: 'http' }),
+      });
+
       const refreshed = await fetch('/api/status').then(r => r.json());
       setStatus(refreshed);
       setSelectedByPort(refreshed.assignedOvpnByPort || {});
@@ -451,7 +473,6 @@ export default function Dashboard() {
               <thead>
                 <tr>
                   <th>Location</th>
-                  <th>Type</th>
                   <th>Host port</th>
                   <th>
                     <span className="block">host:port:user:pass</span>
@@ -476,9 +497,13 @@ export default function Dashboard() {
                     <tr key={row.internalPort}>
                       <td className="font-medium">{row.label}</td>
                       <td>
-                        <span className="badge-outline">{row.proxyType === 'socks5' ? 'SOCKS5' : 'HTTP'}</span>
+                        <div className="flex flex-col gap-1 items-start">
+                          <span className="badge-outline">
+                            {row.proxyType === 'socks5' ? 'SOCKS5' : 'HTTP'}
+                          </span>
+                          <span className="text-primary text-mono font-bold">{row.hostPort}</span>
+                        </div>
                       </td>
-                      <td className="text-primary text-mono font-bold">{row.hostPort}</td>
                       <td>
                         <button
                           type="button"
@@ -555,10 +580,15 @@ export default function Dashboard() {
               spellCheck={false}
             />
           </label>
-          <button 
-            type="button" 
-            className="btn-primary" 
-            onClick={() => setShowCreateEntry(!showCreateEntry)}
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => {
+              if (!showCreateEntry) {
+                setNewEntryProxyType('http');
+              }
+              setShowCreateEntry(!showCreateEntry);
+            }}
           >
             <span className="material-symbols-outlined">{showCreateEntry ? 'close' : 'add'}</span>
             {showCreateEntry ? 'Cancel' : 'Create Entry'}
@@ -608,6 +638,19 @@ export default function Dashboard() {
                     disabled={creatingEntry}
                     placeholder="Select location .ovpn…"
                   />
+                </label>
+                <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Proxy type</span>
+                  <select
+                    className="dashboard-modal-input dashboard-proxy-type-select"
+                    value={newEntryProxyType}
+                    onChange={(e) => setNewEntryProxyType(e.target.value === 'socks5' ? 'socks5' : 'http')}
+                    disabled={creatingEntry}
+                    aria-label="Proxy type for new entries"
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                  </select>
                 </label>
                 <div className="dashboard-modal-actions">
                   <button
@@ -664,6 +707,19 @@ export default function Dashboard() {
                     placeholder="Select location .ovpn…"
                   />
                 </label>
+                <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Proxy type</span>
+                  <select
+                    className="dashboard-modal-input dashboard-proxy-type-select"
+                    value={editEntryProxyType}
+                    onChange={(e) => setEditEntryProxyType(e.target.value === 'socks5' ? 'socks5' : 'http')}
+                    disabled={isEditingEntry}
+                    aria-label="Proxy type for this port"
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                  </select>
+                </label>
                 <div className="dashboard-modal-actions">
                   <button
                     type="submit"
@@ -683,7 +739,6 @@ export default function Dashboard() {
               <tr>
                 <th style={{ width: '40px', textAlign: 'center' }}>#</th>
                 <th>ID</th>
-                <th>Proxy</th>
                 <th>{portColumnLabel}</th>
                 <th>Selected OVPN File</th>
                 <th>Status</th>
@@ -693,11 +748,11 @@ export default function Dashboard() {
             <tbody>
               {totalPorts === 0 || locations.length === 0 ? (
                 <tr>
-                  <td colSpan="8" className="text-center p-6 text-muted">No locations configured.</td>
+                  <td colSpan="6" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
               ) : filteredPortRows.length === 0 ? (
                 <tr>
-                  <td colSpan="8" className="text-center p-6 text-muted">
+                  <td colSpan="6" className="text-center p-6 text-muted">
                     No ports match this ID search.
                   </td>
                 </tr>
@@ -714,7 +769,6 @@ export default function Dashboard() {
                   const isActive = activationState === 'active';
                   const isFailed = activationState === 'failed';
                   const canStart = !isStarting && !!selected;
-                  const selectedLocation = selected ? formatOvpnRichLabel(selected) : '';
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
                       <td className="text-muted text-sm font-bold text-center border-r border-[var(--border-color)]" style={{ opacity: 0.5 }}>
@@ -740,26 +794,16 @@ export default function Dashboard() {
                           )}
                         </div>
                       </td>
-                      <td>
-                        <select
-                          className="dashboard-proxy-type-select"
-                          value={proxyTypeServer}
-                          disabled={savingProxyTypePort === port || busyPort === port}
-                          aria-label={`Proxy type for port ${displayPort}`}
-                          onChange={(e) => saveProxyType(port, e.target.value, proxyTypeServer)}
-                        >
-                          <option value="http">HTTP</option>
-                          <option value="socks5">SOCKS5</option>
-                        </select>
-                        {savingProxyTypePort === port && (
-                          <span className="text-muted text-xs ml-1">Saving…</span>
-                        )}
-                      </td>
-                      <td className="text-primary text-mono font-bold">
-                        {displayPort}
-                        {displayPort !== port && (
-                          <div className="text-muted text-xs font-normal">Container: {port}</div>
-                        )}
+                      <td className="text-primary font-bold">
+                        <div className="flex flex-col gap-1 items-start">
+                          <span className="badge-outline">
+                            {proxyTypeServer === 'socks5' ? 'SOCKS5' : 'HTTP'}
+                          </span>
+                          <span className="text-mono">{displayPort}</span>
+                          {displayPort !== port && (
+                            <div className="text-muted text-xs font-normal">Container: {port}</div>
+                          )}
+                        </div>
                       </td>
                       <td>
                         <OvpnFileSelect
@@ -795,7 +839,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, selected)}
+                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
@@ -835,7 +879,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, selected)}
+                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
