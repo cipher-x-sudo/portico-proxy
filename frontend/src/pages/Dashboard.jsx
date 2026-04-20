@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import './Dashboard.css';
 import OvpnFileSelect from '../components/OvpnFileSelect';
 import { formatOvpnDisplayLabel, formatOvpnRichLabel, sortOvpnFiles } from '../utils/ovpnFiles';
+import { copyToClipboard } from '../utils/copyToClipboard';
 import { internalPortForIndex, internalToPublishedPort, publishedPortForIndex } from '../utils/portDisplay';
 
 export default function Dashboard() {
@@ -211,7 +212,7 @@ export default function Dashboard() {
 
   const copyProxyLine = async (text, token) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyToClipboard(text);
       setCopiedToken(token);
       window.setTimeout(() => {
         setCopiedToken((t) => (t === token ? null : t));

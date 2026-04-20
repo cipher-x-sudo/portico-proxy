@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { copyToClipboard } from '../utils/copyToClipboard';
 import './Actions.css';
 
 export default function Actions() {
@@ -95,9 +96,13 @@ export default function Actions() {
     }
   };
 
-  const copyGatewayLogs = () => {
-    navigator.clipboard.writeText(gatewayLogs.join('\n'));
-    alert("Logs copied to clipboard.");
+  const copyGatewayLogs = async () => {
+    try {
+      await copyToClipboard(gatewayLogs.join('\n'));
+      alert('Logs copied to clipboard.');
+    } catch (e) {
+      alert(e?.message ? `Copy failed: ${e.message}` : 'Copy failed');
+    }
   };
 
   const filteredLogs = gatewayLogs.filter(line => 
