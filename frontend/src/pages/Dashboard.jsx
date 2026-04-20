@@ -456,27 +456,40 @@ export default function Dashboard() {
         
         {showCreateEntry && (
           <div className="dashboard-modal-overlay" onClick={() => setShowCreateEntry(false)}>
-            <div className="dashboard-modal-content glass-panel" onClick={(e) => e.stopPropagation()}>
-              <div className="dashboard-modal-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1.25rem 1.5rem', borderBottom: '1px solid var(--border-color)', background: 'rgba(0,0,0,0.2)' }}>
-                <h3 className="font-bold m-0 text-primary">Create New Port Entry</h3>
-                <button type="button" onClick={() => setShowCreateEntry(false)} className="dashboard-modal-close" style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: '0.25rem', borderRadius: '4px' }}>
+            <div
+              className="dashboard-modal-panel"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dashboard-create-entry-title"
+            >
+              <div className="dashboard-modal-header">
+                <h3 id="dashboard-create-entry-title" className="dashboard-modal-title">
+                  Create New Port Entry
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setShowCreateEntry(false)}
+                  className="dashboard-modal-close"
+                  aria-label="Close"
+                >
                   <span className="material-symbols-outlined">close</span>
                 </button>
               </div>
-              <form className="dashboard-modal-body" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1.25rem' }} onSubmit={handleCreateEntry}>
-                <label style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <span className="font-bold text-sm text-muted">Launcher ID</span>
+              <form className="dashboard-modal-body" onSubmit={handleCreateEntry}>
+                <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Launcher ID</span>
                   <input
                     type="text"
-                    className="premium-input"
+                    className="dashboard-modal-input"
                     value={newEntryId}
                     onChange={(e) => setNewEntryId(e.target.value)}
-                    placeholder="Enter a unique ID..."
+                    placeholder="Enter a unique ID…"
                     required
                   />
                 </label>
-                <label style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <span className="font-bold text-sm text-muted">Location Configuration</span>
+                <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Location Configuration</span>
                   <OvpnFileSelect
                     files={sortedOvpnFiles}
                     value={newEntryOvpn}
@@ -485,12 +498,11 @@ export default function Dashboard() {
                     placeholder="Select location .ovpn…"
                   />
                 </label>
-                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '0.5rem' }}>
-                  <button 
-                    type="submit" 
-                    className="btn-primary" 
+                <div className="dashboard-modal-actions">
+                  <button
+                    type="submit"
+                    className="btn-primary dashboard-modal-submit"
                     disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
-                    style={{ padding: '0.75rem 1.5rem', fontSize: '0.9rem' }}
                   >
                     {creatingEntry ? 'Creating...' : 'Create Config'}
                   </button>
