@@ -157,19 +157,6 @@
   margin: 0;
 }
 
-.dashboard-docker-capacity-banner {
-  margin: 0.75rem 1rem 0;
-  padding: 0.75rem 1rem;
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(59, 130, 246, 0.45);
-  background: rgba(59, 130, 246, 0.1);
-  font-size: 0.875rem;
-}
-
-.dashboard-docker-capacity-banner code {
-  font-size: 0.8em;
-}
-
 /* Persistent tint when a row has an OVPN assigned; :hover duplicate beats .data-table tr:hover td specificity */
 .data-table tr.dashboard-row-ovpn-selected td,
 .data-table tr.dashboard-row-ovpn-selected:hover td {

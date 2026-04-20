@@ -162,29 +162,6 @@ export default function Dashboard() {
     allPortRows.push({ loc, idx });
   }
 
-  /** How many host:container mappings Docker published (from gateway env / status). */
-  let publishedDockerSpan =
-    typeof status.dockerPublishedPortSpan === 'number' && status.dockerPublishedPortSpan > 0
-      ? status.dockerPublishedPortSpan
-      : null;
-  if (
-    publishedDockerSpan == null &&
-    typeof status.dockerPublishedHostPortFirst === 'number' &&
-    typeof status.dockerPublishedHostPortLast === 'number' &&
-    status.dockerPublishedHostPortLast >= status.dockerPublishedHostPortFirst
-  ) {
-    publishedDockerSpan =
-      status.dockerPublishedHostPortLast - status.dockerPublishedHostPortFirst + 1;
-  }
-  const unusedDockerSlots =
-    publishedDockerSpan != null && publishedDockerSpan > totalPorts
-      ? publishedDockerSpan - totalPorts
-      : 0;
-  const impliedHostFirst =
-    typeof status.publishedPortBase === 'number' ? status.publishedPortBase : null;
-  const impliedHostLast =
-    impliedHostFirst != null && totalPorts > 0 ? impliedHostFirst + totalPorts - 1 : null;
-
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
       ? 'Host proxy port'
@@ -302,40 +279,6 @@ export default function Dashboard() {
           </div>
           <span className="badge-primary">{totalPorts} locations</span>
         </div>
-        <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-          <strong>{totalPorts} rows</strong> = <strong>{totalPorts} TCP listeners</strong> on the gateway. In Docker,
-          when <code className="text-xs">DOCKER_PROXY_CONTAINER_PORT_FIRST/LAST</code> is set, the gateway opens that
-          many ports even if your JSON has fewer rows (extra rows are auto-filled for OVPN pick + Open Port). Pick an
-          .ovpn per row, then <strong>Open Port</strong>. Host port is what clients use when published.
-        </p>
-        {impliedHostFirst != null && impliedHostLast != null && (
-          <p className="text-muted text-sm px-4 pt-1 pb-0 mb-0">
-            Current listener host range: <strong>{impliedHostFirst}</strong>–<strong>{impliedHostLast}</strong>
-            {publishedDockerSpan != null && publishedDockerSpan !== totalPorts && (
-              <> (Docker publish capacity: {publishedDockerSpan} TCP slots)</>
-            )}
-            .
-          </p>
-        )}
-        {unusedDockerSlots > 0 && (
-          <div className="dashboard-docker-capacity-banner" role="status">
-            Docker maps <strong>{publishedDockerSpan}</strong> TCP slots, but this gateway only has{' '}
-            <strong>{totalPorts}</strong> listener(s). Raise{' '}
-            <code className="text-xs">DOCKER_PROXY_CONTAINER_PORT_LAST</code> (and matching host range /{' '}
-            <code className="text-xs">portBase</code>), then restart the stack.
-          </div>
-        )}
-        {unusedDockerSlots === 0 &&
-          publishedDockerSpan != null &&
-          publishedDockerSpan === totalPorts &&
-          totalPorts > 0 && (
-            <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-              Listener count matches Docker publish width. For <em>more</em> rows, widen the same-width host +
-              container ranges in <code className="text-xs">.env</code> / <code className="text-xs">docker-compose.yml</code>{' '}
-              and restart (keep <code className="text-xs">portBase</code> aligned with{' '}
-              <code className="text-xs">DOCKER_PROXY_CONTAINER_PORT_FIRST</code>).
-            </p>
-          )}
         <div className="table-container">
           <table className="data-table">
             <thead>
