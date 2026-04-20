@@ -11,7 +11,8 @@ export default function Dashboard() {
   const [ovpnFilesHint, setOvpnFilesHint] = useState('');
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
-  const [savingLauncherIdPort, setSavingLauncherIdPort] = useState(null);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [selectedTablePorts, setSelectedTablePorts] = useState([]);
   const [launcherIdFilter, setLauncherIdFilter] = useState('');
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
@@ -131,33 +132,6 @@ export default function Dashboard() {
     } catch (err) {
       setError('Failed to save proxy type: ' + err.message);
       return false;
-    }
-  };
-
-  const saveLauncherId = async (port, trimmedValue, previousFromServer) => {
-    const next = (trimmedValue || '').trim();
-    const prev = (previousFromServer || '').trim();
-    if (next === prev) return;
-    setSavingLauncherIdPort(port);
-    setError('');
-    try {
-      const res = await fetch(`/api/set-launcher-id?port=${encodeURIComponent(port)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ launcherId: next }),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        setError(data.error || 'Failed to save ID');
-        return;
-      }
-      const refreshed = await fetch('/api/status').then((r) => r.json());
-      setStatus(refreshed);
-      setSelectedByPort(refreshed.assignedOvpnByPort || {});
-    } catch (err) {
-      setError('Failed to save ID: ' + err.message);
-    } finally {
-      setSavingLauncherIdPort(null);
     }
   };
 
@@ -313,35 +287,91 @@ export default function Dashboard() {
     }
   };
 
+  const runDeleteApis = async (port) => {
+    await fetch(`/api/deactivate?port=${encodeURIComponent(port)}`, { method: 'POST' });
+    await fetch(`/api/set-launcher-id?port=${encodeURIComponent(port)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ launcherId: '' }),
+    });
+    await fetch(`/api/assign-ovpn?port=${encodeURIComponent(port)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ovpn: '' }),
+    });
+    await fetch(`/api/set-proxy-type?port=${encodeURIComponent(port)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proxyType: 'http' }),
+    });
+  };
+
   const deleteEntry = async (port) => {
-    if (!window.confirm("Are you sure you want to delete this entry?")) return;
+    if (!window.confirm('Are you sure you want to delete this entry?')) return;
     setBusyPort(port);
     setError('');
     try {
-      await fetch(`/api/deactivate?port=${encodeURIComponent(port)}`, { method: 'POST' });
-      await fetch(`/api/set-launcher-id?port=${encodeURIComponent(port)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ launcherId: '' }),
-      });
-      await fetch(`/api/assign-ovpn?port=${encodeURIComponent(port)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ovpn: '' }),
-      });
-      await fetch(`/api/set-proxy-type?port=${encodeURIComponent(port)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ proxyType: 'http' }),
-      });
-
-      const refreshed = await fetch('/api/status').then(r => r.json());
+      await runDeleteApis(port);
+      const refreshed = await fetch('/api/status').then((r) => r.json());
       setStatus(refreshed);
       setSelectedByPort(refreshed.assignedOvpnByPort || {});
+      setSelectedTablePorts((prev) => prev.filter((x) => x !== port));
     } catch (err) {
       setError('Failed to delete entry: ' + err.message);
     } finally {
       setBusyPort(null);
+    }
+  };
+
+  const refreshStatus = async () => {
+    const refreshed = await fetch('/api/status').then((r) => r.json());
+    setStatus(refreshed);
+    setSelectedByPort(refreshed.assignedOvpnByPort || {});
+  };
+
+  const batchDeleteSelected = async (validPorts) => {
+    const targets = selectedTablePorts.filter((p) => validPorts.includes(p));
+    if (targets.length === 0) return;
+    if (!window.confirm(`Delete ${targets.length} selected ${targets.length === 1 ? 'entry' : 'entries'}?`)) return;
+    setBatchBusy(true);
+    setError('');
+    try {
+      for (const port of targets) {
+        await runDeleteApis(port);
+      }
+      await refreshStatus();
+      setSelectedTablePorts([]);
+    } catch (err) {
+      setError('Batch delete failed: ' + err.message);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const batchApplyProxyType = async (validPorts, type) => {
+    const targets = selectedTablePorts.filter((p) => validPorts.includes(p));
+    if (targets.length === 0) return;
+    const snap = status;
+    if (!snap) return;
+    const portBase = snap.portBase;
+    const locs = snap.locations || [];
+    setBatchBusy(true);
+    setError('');
+    try {
+      for (const port of targets) {
+        const idx = port - portBase;
+        const loc = idx >= 0 && idx < locs.length ? locs[idx] : null;
+        const prev = loc?.proxyType === 'socks5' ? 'socks5' : 'http';
+        const ok = await saveProxyType(port, type, prev);
+        if (!ok) {
+          throw new Error('Proxy update rejected by server');
+        }
+      }
+      await refreshStatus();
+    } catch (err) {
+      setError('Batch proxy update failed: ' + err.message);
+    } finally {
+      setBatchBusy(false);
     }
   };
 
@@ -410,6 +440,11 @@ export default function Dashboard() {
     return hasLauncherId || hasOvpn || isEnabled;
   });
 
+  const configuredInternalPorts = configuredPortRows
+    .map(({ idx }) => internalPortForIndex(status, idx))
+    .filter((p) => p != null);
+  const effectiveSelectedPorts = selectedTablePorts.filter((p) => configuredInternalPorts.includes(p));
+
   const launcherIdQuery = launcherIdFilter.trim().toLowerCase();
   const filteredPortRows = launcherIdQuery
     ? configuredPortRows.filter(({ loc }) => {
@@ -417,6 +452,13 @@ export default function Dashboard() {
         return id.toLowerCase().includes(launcherIdQuery);
       })
     : configuredPortRows;
+
+  const visibleInternalPorts = filteredPortRows
+    .map(({ idx }) => internalPortForIndex(status, idx))
+    .filter((p) => p != null);
+  const selectedInViewCount = visibleInternalPorts.filter((p) => selectedTablePorts.includes(p)).length;
+  const allVisibleSelected =
+    visibleInternalPorts.length > 0 && selectedInViewCount === visibleInternalPorts.length;
 
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
@@ -594,7 +636,53 @@ export default function Dashboard() {
             {showCreateEntry ? 'Cancel' : 'Create Entry'}
           </button>
         </div>
-        
+
+        {selectedTablePorts.length > 0 && (
+          <div className="dashboard-batch-bar flex flex-wrap items-center gap-2 px-4 py-3 border-t border-[var(--border-color)]">
+            <span className="text-sm font-medium">
+              {selectedTablePorts.length} selected
+              {effectiveSelectedPorts.length !== selectedTablePorts.length && (
+                <span className="text-muted font-normal">
+                  {' '}
+                  ({effectiveSelectedPorts.length} apply — others are not in this list)
+                </span>
+              )}
+            </span>
+            <button
+              type="button"
+              className="btn-secondary text-sm"
+              disabled={batchBusy || effectiveSelectedPorts.length === 0}
+              onClick={() => batchApplyProxyType(configuredInternalPorts, 'http')}
+            >
+              Set HTTP
+            </button>
+            <button
+              type="button"
+              className="btn-secondary text-sm"
+              disabled={batchBusy || effectiveSelectedPorts.length === 0}
+              onClick={() => batchApplyProxyType(configuredInternalPorts, 'socks5')}
+            >
+              Set SOCKS5
+            </button>
+            <button
+              type="button"
+              className="btn-danger text-sm"
+              disabled={batchBusy || effectiveSelectedPorts.length === 0}
+              onClick={() => batchDeleteSelected(configuredInternalPorts)}
+            >
+              Delete selected
+            </button>
+            <button
+              type="button"
+              className="btn-secondary text-sm"
+              disabled={batchBusy}
+              onClick={() => setSelectedTablePorts([])}
+            >
+              Clear selection
+            </button>
+          </div>
+        )}
+
         {showCreateEntry && (
           <div className="dashboard-modal-overlay" onClick={() => setShowCreateEntry(false)}>
             <div
@@ -737,6 +825,25 @@ export default function Dashboard() {
           <table className="data-table">
             <thead>
               <tr>
+                <th style={{ width: '36px', textAlign: 'center' }} aria-label="Select rows">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    disabled={batchBusy || visibleInternalPorts.length === 0}
+                    onChange={() => {
+                      if (allVisibleSelected) {
+                        setSelectedTablePorts((prev) =>
+                          prev.filter((p) => !visibleInternalPorts.includes(p)),
+                        );
+                      } else {
+                        setSelectedTablePorts((prev) => {
+                          const next = new Set([...prev, ...visibleInternalPorts]);
+                          return [...next];
+                        });
+                      }
+                    }}
+                  />
+                </th>
                 <th style={{ width: '40px', textAlign: 'center' }}>#</th>
                 <th>ID</th>
                 <th>{portColumnLabel}</th>
@@ -748,11 +855,11 @@ export default function Dashboard() {
             <tbody>
               {totalPorts === 0 || locations.length === 0 ? (
                 <tr>
-                  <td colSpan="6" className="text-center p-6 text-muted">No locations configured.</td>
+                  <td colSpan="7" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
               ) : filteredPortRows.length === 0 ? (
                 <tr>
-                  <td colSpan="6" className="text-center p-6 text-muted">
+                  <td colSpan="7" className="text-center p-6 text-muted">
                     No ports match this ID search.
                   </td>
                 </tr>
@@ -769,8 +876,22 @@ export default function Dashboard() {
                   const isActive = activationState === 'active';
                   const isFailed = activationState === 'failed';
                   const canStart = !isStarting && !!selected;
+                  const rowChecked = selectedTablePorts.includes(port);
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
+                      <td className="text-center align-middle">
+                        <input
+                          type="checkbox"
+                          checked={rowChecked}
+                          disabled={batchBusy || busyPort === port}
+                          onChange={() => {
+                            setSelectedTablePorts((prev) =>
+                              prev.includes(port) ? prev.filter((x) => x !== port) : [...prev, port],
+                            );
+                          }}
+                          aria-label={`Select row ${launcherIdServer || displayPort}`}
+                        />
+                      </td>
                       <td className="text-muted text-sm font-bold text-center border-r border-[var(--border-color)]" style={{ opacity: 0.5 }}>
                         {arrayIndex + 1}
                       </td>

@@ -439,3 +439,7 @@
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+.dashboard-batch-bar {
+  background: rgba(0, 0, 0, 0.15);
+}
