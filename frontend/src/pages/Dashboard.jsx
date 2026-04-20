@@ -1028,15 +1028,23 @@ export default function Dashboard() {
                         </div>
                       </td>
                       <td className="text-primary font-bold">
-                        <div className="flex flex-col gap-1 items-start">
-                          <span className="badge-outline">
-                            {proxyTypeServer === 'socks5' ? 'SOCKS5' : 'HTTP'}
-                          </span>
-                          <span className="text-mono">{displayPort}</span>
-                          {displayPort !== port && (
-                            <div className="text-muted text-xs font-normal">Container: {port}</div>
+                        <button
+                          type="button"
+                          className="dashboard-copy-line text-mono"
+                          title="Click to copy host port"
+                          onClick={() => {
+                            copyToClipboard(String(displayPort));
+                            setCopiedToken(`hostport-${port}`);
+                            window.setTimeout(() => {
+                              setCopiedToken((t) => (t === `hostport-${port}` ? null : t));
+                            }, 2000);
+                          }}
+                        >
+                          <span className="dashboard-copy-code">{displayPort}</span>
+                          {copiedToken === `hostport-${port}` && (
+                            <span className="dashboard-copy-toast">Copied!</span>
                           )}
-                        </div>
+                        </button>
                       </td>
                       <td>
                         <OvpnFileSelect
