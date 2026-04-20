@@ -19,6 +19,7 @@ import os
 import secrets
 import re
 import select
+import selectors
 import signal
 import socket
 import subprocess
@@ -2448,45 +2449,69 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _on_shutdown_signal)
     signal.signal(signal.SIGINT, _on_shutdown_signal)
 
-    try:
-        while True:
-            r, _, _ = select.select(server_sockets, [], [], 1)
-            if shutdown_flag:
+    def _accept_and_dispatch(sock: socket.socket) -> None:
+        try:
+            client_sock, _ = sock.accept()
+        except OSError:
+            return
+        port = port_base
+        for p, s in sockets_by_port.items():
+            if s is sock:
+                port = p
                 break
-            for sock in r:
-                try:
-                    client_sock, _ = sock.accept()
-                except OSError:
-                    continue
-                port = port_base
-                for p, s in sockets_by_port.items():
-                    if s is sock:
-                        port = p
+        t = threading.Thread(
+            target=handle_connection,
+            args=(
+                client_sock,
+                port,
+                config,
+                config_path,
+                port_base,
+                internal_port_base,
+                max_slots,
+                slots,
+                port_to_slot,
+                active_ports,
+                port_ovpn_assignment,
+                activation_state_by_port,
+                lock,
+                use_docker,
+                docker_image,
+                docker_network,
+                ovpn_volume_name,
+            ),
+            daemon=True,
+        )
+        t.start()
+
+    try:
+        # select() fails on Linux when any listener fd >= FD_SETSIZE (~1024); use poll-based API instead.
+        if not server_sockets:
+            while not shutdown_flag:
+                time.sleep(1.0)
+        else:
+            sel = selectors.DefaultSelector()
+            try:
+                for s in server_sockets:
+                    sel.register(s, selectors.EVENT_READ)
+                while not shutdown_flag:
+                    events = sel.select(timeout=1.0)
+                    if shutdown_flag:
                         break
-                t = threading.Thread(
-                    target=handle_connection,
-                    args=(
-                        client_sock,
-                        port,
-                        config,
-                        config_path,
-                        port_base,
-                        internal_port_base,
-                        max_slots,
-                        slots,
-                        port_to_slot,
-                        active_ports,
-                        port_ovpn_assignment,
-                        activation_state_by_port,
-                        lock,
-                        use_docker,
-                        docker_image,
-                        docker_network,
-                        ovpn_volume_name,
-                    ),
-                    daemon=True,
-                )
-                t.start()
+                    for key, _ in events:
+                        sock = key.fileobj
+                        if isinstance(sock, socket.socket):
+                            _accept_and_dispatch(sock)
+            finally:
+                for s in server_sockets:
+                    try:
+                        sel.unregister(s)
+                    except Exception:
+                        pass
+                try:
+                    sel.close()
+                except Exception:
+                    pass
     except KeyboardInterrupt:
         pass
     finally:

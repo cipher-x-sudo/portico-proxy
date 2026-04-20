@@ -176,17 +176,17 @@ Legacy keys (`openvpnPath`, `forceBindIPPath`, `pythonPath`, `maxLocations`) exi
 
 | Exposure | Default bind | Description |
 |----------|----------------|-------------|
-| **Dashboard** | `127.0.0.1:8080` (default in Compose) | Static UI; `/api/*` proxied to gateway. For a VPS, edit **`docker-compose.yml`** and change the published bind from **`127.0.0.1`** to **`0.0.0.0`** on the frontend **`8080`** line. |
+| **Dashboard** | `0.0.0.0:8080` (default in Compose) | Static UI; `/api/*` proxied to gateway. Use **`http://YOUR_IP:8080`** from another machine. For local-only, set the publish bind to **`127.0.0.1:8080:80`**. |
 | **Control API** | `127.0.0.1:49999` | JSON REST used by the UI (`/api/status`, `/api/activate`, …). Always localhost on the host. |
-| **HTTP proxies** | `127.0.0.1:58000+` (host, default) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) must match the **left-hand** side of the port range in `docker-compose.yml`. For a VPS, change the leading **`127.0.0.1`** to **`0.0.0.0`** on the gateway proxy port range line. |
+| **HTTP proxies** | `0.0.0.0:58000+` (host, default) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) must match the **left-hand** side of the port range in `docker-compose.yml`. |
 
 **Clients on the same machine** use `127.0.0.1` and the **published** host port. **Android emulator** uses host alias **`10.0.2.2`** (e.g. `10.0.2.2:58000`). For LAN or internet clients, set **`clientProxyHost`** in **`openvpn-proxy-config.json`** (or the Config page) to the hostname or IP clients use, and allow those TCP ports in the firewall.
 
 ### Remote / VPS
 
-1. In **`docker-compose.yml`**, change **`127.0.0.1`** to **`0.0.0.0`** on the **frontend** `8080` mapping and on the **gateway** proxy host-port range line so the dashboard and HTTP proxies listen on all interfaces (the control API **`49999`** line stays **`127.0.0.1`**; the UI still reaches the gateway over the Docker network).
+1. Compose defaults publish the dashboard and proxy ports on **`0.0.0.0`** so they are reachable on the server’s public IP (the control API **`49999`** stays **`127.0.0.1`** only).
 2. Set **`clientProxyHost`** in **`openvpn-proxy-config.json`** to your VPS **public IP** or **hostname** so `/api/status` and the dashboard show the correct host for proxy URLs.
-3. Open the host firewall only for **TCP `8080`** and the **TCP range** you actually use: **`PUBLISHED_PROXY_PORT_BASE`** through **`PUBLISHED_PROXY_PORT_BASE + locationSpec.count - 1`**, aligned with **`DOCKER_PROXY_HOST_PORT_FIRST`** / **`DOCKER_PROXY_HOST_LAST`** in Compose if you override them. You do not need to expose every mapped slot if your config uses fewer locations.
+3. Open the host firewall (example **UFW**): `sudo ufw allow 8080/tcp` and a TCP range for proxies you use, e.g. `sudo ufw allow 58000:58127/tcp` when **`locationSpec.count`** is **128** (adjust end port to **`PUBLISHED_PROXY_PORT_BASE + count - 1`**). If **`ufw`** is enabled and these ports are closed, browsers will time out even though Docker is listening.
 4. Hardening: use **strong** `proxyUsername` / `proxyPassword`; do not expose **`49999`** publicly; consider TLS or SSH tunneling for **`8080`** on untrusted networks.
 
 ---
@@ -237,7 +237,7 @@ Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount tar
 ## Security
 
 - **Docker socket** — The gateway can start arbitrary worker containers; isolate the daemon and restrict who can access the compose project directory.  
-- **Bind addresses** — Default Compose keeps the UI and proxy host ports on **127.0.0.1**; the control API stays on **127.0.0.1** only. Publishing **`0.0.0.0`** on a VPS (by editing **`docker-compose.yml`**) requires explicit threat modeling, **mandatory proxy authentication**, and host/network firewall rules.  
+- **Bind addresses** — Default Compose publishes the UI and proxy host ports on **`0.0.0.0`** (reachable on the LAN/public IP); the control API stays on **127.0.0.1** only. Treat **`8080`** and **`58000+`** as sensitive surfaces: **mandatory proxy authentication**, host firewall, and TLS or SSH tunneling on untrusted networks.  
 - **Secrets** — Provider credentials belong in `.env` or `ovpn/**/auth.txt`, not in tracked JSON. Rotate credentials if a workstation or volume was compromised.  
 - **Control API** — Equivalent to administrative access; do not expose **`49999`** to untrusted networks without TLS termination and authentication in front (not included by default).
 
@@ -247,7 +247,9 @@ Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount tar
 
 | Symptom | Likely cause | Action |
 |--------|----------------|--------|
-| **502** on `/api/status` | Gateway not listening (crash loop, port bind, old image). | `docker compose logs gateway`; rebuild gateway; confirm config JSON exists and is valid. |
+| **502** on `/api/status` | Gateway not listening (crash loop, port bind, old image). | `docker compose logs portico-gateway` (or `docker compose logs gateway`); rebuild with `docker compose build gateway --no-cache && docker compose up -d gateway`. |
+| **`portico-gateway` restarting** | Bad config mount, bind error, or missing files. | Ensure **`backend/openvpn-proxy-config.json`** exists on the host **before** the first `up` (otherwise Docker creates a **directory** at the mount path and the gateway exits). Same for **`openvpn-proxy-assignments.json`**. Read logs for `Failed to bind` or `Config path is a directory`. |
+| **Cannot open dashboard from public IP** | Firewall or bind address. | With default Compose, use **`http://PUBLIC_IP:8080`**. Allow **8080/tcp** (and proxy ports) in **ufw**/cloud security group. For local-only, set **`127.0.0.1:8080:80`** in **`docker-compose.yml`**. |
 | **`Rejecting connection on inactive port`** | Port not activated. | Assign `.ovpn`, activate in UI, wait for **active** state. |
 | **Wrong port from host** | Using container port instead of **published** port. | Use host map (e.g. **58000**), not **50000**, unless you intentionally publish 50000. |
 | **`files: []`** from `/api/ovpn-files` | Empty or wrong **`ovpn_data`** mount. | `docker exec portico-gateway ls -la /ovpn`; fix **`OVPN_HOST_PATH`**, recreate **`ovpn_data`** if needed (`docker compose down` then `docker volume rm ovpn_data` — **data loss**). |

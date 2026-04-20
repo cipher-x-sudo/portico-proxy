@@ -1,8 +1,8 @@
 # Portico — dynamic VPN proxy gateway + on-demand worker containers (Linux / Windows Docker Desktop).
 # One proxy port per location; gateway listens on portBase, portBase+1, ... (e.g. 50000-50515). Port range size must be >= number of locations.
 # ovpn_data: set OVPN_HOST_PATH in .env to your .ovpn folder (e.g. E:/FB/protonusa/ovpn on Windows). Default ./ovpn (run compose from repo root).
-# Remote access: in this file change 127.0.0.1 to 0.0.0.0 on the frontend and gateway proxy port lines; set
-# "clientProxyHost" in backend/openvpn-proxy-config.json to your VPS IP or hostname (Config page or edit JSON).
+# Dashboard + proxy ports publish on 0.0.0.0 (public IP). Set "clientProxyHost" in openvpn-proxy-config.json to that IP/DNS.
+# For local-only, use 127.0.0.1 instead of 0.0.0.0 on the frontend :8080 and gateway proxy range lines below.
 #
 # The gateway may start extra worker containers (proxy-<port>) on proxynet. On SIGTERM/SIGINT it stops them
 # before exit; stop_grace_period on the gateway gives time for that during "docker compose down".
@@ -60,12 +60,12 @@ services:
     ports:
       - "127.0.0.1:49999:49999"           # control API bound to localhost only
       # Container ports must equal portBase..portBase+N-1 from openvpn-proxy-config.json (here: 50000-50515 for up to 516 locations).
-      # VPS: change leading 127.0.0.1 to 0.0.0.0 so clients can use the server public IP. Override host range via .env if needed.
-      - "127.0.0.1:${DOCKER_PROXY_HOST_PORT_FIRST:-58000}-${DOCKER_PROXY_HOST_PORT_LAST:-58515}:50000-50515"
+      # Host 0.0.0.0: reachable on the VPS public IP (use host firewall + strong proxy auth). Use 127.0.0.1 for local-only.
+      - "0.0.0.0:${DOCKER_PROXY_HOST_PORT_FIRST:-58000}-${DOCKER_PROXY_HOST_PORT_LAST:-58515}:50000-50515"
     ulimits:
       nofile:
-        soft: 4096
-        hard: 4096
+        soft: 65536
+        hard: 65536
     init: true
     stop_grace_period: 60s
     networks:
@@ -81,8 +81,8 @@ services:
     depends_on:
       - gateway
     ports:
-      # VPS: change 127.0.0.1 to 0.0.0.0 so the dashboard is reachable on the server public IP.
-      - "127.0.0.1:8080:80"
+      # 0.0.0.0: dashboard on public IP. Use 127.0.0.1:8080:80 for local-only.
+      - "0.0.0.0:8080:80"
     networks:
       - proxynet
     restart: unless-stopped
