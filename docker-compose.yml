@@ -90,6 +90,8 @@ services:
     ports:
       # 0.0.0.0: dashboard on public IP. Use 127.0.0.1:8080:80 for local-only.
       - "0.0.0.0:8080:80"
+      # HTTPS (self-signed in image). Mount your own cert/key over /etc/nginx/ssl/*.pem for a real CA.
+      - "0.0.0.0:8443:443"
     networks:
       - proxynet
     restart: unless-stopped
