@@ -456,47 +456,44 @@ export default function Dashboard() {
         
         {showCreateEntry && (
           <div className="dashboard-modal-overlay" onClick={() => setShowCreateEntry(false)}>
-            <div className="dashboard-modal-content" onClick={(e) => e.stopPropagation()}>
-              <div className="table-header border-b border-[var(--border-color)] p-4 m-0" style={{ marginBottom: "1rem" }}>
-                <h3 className="font-bold">Create New Port Entry</h3>
-                <button type="button" className="btn-secondary" style={{ padding: "0.25rem" }} onClick={() => setShowCreateEntry(false)}>
+            <div className="dashboard-modal-content glass-panel" onClick={(e) => e.stopPropagation()}>
+              <div className="dashboard-modal-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1.25rem 1.5rem', borderBottom: '1px solid var(--border-color)', background: 'rgba(0,0,0,0.2)' }}>
+                <h3 className="font-bold m-0 text-primary">Create New Port Entry</h3>
+                <button type="button" onClick={() => setShowCreateEntry(false)} className="dashboard-modal-close" style={{ background: 'transparent', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: '0.25rem', borderRadius: '4px' }}>
                   <span className="material-symbols-outlined">close</span>
                 </button>
               </div>
-              <form className="p-4 pt-0" onSubmit={handleCreateEntry}>
-                <div className="flex flex-col gap-4">
-                  <label className="flex flex-col gap-1 w-full">
-                    <span className="font-bold text-sm">Launcher ID</span>
-                    <input
-                      type="text"
-                      className="input-field"
-                      style={{ padding: '0.6rem', borderRadius: '4px', border: '1px solid var(--border-color)' }}
-                      value={newEntryId}
-                      onChange={(e) => setNewEntryId(e.target.value)}
-                      placeholder="Enter a unique ID..."
-                      required
-                    />
-                  </label>
-                  <label className="flex flex-col gap-1 w-full">
-                    <span className="font-bold text-sm">Location Configuration</span>
-                    <OvpnFileSelect
-                      files={sortedOvpnFiles}
-                      value={newEntryOvpn}
-                      onChange={setNewEntryOvpn}
-                      disabled={creatingEntry}
-                      placeholder="Select location .ovpn…"
-                    />
-                  </label>
-                  <div className="flex justify-end mt-4">
-                    <button 
-                      type="submit" 
-                      className="btn-primary" 
-                      disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
-                      style={{ padding: '0.6rem 1.2rem'}}
-                    >
-                      {creatingEntry ? 'Creating...' : 'Create Config'}
-                    </button>
-                  </div>
+              <form className="dashboard-modal-body" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1.25rem' }} onSubmit={handleCreateEntry}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <span className="font-bold text-sm text-muted">Launcher ID</span>
+                  <input
+                    type="text"
+                    className="premium-input"
+                    value={newEntryId}
+                    onChange={(e) => setNewEntryId(e.target.value)}
+                    placeholder="Enter a unique ID..."
+                    required
+                  />
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <span className="font-bold text-sm text-muted">Location Configuration</span>
+                  <OvpnFileSelect
+                    files={sortedOvpnFiles}
+                    value={newEntryOvpn}
+                    onChange={setNewEntryOvpn}
+                    disabled={creatingEntry}
+                    placeholder="Select location .ovpn…"
+                  />
+                </label>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '0.5rem' }}>
+                  <button 
+                    type="submit" 
+                    className="btn-primary" 
+                    disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
+                    style={{ padding: '0.75rem 1.5rem', fontSize: '0.9rem' }}
+                  >
+                    {creatingEntry ? 'Creating...' : 'Create Config'}
+                  </button>
                 </div>
               </form>
             </div>
