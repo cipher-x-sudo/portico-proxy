@@ -1,7 +1,8 @@
 # Portico — dynamic VPN proxy gateway + on-demand worker containers (Linux / Windows Docker Desktop).
 # One proxy port per location; gateway listens on portBase, portBase+1, ... (e.g. 50000-50515). Port range size must be >= number of locations.
 # ovpn_data: set OVPN_HOST_PATH in .env to your .ovpn folder (e.g. E:/FB/protonusa/ovpn on Windows). Default ./ovpn (run compose from repo root).
-# Dashboard + proxy ports publish on 0.0.0.0 (public IP). Set "clientProxyHost" in openvpn-proxy-config.json to that IP/DNS.
+# Dashboard + proxy ports publish on 0.0.0.0 (public IP). clientProxyHost in openvpn-proxy-config.json is optional:
+# the gateway auto-detects public IPv4 when empty (see autoDetectClientProxyHost); set clientProxyHost for DNS/LAN.
 # For local-only, use 127.0.0.1 instead of 0.0.0.0 on the frontend :8080 and gateway proxy range lines below.
 #
 # The gateway may start extra worker containers (proxy-<port>) on proxynet. On SIGTERM/SIGINT it stops them

@@ -272,9 +272,18 @@ export default function Config() {
               onChange={(e) => handleChange('clientProxyHost', e.target.value)}
             />
             <p className="text-muted text-sm mt-1 mb-0">
-              Hostname or IP shown in the dashboard for HTTP proxy URLs. Set when clients connect via a public
-              IP or DNS name; leave empty for local-only hints.
+              Hostname or IP shown in the dashboard for HTTP proxy URLs. Leave empty on a VPS to let the gateway
+              detect your public IPv4 (cached; uses ifconfig.me / ipify with fallbacks). Set explicitly when you need
+              a DNS name or a LAN IP instead of the detected WAN address.
             </p>
+            <label className="checkbox-label mt-3">
+              <input
+                type="checkbox"
+                checked={config.autoDetectClientProxyHost !== false}
+                onChange={(e) => handleChange('autoDetectClientProxyHost', e.target.checked)}
+              />
+              <span>Auto-detect public IPv4 when client proxy host is empty and listeners use all interfaces</span>
+            </label>
           </div>
         </section>
 

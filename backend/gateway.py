@@ -62,6 +62,81 @@ PORTS_PER_LOCATION = 1  # One HTTP proxy port per location
 BACKEND_HTTP_PORT = 8080
 EXTEND_PORT_IDLE_SECONDS = 30 * 60  # user extend: add this much idle budget (monotonic last_activity)
 
+# Public WAN IPv4 for dashboard proxy URLs when clientProxyHost is empty and listeners bind all interfaces.
+_AUTO_WAN_IP_STATE: Dict[str, Any] = {"ip": None, "valid_until": 0.0, "cooldown_until": 0.0}
+_AUTO_WAN_IP_LOCK = threading.Lock()
+_AUTO_WAN_IP_TTL_SEC = 600.0
+_AUTO_WAN_IP_FAIL_COOLDOWN_SEC = 45.0
+
+
+def _is_plain_ipv4(s: str) -> bool:
+    parts = s.strip().split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
+def _fetch_public_wan_ipv4_once() -> Optional[str]:
+    import urllib.error
+    import urllib.request as urllib_request
+
+    ua = "Portico-Proxy-Gateway/1.0"
+
+    def try_text(url: str) -> Optional[str]:
+        try:
+            req = urllib_request.Request(url, headers={"User-Agent": ua})
+            with urllib_request.urlopen(req, timeout=5) as resp:
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+            line = raw.splitlines()[0].strip() if raw else ""
+            return line if _is_plain_ipv4(line) else None
+        except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+            return None
+
+    def try_ipify() -> Optional[str]:
+        try:
+            req = urllib_request.Request(
+                "https://api.ipify.org?format=json",
+                headers={"User-Agent": ua},
+            )
+            with urllib_request.urlopen(req, timeout=5) as resp:
+                raw = resp.read().decode("utf-8", errors="replace").strip()
+            data = json.loads(raw)
+            ip = str(data.get("ip", "")).strip()
+            return ip if _is_plain_ipv4(ip) else None
+        except (urllib.error.URLError, OSError, ValueError, UnicodeError, json.JSONDecodeError, TypeError):
+            return None
+
+    for ip in (try_text("https://ifconfig.me/ip"), try_ipify(), try_text("https://icanhazip.com/")):
+        if ip:
+            return ip
+    return None
+
+
+def get_cached_public_wan_ipv4() -> Optional[str]:
+    """Best-effort egress IPv4; cached with TTL and failure cooldown (no dependency beyond stdlib)."""
+    now = time.monotonic()
+    with _AUTO_WAN_IP_LOCK:
+        ip = _AUTO_WAN_IP_STATE.get("ip")
+        if ip and now < float(_AUTO_WAN_IP_STATE.get("valid_until") or 0.0):
+            return str(ip)
+        if now < float(_AUTO_WAN_IP_STATE.get("cooldown_until") or 0.0):
+            return str(ip) if ip else None
+    fetched = _fetch_public_wan_ipv4_once()
+    now2 = time.monotonic()
+    with _AUTO_WAN_IP_LOCK:
+        if fetched:
+            _AUTO_WAN_IP_STATE["ip"] = fetched
+            _AUTO_WAN_IP_STATE["valid_until"] = now2 + _AUTO_WAN_IP_TTL_SEC
+            _AUTO_WAN_IP_STATE["cooldown_until"] = 0.0
+            return fetched
+        _AUTO_WAN_IP_STATE["cooldown_until"] = now2 + _AUTO_WAN_IP_FAIL_COOLDOWN_SEC
+        cur = _AUTO_WAN_IP_STATE.get("ip")
+        return str(cur) if cur else None
+
+
 listening_sockets: List[socket.socket] = []
 shutdown_flag = False
 CONTROL_PORT_DEFAULT = 49999
@@ -91,6 +166,16 @@ def _log(msg: str) -> None:
 
 def script_dir() -> Path:
     return Path(__file__).resolve().parent
+
+
+def _cfg_int(val: Any, default: int) -> int:
+    """Coerce JSON config values to int; bad or missing types must not crash the gateway."""
+    try:
+        if val is None:
+            return default
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _enforce_default_proxy_auth(config: Dict[str, Any]) -> None:
@@ -1509,18 +1594,22 @@ def _control_api_handler_factory(
             randomize_country = "random"
             randomize_country_pool = "any country"
             cfg_client = ""
+            auto_detect_wan = True
             try:
                 with open(state["config_path"], encoding="utf-8") as _cf:
                     _cfg = json.load(_cf)
                 randomize_country = normalize_randomize_country(_cfg.get("randomizeCountry"))
                 randomize_country_pool = randomize_country_status_label(_cfg.get("randomizeCountry"))
                 cfg_client = (str(_cfg.get("clientProxyHost") or "")).strip()
+                if "autoDetectClientProxyHost" in _cfg:
+                    auto_detect_wan = bool(_cfg.get("autoDetectClientProxyHost"))
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                 pass
             if cfg_client:
                 client_proxy_host = cfg_client
             elif listen_h in ("0.0.0.0", "::", "[::]"):
-                client_proxy_host = "127.0.0.1"
+                wan = get_cached_public_wan_ipv4() if auto_detect_wan else None
+                client_proxy_host = wan if wan else "127.0.0.1"
             else:
                 client_proxy_host = listen_h
             self._send_json({
@@ -1646,6 +1735,11 @@ def _control_api_handler_factory(
                 self._send_error_body("Invalid port", 400)
                 return
             listen_host = state.get("listen_host", "127.0.0.1")
+            connect_host = (
+                "127.0.0.1"
+                if listen_host in ("0.0.0.0", "::", "[::]")
+                else listen_host
+            )
             proxy_user = state.get("proxy_username") or ""
             proxy_pass = state.get("proxy_password") or ""
             if proxy_user and proxy_pass:
@@ -2226,8 +2320,15 @@ def main() -> int:
         print(f"Config path is a directory, not a file: {config_path}. (If using Docker, ensure the host file exists so the bind mount is a file.)", file=sys.stderr)
         return 1
 
-    with open(config_path, encoding="utf-8") as f:
-        config = json.load(f)
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"Could not read config file: {e}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON in config file {config_path}: {e}", file=sys.stderr)
+        return 1
     try:
         apply_location_spec(config)
     except ValueError as e:
@@ -2249,8 +2350,8 @@ def main() -> int:
     docker_network = config.get("dockerNetwork") or os.environ.get("DOCKER_NETWORK", "proxynet")
     ovpn_volume_name = config.get("dockerOvpnVolume") or os.environ.get("DOCKER_OVPN_VOLUME", "ovpn_data")
 
-    port_base = config.get("portBase", 50000)
-    internal_port_base = config.get("internalPortBase", 51000)
+    port_base = max(1, min(65535, _cfg_int(config.get("portBase"), 50000)))
+    internal_port_base = max(1, min(65535, _cfg_int(config.get("internalPortBase"), 51000)))
     # Host-side proxy port for location 0 when Docker publishes e.g. 51000->50000 (UI / curl on host).
     _ppb_env = (os.environ.get("PUBLISHED_PROXY_PORT_BASE") or "").strip()
     published_proxy_port_base: Optional[int] = None
@@ -2260,8 +2361,8 @@ def main() -> int:
         _ppb_cfg = config.get("publishedPortBase")
         if isinstance(_ppb_cfg, int) and _ppb_cfg > 0:
             published_proxy_port_base = _ppb_cfg
-    max_slots = config.get("maxSlots", 50)
-    idle_timeout_minutes = config.get("idleTimeoutMinutes", 45)
+    max_slots = max(1, _cfg_int(config.get("maxSlots"), 50))
+    idle_timeout_minutes = max(1, _cfg_int(config.get("idleTimeoutMinutes"), 45))
     idle_timeout_seconds = idle_timeout_minutes * 60.0
     listen_host = config.get("proxyListenHost") or "0.0.0.0"
     if use_docker:
@@ -2371,7 +2472,7 @@ def main() -> int:
         "use_docker": use_docker,
         "locations": locations,
         "listen_host": listen_host,
-        "control_port": int(config.get("controlPort", CONTROL_PORT_DEFAULT) or 0),
+        "control_port": max(0, _cfg_int(config.get("controlPort"), CONTROL_PORT_DEFAULT)),
         "num_ports": num_ports,
         "proxy_username": (config.get("proxyUsername") or "").strip(),
         "proxy_password": config.get("proxyPassword") or "",
@@ -2426,7 +2527,7 @@ def main() -> int:
             ).start()
         persist_assignments_snapshot(gateway_state)
 
-    control_port = int(gateway_state["control_port"] or 0)
+    control_port = max(0, _cfg_int(gateway_state.get("control_port"), 0))
     if control_port > 0:
         gui_dir = script_dir() / "gui"
         control_thread = threading.Thread(
@@ -2536,4 +2637,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except BaseException:
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        raise SystemExit(1)
