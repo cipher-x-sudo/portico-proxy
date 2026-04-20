@@ -150,8 +150,9 @@ export default function Dashboard() {
 
   const handleCreateEntry = async (e) => {
     e.preventDefault();
-    if (!newEntryId.trim() || !newEntryOvpn) {
-      setError('Please provide an ID and select an OVPN file.');
+    const ids = newEntryId.split(/[\n,]+/).map(id => id.trim()).filter(Boolean);
+    if (ids.length === 0) {
+      setError('Please provide at least one ID.');
       return;
     }
     setCreatingEntry(true);
@@ -163,7 +164,7 @@ export default function Dashboard() {
       const enabledPortsSet = new Set(status.enabledPorts || []);
       const mySelectedByPort = status.assignedOvpnByPort || {};
 
-      const unusedIdxs = [];
+      let unusedIdxs = [];
       for (let idx = 0; idx < totalP; idx++) {
         const loc = (status.locations || [])[idx] || {};
         const port = internalPortForIndex(status, idx);
@@ -176,27 +177,34 @@ export default function Dashboard() {
         }
       }
 
-      if (unusedIdxs.length === 0) {
-        throw new Error("No unused ports available.");
+      if (unusedIdxs.length < ids.length) {
+        throw new Error(`Only ${unusedIdxs.length} unused ports available, but ${ids.length} IDs provided.`);
       }
 
-      const randItem = unusedIdxs[Math.floor(Math.random() * unusedIdxs.length)];
-      const targetPort = randItem.port;
+      // Shuffle array to pick random ports easily
+      unusedIdxs = unusedIdxs.sort(() => Math.random() - 0.5);
 
-      const setLauncherRes = await fetch(`/api/set-launcher-id?port=${encodeURIComponent(targetPort)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ launcherId: newEntryId.trim() }),
-      });
-      
-      if (!setLauncherRes.ok) {
-        const errorData = await setLauncherRes.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to set Launcher ID');
-      }
+      for (let i = 0; i < ids.length; i++) {
+        const targetPort = unusedIdxs[i].port;
+        const currentId = ids[i];
 
-      const assignSuccess = await assignOvpn(targetPort, newEntryOvpn);
-      if (!assignSuccess) {
-        throw new Error('Assigned ID but failed to assign OVPN file.');
+        const setLauncherRes = await fetch(`/api/set-launcher-id?port=${encodeURIComponent(targetPort)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ launcherId: currentId }),
+        });
+        
+        if (!setLauncherRes.ok) {
+          const errorData = await setLauncherRes.json().catch(() => ({}));
+          throw new Error(errorData.error || `Failed to set Launcher ID for ${currentId}`);
+        }
+
+        if (newEntryOvpn) {
+          const assignSuccess = await assignOvpn(targetPort, newEntryOvpn);
+          if (!assignSuccess) {
+            throw new Error(`Assigned ID ${currentId} but failed to assign OVPN file.`);
+          }
+        }
       }
 
       setNewEntryId('');
@@ -477,18 +485,18 @@ export default function Dashboard() {
               </div>
               <form className="dashboard-modal-body" onSubmit={handleCreateEntry}>
                 <label className="dashboard-modal-field">
-                  <span className="dashboard-modal-label">Launcher ID</span>
-                  <input
-                    type="text"
+                  <span className="dashboard-modal-label">Launcher IDs (Bulk support)</span>
+                  <textarea
                     className="dashboard-modal-input"
                     value={newEntryId}
                     onChange={(e) => setNewEntryId(e.target.value)}
-                    placeholder="Enter a unique ID…"
+                    placeholder="Enter unique ID(s) separated by commas or newlines…"
+                    rows={4}
                     required
                   />
                 </label>
                 <label className="dashboard-modal-field">
-                  <span className="dashboard-modal-label">Location Configuration</span>
+                  <span className="dashboard-modal-label">Location Configuration (Optional)</span>
                   <OvpnFileSelect
                     files={sortedOvpnFiles}
                     value={newEntryOvpn}
@@ -501,7 +509,7 @@ export default function Dashboard() {
                   <button
                     type="submit"
                     className="btn-primary dashboard-modal-submit"
-                    disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
+                    disabled={creatingEntry || !newEntryId.trim()}
                   >
                     {creatingEntry ? 'Creating...' : 'Create Config'}
                   </button>
@@ -583,7 +591,7 @@ export default function Dashboard() {
                           files={sortedOvpnFiles}
                           value={selected}
                           onChange={(file) => onSelectRowFile(port, file)}
-                          disabled={true}
+                          disabled={busyPort === port || isActive || isStarting}
                           placeholder="Select profile…"
                         />
                       </td>
