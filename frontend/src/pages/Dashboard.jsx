@@ -160,7 +160,6 @@ export default function Dashboard() {
     try {
       const totalPortsFromApi = typeof status.totalPorts === 'number' && status.totalPorts >= 0 ? status.totalPorts : 0;
       const totalP = Math.max((status.locations || []).length, totalPortsFromApi);
-      const isConfiguredMap = new Map();
       const enabledPortsSet = new Set(status.enabledPorts || []);
       const mySelectedByPort = status.assignedOvpnByPort || {};
 
