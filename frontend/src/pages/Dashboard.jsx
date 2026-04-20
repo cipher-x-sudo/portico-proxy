@@ -203,10 +203,42 @@ export default function Dashboard() {
       setNewEntryId('');
       setNewEntryOvpn('');
       setShowCreateEntry(false);
+      
+      // Update ui immediately
+      const refreshed = await fetch('/api/status').then((r) => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
     } catch (err) {
       setError('Failed to create entry: ' + err.message);
     } finally {
       setCreatingEntry(false);
+    }
+  };
+
+  const deleteEntry = async (port) => {
+    if (!window.confirm("Are you sure you want to delete this entry?")) return;
+    setBusyPort(port);
+    setError('');
+    try {
+      await fetch(`/api/deactivate?port=${encodeURIComponent(port)}`, { method: 'POST' });
+      await fetch(`/api/set-launcher-id?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ launcherId: '' }),
+      });
+      await fetch(`/api/assign-ovpn?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ovpn: '' }),
+      });
+      
+      const refreshed = await fetch('/api/status').then(r => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
+    } catch (err) {
+      setError('Failed to delete entry: ' + err.message);
+    } finally {
+      setBusyPort(null);
     }
   };
 
@@ -423,40 +455,52 @@ export default function Dashboard() {
         </div>
         
         {showCreateEntry && (
-          <form className="p-4 border-b border-[var(--border-color)] bg-[var(--surface-color)]" onSubmit={handleCreateEntry}>
-            <div className="flex items-end gap-4 flex-wrap">
-              <label className="flex flex-col gap-1 flex-1 min-w-[200px]">
-                <span className="font-bold text-sm">Launcher ID</span>
-                <input
-                  type="text"
-                  className="input-field"
-                  style={{ padding: '0.6rem', borderRadius: '4px', border: '1px solid var(--border-color)' }}
-                  value={newEntryId}
-                  onChange={(e) => setNewEntryId(e.target.value)}
-                  placeholder="Enter a unique ID..."
-                  required
-                />
-              </label>
-              <label className="flex flex-col gap-1 flex-1 min-w-[200px]">
-                <span className="font-bold text-sm">Location Configuration</span>
-                <OvpnFileSelect
-                  files={sortedOvpnFiles}
-                  value={newEntryOvpn}
-                  onChange={setNewEntryOvpn}
-                  disabled={creatingEntry}
-                  placeholder="Select location .ovpn…"
-                />
-              </label>
-              <button 
-                type="submit" 
-                className="btn-primary" 
-                disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
-                style={{ padding: '0.6rem 1.2rem', height: 'max-content' }}
-              >
-                {creatingEntry ? 'Creating...' : 'Create Config'}
-              </button>
+          <div className="dashboard-modal-overlay" onClick={() => setShowCreateEntry(false)}>
+            <div className="dashboard-modal-content" onClick={(e) => e.stopPropagation()}>
+              <div className="table-header border-b border-[var(--border-color)] p-4 m-0" style={{ marginBottom: "1rem" }}>
+                <h3 className="font-bold">Create New Port Entry</h3>
+                <button type="button" className="btn-secondary" style={{ padding: "0.25rem" }} onClick={() => setShowCreateEntry(false)}>
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+              <form className="p-4 pt-0" onSubmit={handleCreateEntry}>
+                <div className="flex flex-col gap-4">
+                  <label className="flex flex-col gap-1 w-full">
+                    <span className="font-bold text-sm">Launcher ID</span>
+                    <input
+                      type="text"
+                      className="input-field"
+                      style={{ padding: '0.6rem', borderRadius: '4px', border: '1px solid var(--border-color)' }}
+                      value={newEntryId}
+                      onChange={(e) => setNewEntryId(e.target.value)}
+                      placeholder="Enter a unique ID..."
+                      required
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 w-full">
+                    <span className="font-bold text-sm">Location Configuration</span>
+                    <OvpnFileSelect
+                      files={sortedOvpnFiles}
+                      value={newEntryOvpn}
+                      onChange={setNewEntryOvpn}
+                      disabled={creatingEntry}
+                      placeholder="Select location .ovpn…"
+                    />
+                  </label>
+                  <div className="flex justify-end mt-4">
+                    <button 
+                      type="submit" 
+                      className="btn-primary" 
+                      disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
+                      style={{ padding: '0.6rem 1.2rem'}}
+                    >
+                      {creatingEntry ? 'Creating...' : 'Create Config'}
+                    </button>
+                  </div>
+                </div>
+              </form>
             </div>
-          </form>
+          </div>
         )}
         <div className="table-container">
           <table className="data-table">
@@ -546,14 +590,25 @@ export default function Dashboard() {
                       <td className="text-right">
                         <div className="dashboard-row-actions">
                           {!isActive ? (
-                            <button
-                              type="button"
-                              className="btn-primary"
-                              disabled={busyPort === port || !canStart}
-                              onClick={() => setActivation(port, true)}
-                            >
-                              {busyPort === port ? 'Working...' : isStarting ? 'Starting...' : isFailed ? 'Retry Start' : 'Open Port'}
-                            </button>
+                            <>
+                              <button
+                                type="button"
+                                className="btn-primary"
+                                disabled={busyPort === port || !canStart}
+                                onClick={() => setActivation(port, true)}
+                              >
+                                {busyPort === port ? 'Working...' : isStarting ? 'Starting...' : isFailed ? 'Retry Start' : 'Open Port'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-danger"
+                                title="Delete this entry completely"
+                                disabled={busyPort === port}
+                                onClick={() => deleteEntry(port)}
+                              >
+                                Delete
+                              </button>
+                            </>
                           ) : (
                             <>
                               <button
@@ -572,6 +627,16 @@ export default function Dashboard() {
                                 onClick={() => setActivation(port, false)}
                               >
                                 {busyPort === port ? 'Working...' : 'Stop Port'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-danger"
+                                title="Delete this entry completely"
+                                disabled={busyPort === port || isStarting}
+                                onClick={() => deleteEntry(port)}
+                                style={{backgroundColor: '#e74c3c'}}
+                              >
+                                Delete
                               </button>
                             </>
                           )}
