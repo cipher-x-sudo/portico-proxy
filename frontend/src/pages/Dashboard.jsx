@@ -169,6 +169,46 @@ export default function Dashboard() {
     }
   };
 
+  /** Reload worker / VPN for this port while keeping the same OVPN assignment. */
+  const restartPort = async (port, { randomAccess, hasOvpn }) => {
+    if (!hasOvpn) {
+      setError('Assign an OVPN profile before restart.');
+      return;
+    }
+    setBusyPort(port);
+    setError('');
+    try {
+      if (randomAccess) {
+        const res = await fetch(`/api/refresh-port?port=${encodeURIComponent(port)}`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) {
+          setError(data.error || 'Restart failed');
+          return;
+        }
+      } else {
+        const stopRes = await fetch(`/api/deactivate?port=${encodeURIComponent(port)}`, { method: 'POST' });
+        const stopData = await stopRes.json();
+        if (!stopData.ok) {
+          setError(stopData.error || 'Failed to stop for restart');
+          return;
+        }
+        const startRes = await fetch(`/api/activate?port=${encodeURIComponent(port)}`, { method: 'POST' });
+        const startData = await startRes.json();
+        if (!startData.ok) {
+          setError(startData.error || 'Failed to start after restart');
+          return;
+        }
+      }
+      const refreshed = await fetch('/api/status').then((r) => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
+    } catch (err) {
+      setError('Restart failed: ' + err.message);
+    } finally {
+      setBusyPort(null);
+    }
+  };
+
   const onSelectRowFile = async (port, ovpn) => {
     await assignOvpn(port, ovpn);
   };
@@ -1111,6 +1151,24 @@ export default function Dashboard() {
                                 title="Add 30 minutes before idle auto-close"
                               >
                                 {busyPort === port ? 'Working...' : '+30m'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-secondary"
+                                title="Restart proxy (reload VPN / worker)"
+                                aria-label="Restart proxy"
+                                disabled={busyPort === port || isStarting || !selected}
+                                onClick={() =>
+                                  restartPort(port, {
+                                    randomAccess: !!loc.randomAccess,
+                                    hasOvpn: !!selected,
+                                  })
+                                }
+                                style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
+                              >
+                                <span className="material-symbols-outlined" style={{ fontSize: '1rem' }} aria-hidden>
+                                  restart_alt
+                                </span>
                               </button>
                               <button
                                 type="button"
