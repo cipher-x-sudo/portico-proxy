@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Sidebar from './components/Sidebar';
 import Header from './components/Header';
 import Dashboard from './pages/Dashboard';
@@ -7,20 +7,52 @@ import Config from './pages/Config';
 import Actions from './pages/Actions';
 import './App.css';
 
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'portico-sidebar-collapsed';
+
+function readSidebarCollapsedFromStorage() {
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function writeSidebarCollapsedToStorage(collapsed) {
+  try {
+    if (typeof window !== 'undefined' && window.innerWidth > 768) {
+      localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? 'true' : 'false');
+    }
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(window.innerWidth <= 768);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    if (window.innerWidth <= 768) return true;
+    return readSidebarCollapsedFromStorage();
+  });
 
   useEffect(() => {
     const handleResize = () => {
       if (window.innerWidth <= 768) {
         setIsSidebarCollapsed(true);
       } else {
-        setIsSidebarCollapsed(false);
+        setIsSidebarCollapsed(readSidebarCollapsedFromStorage());
       }
     };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  const toggleSidebar = useCallback(() => {
+    setIsSidebarCollapsed((prev) => {
+      const next = !prev;
+      writeSidebarCollapsedToStorage(next);
+      return next;
+    });
   }, []);
   
   // Basic mock state for header (can be updated from pages if needed)
@@ -60,7 +92,7 @@ function App() {
 
   return (
     <div className={`app-layout ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
-      <Sidebar activeTab={activeTab} setActiveTab={handleTabClick} isCollapsed={isSidebarCollapsed} setIsCollapsed={setIsSidebarCollapsed} />
+      <Sidebar activeTab={activeTab} setActiveTab={handleTabClick} isCollapsed={isSidebarCollapsed} />
       
       {/* Mobile backdrop */}
       <div 
@@ -69,7 +101,7 @@ function App() {
       ></div>
 
       <main className="main-content">
-        <Header title={getPageTitle()} isRunning={isRunning} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} />
+        <Header title={getPageTitle()} isRunning={isRunning} toggleSidebar={toggleSidebar} />
         
         <div className="page-container animate-fade-in" key={activeTab}>
           {renderContent()}
