@@ -162,6 +162,29 @@ export default function Dashboard() {
     allPortRows.push({ loc, idx });
   }
 
+  /** How many host:container mappings Docker published (from gateway env / status). */
+  let publishedDockerSpan =
+    typeof status.dockerPublishedPortSpan === 'number' && status.dockerPublishedPortSpan > 0
+      ? status.dockerPublishedPortSpan
+      : null;
+  if (
+    publishedDockerSpan == null &&
+    typeof status.dockerPublishedHostPortFirst === 'number' &&
+    typeof status.dockerPublishedHostPortLast === 'number' &&
+    status.dockerPublishedHostPortLast >= status.dockerPublishedHostPortFirst
+  ) {
+    publishedDockerSpan =
+      status.dockerPublishedHostPortLast - status.dockerPublishedHostPortFirst + 1;
+  }
+  const unusedDockerSlots =
+    publishedDockerSpan != null && publishedDockerSpan > totalPorts
+      ? publishedDockerSpan - totalPorts
+      : 0;
+  const impliedHostFirst =
+    typeof status.publishedPortBase === 'number' ? status.publishedPortBase : null;
+  const impliedHostLast =
+    impliedHostFirst != null && totalPorts > 0 ? impliedHostFirst + totalPorts - 1 : null;
+
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
       ? 'Host proxy port'
@@ -277,11 +300,41 @@ export default function Dashboard() {
             <span className="material-symbols-outlined text-primary">table_view</span>
             <h3 className="font-bold">Ports Launcher</h3>
           </div>
-          <span className="badge-primary">{totalPorts} PORTS</span>
+          <span className="badge-primary">{totalPorts} locations</span>
         </div>
         <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-          One row per gateway listener. Pick an .ovpn, then <strong>Open Port</strong>. Host port is what clients use on the VPS when published.
+          <strong>{totalPorts} rows</strong> = <strong>{totalPorts} listeners</strong> from{' '}
+          <code className="text-xs">locationSpec.count</code> / saved locations in Configuration — not a dashboard cap.
+          Pick an .ovpn, then <strong>Open Port</strong>. Host port is what clients use on the VPS when published.
         </p>
+        {impliedHostFirst != null && impliedHostLast != null && (
+          <p className="text-muted text-sm px-4 pt-1 pb-0 mb-0">
+            Current listener host range: <strong>{impliedHostFirst}</strong>–<strong>{impliedHostLast}</strong>
+            {publishedDockerSpan != null && publishedDockerSpan !== totalPorts && (
+              <> (Docker publish capacity: {publishedDockerSpan} TCP slots)</>
+            )}
+            .
+          </p>
+        )}
+        {unusedDockerSlots > 0 && (
+          <div className="dashboard-docker-capacity-banner" role="status">
+            Docker maps <strong>{publishedDockerSpan}</strong> host ports, but this config only defines{' '}
+            <strong>{totalPorts}</strong> gateway listener(s). <strong>{unusedDockerSlots}</strong> published port(s)
+            are unused until you raise <code className="text-xs">locationSpec.count</code> (up to{' '}
+            {publishedDockerSpan}), keep <code className="text-xs">portBase</code> aligned with compose, save, and
+            restart the gateway.
+          </div>
+        )}
+        {unusedDockerSlots === 0 &&
+          publishedDockerSpan != null &&
+          publishedDockerSpan === totalPorts &&
+          totalPorts > 0 && (
+            <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
+              Listener count matches Docker publish width. To get <em>more</em> rows, increase{' '}
+              <code className="text-xs">locationSpec.count</code> and widen the same-width host + container ranges in{' '}
+              <code className="text-xs">.env</code> / <code className="text-xs">docker-compose.yml</code>, then restart.
+            </p>
+          )}
         <div className="table-container">
           <table className="data-table">
             <thead>
