@@ -14,6 +14,8 @@ export default function Dashboard() {
   const [batchBusy, setBatchBusy] = useState(false);
   const [selectedTablePorts, setSelectedTablePorts] = useState([]);
   const [launcherIdFilter, setLauncherIdFilter] = useState('');
+  /** Ports Launcher table: null = preserve filter order (by port index). */
+  const [launcherTableSort, setLauncherTableSort] = useState({ key: null, dir: 'asc' });
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
 
@@ -465,7 +467,49 @@ export default function Dashboard() {
       })
     : configuredPortRows;
 
-  const visibleInternalPorts = filteredPortRows
+  const launcherTableSortedRows = (() => {
+    const sortKey = launcherTableSort.key;
+    if (!sortKey) return filteredPortRows;
+    const mul = launcherTableSort.dir === 'desc' ? -1 : 1;
+    return [...filteredPortRows].sort((a, b) => {
+      const portA = internalPortForIndex(status, a.idx);
+      const portB = internalPortForIndex(status, b.idx);
+      if (portA == null && portB == null) return 0;
+      if (portA == null) return 1;
+      if (portB == null) return -1;
+
+      const keyA = String(portA);
+      const keyB = String(portB);
+
+      if (sortKey === 'id') {
+        const ida = typeof a.loc.launcherId === 'string' ? a.loc.launcherId.trim() : '';
+        const idb = typeof b.loc.launcherId === 'string' ? b.loc.launcherId.trim() : '';
+        const rankA = ida ? 0 : 1;
+        const rankB = idb ? 0 : 1;
+        if (rankA !== rankB) return (rankA - rankB) * mul;
+        const cmp = ida.localeCompare(idb, undefined, { sensitivity: 'base', numeric: true });
+        if (cmp !== 0) return cmp * mul;
+        return (portA - portB) * mul;
+      }
+
+      if (sortKey === 'ovpn') {
+        const oa = selectedByPort[keyA] || '';
+        const ob = selectedByPort[keyB] || '';
+        const rankA = oa ? 0 : 1;
+        const rankB = ob ? 0 : 1;
+        if (rankA !== rankB) return (rankA - rankB) * mul;
+        const labelA = formatOvpnDisplayLabel(oa);
+        const labelB = formatOvpnDisplayLabel(ob);
+        const cmp = labelA.localeCompare(labelB, undefined, { sensitivity: 'base', numeric: true });
+        if (cmp !== 0) return cmp * mul;
+        return (portA - portB) * mul;
+      }
+
+      return 0;
+    });
+  })();
+
+  const visibleInternalPorts = launcherTableSortedRows
     .map(({ idx }) => internalPortForIndex(status, idx))
     .filter((p) => p != null);
   const selectedInViewCount = visibleInternalPorts.filter((p) => selectedTablePorts.includes(p)).length;
@@ -857,9 +901,65 @@ export default function Dashboard() {
                   />
                 </th>
                 <th style={{ width: '40px', textAlign: 'center' }}>#</th>
-                <th>ID</th>
+                <th
+                  scope="col"
+                  aria-sort={
+                    launcherTableSort.key === 'id'
+                      ? launcherTableSort.dir === 'asc'
+                        ? 'ascending'
+                        : 'descending'
+                      : 'none'
+                  }
+                >
+                  <button
+                    type="button"
+                    className="dashboard-sort-header"
+                    onClick={() =>
+                      setLauncherTableSort((prev) =>
+                        prev.key !== 'id'
+                          ? { key: 'id', dir: 'asc' }
+                          : { key: 'id', dir: prev.dir === 'asc' ? 'desc' : 'asc' },
+                      )
+                    }
+                  >
+                    <span>ID</span>
+                    {launcherTableSort.key === 'id' && (
+                      <span className="material-symbols-outlined dashboard-sort-header-icon" aria-hidden>
+                        {launcherTableSort.dir === 'asc' ? 'arrow_upward' : 'arrow_downward'}
+                      </span>
+                    )}
+                  </button>
+                </th>
                 <th>{portColumnLabel}</th>
-                <th>Selected OVPN File</th>
+                <th
+                  scope="col"
+                  aria-sort={
+                    launcherTableSort.key === 'ovpn'
+                      ? launcherTableSort.dir === 'asc'
+                        ? 'ascending'
+                        : 'descending'
+                      : 'none'
+                  }
+                >
+                  <button
+                    type="button"
+                    className="dashboard-sort-header"
+                    onClick={() =>
+                      setLauncherTableSort((prev) =>
+                        prev.key !== 'ovpn'
+                          ? { key: 'ovpn', dir: 'asc' }
+                          : { key: 'ovpn', dir: prev.dir === 'asc' ? 'desc' : 'asc' },
+                      )
+                    }
+                  >
+                    <span>Selected OVPN File</span>
+                    {launcherTableSort.key === 'ovpn' && (
+                      <span className="material-symbols-outlined dashboard-sort-header-icon" aria-hidden>
+                        {launcherTableSort.dir === 'asc' ? 'arrow_upward' : 'arrow_downward'}
+                      </span>
+                    )}
+                  </button>
+                </th>
                 <th>Status</th>
                 <th className="text-right">Actions</th>
               </tr>
@@ -876,7 +976,7 @@ export default function Dashboard() {
                   </td>
                 </tr>
               ) : (
-                filteredPortRows.map(({ loc, idx }, arrayIndex) => {
+                launcherTableSortedRows.map(({ loc, idx }, arrayIndex) => {
                   const port = internalPortForIndex(status, idx);
                   const displayPort = publishedPortForIndex(status, idx);
                   const portKey = String(port);

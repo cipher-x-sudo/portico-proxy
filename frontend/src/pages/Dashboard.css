@@ -443,3 +443,34 @@
 .dashboard-batch-bar {
   background: rgba(0, 0, 0, 0.15);
 }
+
+.dashboard-sort-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-sm, 4px);
+}
+
+.dashboard-sort-header:hover {
+  color: var(--primary);
+}
+
+.dashboard-sort-header:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.dashboard-sort-header-icon {
+  font-size: 1rem;
+  line-height: 1;
+  opacity: 0.9;
+}
