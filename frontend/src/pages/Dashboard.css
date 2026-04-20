@@ -157,24 +157,6 @@
   margin: 0;
 }
 
-.dashboard-random-access .table-header .material-symbols-outlined {
-  font-size: 1.35rem;
-}
-
-.dashboard-random-filter-input {
-  background: rgba(0, 0, 0, 0.2);
-  border: 1px solid var(--border-color);
-  color: var(--text-main);
-  padding: 0.5rem 0.75rem;
-  border-radius: var(--radius-sm);
-  outline: none;
-}
-
-.dashboard-random-filter-input:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
-}
-
 /* Persistent tint when a row has an OVPN assigned; :hover duplicate beats .data-table tr:hover td specificity */
 .data-table tr.dashboard-row-ovpn-selected td,
 .data-table tr.dashboard-row-ovpn-selected:hover td {

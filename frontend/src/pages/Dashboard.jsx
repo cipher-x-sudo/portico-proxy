@@ -13,7 +13,6 @@ export default function Dashboard() {
   const [busyPort, setBusyPort] = useState(null);
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
-  const [randomizeFilterQuery, setRandomizeFilterQuery] = useState('');
 
   useEffect(() => {
     const loadStatus = () => {
@@ -91,50 +90,6 @@ export default function Dashboard() {
     }
   };
 
-  const randomizePort = async (port) => {
-    setBusyPort(port);
-    setError('');
-    try {
-      const res = await fetch(`/api/randomize-port?port=${encodeURIComponent(port)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filter: randomizeFilterQuery }),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        setError(data.error || 'Randomize failed');
-        return;
-      }
-      const refreshed = await fetch('/api/status').then(r => r.json());
-      setStatus(refreshed);
-      setSelectedByPort(refreshed.assignedOvpnByPort || {});
-    } catch (err) {
-      setError('Randomize failed: ' + err.message);
-    } finally {
-      setBusyPort(null);
-    }
-  };
-
-  const refreshPort = async (port) => {
-    setBusyPort(port);
-    setError('');
-    try {
-      const res = await fetch(`/api/refresh-port?port=${encodeURIComponent(port)}`, { method: 'POST' });
-      const data = await res.json();
-      if (!data.ok) {
-        setError(data.error || 'Refresh failed');
-        return;
-      }
-      const refreshed = await fetch('/api/status').then(r => r.json());
-      setStatus(refreshed);
-      setSelectedByPort(refreshed.assignedOvpnByPort || {});
-    } catch (err) {
-      setError('Refresh failed: ' + err.message);
-    } finally {
-      setBusyPort(null);
-    }
-  };
-
   const extendPort = async (port) => {
     setBusyPort(port);
     setError('');
@@ -197,7 +152,7 @@ export default function Dashboard() {
     });
   });
 
-  /** Every listener port (one row each); do not hide random-access rows — they only get extra actions. */
+  /** One row per gateway listener port. */
   const totalPortsFromApi =
     typeof status.totalPorts === 'number' && status.totalPorts >= 0 ? status.totalPorts : 0;
   const totalPorts = Math.max(locations.length, totalPortsFromApi);
@@ -206,7 +161,6 @@ export default function Dashboard() {
     const loc = locations[idx] || { label: `Port ${idx}`, randomAccess: false };
     allPortRows.push({ loc, idx });
   }
-  const hasAnyRandomAccess = locations.some((loc) => loc && loc.randomAccess);
 
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
@@ -256,7 +210,7 @@ export default function Dashboard() {
         <div className="table-container">
           {runningProxyRows.length === 0 ? (
             <div className="text-center p-6 text-muted">
-              No active proxies. Open a port in the launcher below (or use Random) to see copy-ready strings.
+              No active proxies. Open a port in the launcher below to see copy-ready strings.
             </div>
           ) : (
             <table className="data-table dashboard-copy-table">
@@ -317,52 +271,6 @@ export default function Dashboard() {
         </div>
       </section>
 
-      <section className="card p-0 overflow-hidden dashboard-random-access">
-        <div className="table-header">
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-primary">shuffle</span>
-            <h3 className="font-bold">Random profile tools</h3>
-          </div>
-        </div>
-        <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-          Rows marked <strong>random access</strong> in Configuration get <strong>Random</strong> and <strong>Refresh</strong> in the Ports Launcher table below. Optional search limits random picks (e.g. <code className="text-xs">texas</code>).
-        </p>
-        {status.randomizeCountry != null && (
-          <p className="text-muted text-sm px-4 pt-1 pb-0 mb-0">
-            Configured random pool:{' '}
-            <strong>
-              {status.randomizeCountry === 'random' || status.randomizeCountry === ''
-                ? 'any country'
-                : status.randomizeCountryPool || status.randomizeCountry}
-            </strong>
-            .
-          </p>
-        )}
-        {hasAnyRandomAccess && (
-          <div className="dashboard-random-filter px-4 py-3">
-            <label htmlFor="dashboard-random-filter" className="text-muted text-sm block mb-1">
-              Limit random to search (optional)
-            </label>
-            <div className="dashboard-random-filter-row flex gap-2 items-center flex-wrap">
-              <span className="material-symbols-outlined text-muted" aria-hidden>
-                search
-              </span>
-              <input
-                id="dashboard-random-filter"
-                type="search"
-                className="dashboard-random-filter-input flex-1 min-w-[12rem]"
-                placeholder="e.g. california, new york, miami…"
-                value={randomizeFilterQuery}
-                onChange={(e) => setRandomizeFilterQuery(e.target.value)}
-                autoComplete="off"
-                spellCheck={false}
-                aria-label="Filter which profiles random selection uses"
-              />
-            </div>
-          </div>
-        )}
-      </section>
-
       <section className="card p-0 overflow-hidden">
         <div className="table-header">
           <div className="flex items-center gap-2">
@@ -401,18 +309,13 @@ export default function Dashboard() {
                   const isActive = activationState === 'active';
                   const isFailed = activationState === 'failed';
                   const canStart = !isStarting && !!selected;
-                  const showRefresh = isActive || (isFailed && !!selected);
                   const selectedLocation = selected ? formatOvpnRichLabel(selected) : '';
-                  const isRandomSlot = !!loc.randomAccess;
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
                       <td className="text-primary text-mono font-bold">
                         {displayPort}
                         {displayPort !== port && (
                           <div className="text-muted text-xs font-normal">Container: {port}</div>
-                        )}
-                        {isRandomSlot && (
-                          <div className="text-muted text-xs font-normal">Random access</div>
                         )}
                       </td>
                       <td>
@@ -442,30 +345,6 @@ export default function Dashboard() {
                       </td>
                       <td className="text-right">
                         <div className="dashboard-row-actions">
-                          {isRandomSlot && (
-                            <>
-                              <button
-                                type="button"
-                                className="btn-primary-soft"
-                                disabled={busyPort === port || ovpnFiles.length === 0}
-                                onClick={() => randomizePort(port)}
-                                title="Stop VPN, pick a random .ovpn, and start again."
-                              >
-                                {busyPort === port ? 'Working...' : 'Random'}
-                              </button>
-                              {showRefresh && (
-                                <button
-                                  type="button"
-                                  className="btn-secondary"
-                                  disabled={busyPort === port || isStarting}
-                                  onClick={() => refreshPort(port)}
-                                  title="Restart OpenVPN and proxy with the same profile."
-                                >
-                                  {busyPort === port ? 'Working...' : 'Refresh'}
-                                </button>
-                              )}
-                            </>
-                          )}
                           {!isActive ? (
                             <button
                               type="button"
