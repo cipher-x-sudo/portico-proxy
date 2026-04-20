@@ -161,7 +161,7 @@ Runtime JSON is mounted at **`/config/openvpn-proxy-config.json`** inside the ga
 
 | Key / group | Purpose |
 |---------------|---------|
-| **`locationSpec`** | Preferred template: `count`, `defaultOvpn` (path under the `ovpn` mount), `labelPrefix`, `randomAccessFirstN`. `count` must not exceed the number of published host ports in Compose (default **516** mappings, host **58000–58515** → container **50000–50515**). |
+| **`locationSpec`** | Preferred template: `count`, `defaultOvpn` (path under the `ovpn` mount), `labelPrefix`, `randomAccessFirstN`. `count` must not exceed the published TCP span in Compose (`DOCKER_PROXY_HOST_PORT_LAST - DOCKER_PROXY_HOST_PORT_FIRST + 1`; default **516**, host **58000–58515** → container **50000–50515** via `.env` / `docker-compose.yml`). |
 | **`portBase`** | First listener port **inside** the gateway network namespace (default `50000`). |
 | **`proxyUsername`** / **`proxyPassword`** | HTTP proxy authentication presented to clients (optional; gateway may apply defaults — see dashboard). |
 | **`clientProxyHost`** | Hostname or IP shown in the dashboard for HTTP proxy URLs. When empty and **`proxyListenHost`** binds all interfaces (`0.0.0.0`), the gateway **auto-detects your public IPv4** (cached HTTP checks to ifconfig.me / ipify / icanhazip) unless **`autoDetectClientProxyHost`** is **`false`**. Set **`clientProxyHost`** explicitly for a DNS name, LAN IP, or to disable any outbound probe while still controlling the displayed host. |
@@ -184,7 +184,7 @@ Legacy keys (`openvpnPath`, `forceBindIPPath`, `pythonPath`, `maxLocations`) exi
 |----------|----------------|-------------|
 | **Dashboard** | `0.0.0.0:8080` (default in Compose) | Static UI; `/api/*` proxied to gateway. Use **`http://YOUR_IP:8080`** from another machine. For local-only, set the publish bind to **`127.0.0.1:8080:80`**. |
 | **Control API** | `127.0.0.1:49999` | JSON REST used by the UI (`/api/status`, `/api/activate`, …). Always localhost on the host. |
-| **HTTP proxies** | `0.0.0.0:58000+` (host, default) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) must match the **left-hand** side of the port range in `docker-compose.yml`. |
+| **HTTP proxies** | `0.0.0.0:58000+` (host, default) | Mapped from container `portBase+index`. **`PUBLISHED_PROXY_PORT_BASE`** (default `58000`) should equal **`DOCKER_PROXY_HOST_PORT_FIRST`**. **`DOCKER_PROXY_CONTAINER_PORT_*`** must span the same number of ports as the host range; **`portBase`** in JSON must equal **`DOCKER_PROXY_CONTAINER_PORT_FIRST`**. See **Ubuntu VPS: scaling proxy port count** below. |
 
 **Clients on the same machine** use `127.0.0.1` and the **published** host port. **Android emulator** uses host alias **`10.0.2.2`** (e.g. `10.0.2.2:58000`). For LAN clients behind NAT, set **`clientProxyHost`** to the hostname or IP those clients use. On a VPS, leaving **`clientProxyHost`** empty usually suffices because the gateway auto-detects the public IPv4 for dashboard URLs (override with **`clientProxyHost`** when you need a stable DNS name). Allow the matching TCP ports in the firewall.
 
@@ -192,8 +192,20 @@ Legacy keys (`openvpnPath`, `forceBindIPPath`, `pythonPath`, `maxLocations`) exi
 
 1. Compose defaults publish the dashboard and proxy ports on **`0.0.0.0`** so they are reachable on the server’s public IP (the control API **`49999`** stays **`127.0.0.1`** only).
 2. **`clientProxyHost`** can stay empty: the gateway fills in your **public IPv4** for `/api/status` and the dashboard. Set it to a **hostname** if you prefer DNS in proxy URLs, or set **`autoDetectClientProxyHost`** to **`false`** and set **`clientProxyHost`** manually if outbound IP discovery must be disabled.
-3. Open the host firewall (example **UFW**): `sudo ufw allow 8080/tcp` and a TCP range for proxies you use, e.g. `sudo ufw allow 58000:58127/tcp` when **`locationSpec.count`** is **128** (adjust end port to **`PUBLISHED_PROXY_PORT_BASE + count - 1`**). If **`ufw`** is enabled and these ports are closed, browsers will time out even though Docker is listening.
+3. Open the host firewall (example **UFW**): `sudo ufw allow 8080/tcp` and a TCP range covering every published proxy port you use. Example: `sudo ufw allow 58000:58127/tcp` when you publish **only** host ports **58000–58127** (that is **128** ports, e.g. **`locationSpec.count: 128`**). The **default** Compose mapping is **58000–58515** (**516** ports); **`58127` in older docs was an example, not a platform cap**. End port formula: **`PUBLISHED_PROXY_PORT_BASE + location_count - 1`**, but **`location_count`** must not exceed **`DOCKER_PROXY_HOST_PORT_LAST - DOCKER_PROXY_HOST_PORT_FIRST + 1`**. If **`ufw`** is enabled and these ports are closed, browsers will time out even though Docker is listening.
 4. Hardening: use **strong** `proxyUsername` / `proxyPassword`; do not expose **`49999`** publicly; consider TLS or SSH tunneling for **`8080`** on untrusted networks.
+
+### Ubuntu VPS: scaling proxy port count
+
+On Linux there is **no** Windows `select(512)` listener cap; the gateway uses **`selectors.DefaultSelector()`** for accept loops. You are limited mainly by **Docker’s published port range**, **`portBase + count ≤ 65535`**, host firewall, and **file descriptor** limits.
+
+1. Set **`DOCKER_PROXY_HOST_PORT_FIRST`** / **`DOCKER_PROXY_HOST_PORT_LAST`** and **`DOCKER_PROXY_CONTAINER_PORT_FIRST`** / **`DOCKER_PROXY_CONTAINER_PORT_LAST`** in **`.env`** so both sides span the **same** number of TCP ports (see [`.env.example`](.env.example)).
+2. Set **`PUBLISHED_PROXY_PORT_BASE`** to the same value as **`DOCKER_PROXY_HOST_PORT_FIRST`** so dashboard URLs match the map.
+3. Set **`portBase`** in **`openvpn-proxy-config.json`** to **`DOCKER_PROXY_CONTAINER_PORT_FIRST`**, and ensure **`locationSpec.count`** (or `locations.length`) is **≤** that span.
+4. **`docker compose up -d`** after edits. Very large mappings (thousands of rules) can make Compose and iptables updates slower; that is expected.
+5. Raise gateway **`ulimits.nofile`** in [`docker-compose.yml`](docker-compose.yml) if you run **many** locations **and** heavy concurrency (for example **131072** soft/hard) and align the **host** daemon limits if the kernel still returns “too many open files”.
+
+The gateway logs a **warning** on startup when counts or bases disagree with these env vars; **`GET /api/status`** includes **`publishMismatch`**, **`publishMismatchHint`**, and **`dockerPublishedHostPortFirst`/`Last`** / **`dockerPublishedPortSpan`** for the Configuration page banner.
 
 ---
 

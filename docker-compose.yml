@@ -1,5 +1,6 @@
 # Portico — dynamic VPN proxy gateway + on-demand worker containers (Linux / Windows Docker Desktop).
-# One proxy port per location; gateway listens on portBase, portBase+1, ... (e.g. 50000-50515). Port range size must be >= number of locations.
+# One proxy port per location; gateway listens on portBase, portBase+1, ... . Host and container published ranges
+# must have the same width (see DOCKER_PROXY_* in .env.example). Width must be >= locationSpec.count.
 # ovpn_data: set OVPN_HOST_PATH in .env to your .ovpn folder (e.g. E:/FB/protonusa/ovpn on Windows). Default ./ovpn (run compose from repo root).
 # Dashboard + proxy ports publish on 0.0.0.0 (public IP). clientProxyHost in openvpn-proxy-config.json is optional:
 # the gateway auto-detects public IPv4 when empty (see autoDetectClientProxyHost); set clientProxyHost for DNS/LAN.
@@ -49,6 +50,11 @@ services:
       # Host-side ports shown in the UI (must match left side of proxy port mapping below).
       # Default 58000+ avoids common Windows Hyper-V excluded ranges that break binds in 51k (e.g. 51273).
       - PUBLISHED_PROXY_PORT_BASE=${PUBLISHED_PROXY_PORT_BASE:-58000}
+      # Mirrored from compose port publish line so the gateway can warn on count/range misalignment.
+      - DOCKER_PROXY_HOST_PORT_FIRST=${DOCKER_PROXY_HOST_PORT_FIRST:-58000}
+      - DOCKER_PROXY_HOST_PORT_LAST=${DOCKER_PROXY_HOST_PORT_LAST:-58515}
+      - DOCKER_PROXY_CONTAINER_PORT_FIRST=${DOCKER_PROXY_CONTAINER_PORT_FIRST:-50000}
+      - DOCKER_PROXY_CONTAINER_PORT_LAST=${DOCKER_PROXY_CONTAINER_PORT_LAST:-50515}
       # OVPN picks + activePorts (survives compose restarts; AOF volume below)
       - REDIS_URL=redis://redis:6379/0
       - REDIS_STATE_KEY=portico:assignments-state
@@ -60,9 +66,9 @@ services:
       - ovpn_data:/ovpn:ro
     ports:
       - "127.0.0.1:49999:49999"           # control API bound to localhost only
-      # Container ports must equal portBase..portBase+N-1 from openvpn-proxy-config.json (here: 50000-50515 for up to 516 locations).
+      # Host:container ranges must span the same number of TCP ports; align portBase in openvpn-proxy-config.json with CONTAINER_FIRST.
       # Host 0.0.0.0: reachable on the VPS public IP (use host firewall + strong proxy auth). Use 127.0.0.1 for local-only.
-      - "0.0.0.0:${DOCKER_PROXY_HOST_PORT_FIRST:-58000}-${DOCKER_PROXY_HOST_PORT_LAST:-58515}:50000-50515"
+      - "0.0.0.0:${DOCKER_PROXY_HOST_PORT_FIRST:-58000}-${DOCKER_PROXY_HOST_PORT_LAST:-58515}:${DOCKER_PROXY_CONTAINER_PORT_FIRST:-50000}-${DOCKER_PROXY_CONTAINER_PORT_LAST:-50515}"
     ulimits:
       nofile:
         soft: 65536

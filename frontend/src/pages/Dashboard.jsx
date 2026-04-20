@@ -197,13 +197,16 @@ export default function Dashboard() {
     });
   });
 
-  const launcherEntries = locations
-    .map((loc, idx) => ({ loc, idx }))
-    .filter(({ loc }) => !loc.randomAccess);
-  const randomEntries = locations
-    .map((loc, idx) => ({ loc, idx }))
-    .filter(({ loc }) => loc.randomAccess)
-    .slice(0, 3);
+  /** Every listener port (one row each); do not hide random-access rows — they only get extra actions. */
+  const totalPortsFromApi =
+    typeof status.totalPorts === 'number' && status.totalPorts >= 0 ? status.totalPorts : 0;
+  const totalPorts = Math.max(locations.length, totalPortsFromApi);
+  const allPortRows = [];
+  for (let idx = 0; idx < totalPorts; idx++) {
+    const loc = locations[idx] || { label: `Port ${idx}`, randomAccess: false };
+    allPortRows.push({ loc, idx });
+  }
+  const hasAnyRandomAccess = locations.some((loc) => loc && loc.randomAccess);
 
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
@@ -318,14 +321,11 @@ export default function Dashboard() {
         <div className="table-header">
           <div className="flex items-center gap-2">
             <span className="material-symbols-outlined text-primary">shuffle</span>
-            <h3 className="font-bold">Random access</h3>
+            <h3 className="font-bold">Random profile tools</h3>
           </div>
-          <span className="badge-primary">
-            {randomEntries.length} / 3 SLOTS
-          </span>
         </div>
         <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
-          Choose a <strong>profile</strong> like Ports Launcher, <strong>Open Port</strong>, or use <strong>Random</strong> to pick a new .ovpn. <strong>Refresh</strong> restarts the same profile without changing it. Optional search below limits random picks (e.g. <code className="text-xs">texas</code>, <code className="text-xs">miami</code>). Enable up to three rows in Configuration → Random access, then restart the gateway.
+          Rows marked <strong>random access</strong> in Configuration get <strong>Random</strong> and <strong>Refresh</strong> in the Ports Launcher table below. Optional search limits random picks (e.g. <code className="text-xs">texas</code>).
         </p>
         {status.randomizeCountry != null && (
           <p className="text-muted text-sm px-4 pt-1 pb-0 mb-0">
@@ -338,7 +338,7 @@ export default function Dashboard() {
             .
           </p>
         )}
-        {randomEntries.length > 0 && (
+        {hasAnyRandomAccess && (
           <div className="dashboard-random-filter px-4 py-3">
             <label htmlFor="dashboard-random-filter" className="text-muted text-sm block mb-1">
               Limit random to search (optional)
@@ -361,121 +361,6 @@ export default function Dashboard() {
             </div>
           </div>
         )}
-        <div className="table-container">
-          {randomEntries.length === 0 ? (
-            <div className="text-center p-6 text-muted">
-              No random-access slots. Check <strong>Random access</strong> on up to three locations in Configuration, save, and restart the gateway.
-            </div>
-          ) : (
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>{portColumnLabel}</th>
-                  <th>Config label</th>
-                  <th>Selected OVPN</th>
-                  <th>Status</th>
-                  <th className="text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {randomEntries.map(({ loc, idx }) => {
-                  const port = internalPortForIndex(status, idx);
-                  const displayPort = publishedPortForIndex(status, idx);
-                  const portKey = String(port);
-                  const selected = selectedByPort[portKey] || '';
-                  const activationState = activationStateByPort[portKey] || (enabledPorts.has(port) ? 'active' : 'inactive');
-                  const isStarting = activationState === 'starting';
-                  const isActive = activationState === 'active';
-                  const isFailed = activationState === 'failed';
-                  const canStart = !isStarting && !!selected;
-                  const showRefresh = isActive || (isFailed && !!selected);
-                  return (
-                    <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
-                      <td className="text-primary text-mono font-bold">
-                        {displayPort}
-                        {displayPort !== port && (
-                          <div className="text-muted text-xs font-normal">Container: {port}</div>
-                        )}
-                      </td>
-                      <td className="text-muted">{loc.label || `Location #${idx}`}</td>
-                      <td>
-                        <OvpnFileSelect
-                          files={sortedOvpnFiles}
-                          value={selected}
-                          onChange={(file) => onSelectRowFile(port, file)}
-                          disabled={busyPort === port}
-                          placeholder="Select profile…"
-                        />
-                      </td>
-                      <td>
-                        <span className={isActive ? 'status-active' : isStarting ? 'status-starting' : isFailed ? 'status-failed' : 'status-inactive'}>
-                          {isActive ? 'Active' : isStarting ? 'Starting...' : isFailed ? 'Failed' : 'Inactive'}
-                        </span>
-                        {isFailed && activationErrorByPort[portKey] && (
-                          <div className="status-error-text">{activationErrorByPort[portKey]}</div>
-                        )}
-                      </td>
-                      <td className="text-right">
-                        <div className="dashboard-row-actions">
-                          <button
-                            type="button"
-                            className="btn-primary-soft"
-                            disabled={busyPort === port || ovpnFiles.length === 0}
-                            onClick={() => randomizePort(port)}
-                            title="Stop VPN, pick a random .ovpn, and start again."
-                          >
-                            {busyPort === port ? 'Working...' : 'Random'}
-                          </button>
-                          {showRefresh && (
-                            <button
-                              type="button"
-                              className="btn-secondary"
-                              disabled={busyPort === port || isStarting}
-                              onClick={() => refreshPort(port)}
-                              title="Restart OpenVPN and proxy with the same profile."
-                            >
-                              {busyPort === port ? 'Working...' : 'Refresh'}
-                            </button>
-                          )}
-                          {!isActive ? (
-                            <button
-                              type="button"
-                              className="btn-primary"
-                              disabled={busyPort === port || !canStart}
-                              onClick={() => setActivation(port, true)}
-                            >
-                              {busyPort === port ? 'Working...' : isStarting ? 'Starting...' : isFailed ? 'Retry Start' : 'Open Port'}
-                            </button>
-                          ) : (
-                            <>
-                              <button
-                                type="button"
-                                className="btn-secondary"
-                                disabled={busyPort === port || isStarting}
-                                onClick={() => extendPort(port)}
-                                title="Add 30 minutes before idle auto-close (no proxy traffic)."
-                              >
-                                {busyPort === port ? 'Working...' : 'Extend +30m'}
-                              </button>
-                              <button
-                                type="button"
-                                className="btn-danger"
-                                disabled={busyPort === port || isStarting}
-                                onClick={() => setActivation(port, false)}
-                              >
-                                {busyPort === port ? 'Working...' : 'Stop Port'}
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
-        </div>
       </section>
 
       <section className="card p-0 overflow-hidden">
@@ -484,8 +369,11 @@ export default function Dashboard() {
             <span className="material-symbols-outlined text-primary">table_view</span>
             <h3 className="font-bold">Ports Launcher</h3>
           </div>
-          <span className="badge-primary">{launcherEntries.length} PORTS</span>
+          <span className="badge-primary">{totalPorts} PORTS</span>
         </div>
+        <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
+          One row per gateway listener. Pick an .ovpn, then <strong>Open Port</strong>. Host port is what clients use on the VPS when published.
+        </p>
         <div className="table-container">
           <table className="data-table">
             <thead>
@@ -498,18 +386,12 @@ export default function Dashboard() {
               </tr>
             </thead>
             <tbody>
-              {locations.length === 0 ? (
+              {totalPorts === 0 || locations.length === 0 ? (
                 <tr>
                   <td colSpan="5" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
-              ) : launcherEntries.length === 0 ? (
-                <tr>
-                  <td colSpan="5" className="text-center p-6 text-muted">
-                    No standard launcher ports — all locations are random-access slots (see Random access above).
-                  </td>
-                </tr>
               ) : (
-                launcherEntries.map(({ loc, idx }) => {
+                allPortRows.map(({ loc, idx }) => {
                   const port = internalPortForIndex(status, idx);
                   const displayPort = publishedPortForIndex(status, idx);
                   const portKey = String(port);
@@ -519,13 +401,18 @@ export default function Dashboard() {
                   const isActive = activationState === 'active';
                   const isFailed = activationState === 'failed';
                   const canStart = !isStarting && !!selected;
+                  const showRefresh = isActive || (isFailed && !!selected);
                   const selectedLocation = selected ? formatOvpnRichLabel(selected) : '';
+                  const isRandomSlot = !!loc.randomAccess;
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
                       <td className="text-primary text-mono font-bold">
                         {displayPort}
                         {displayPort !== port && (
                           <div className="text-muted text-xs font-normal">Container: {port}</div>
+                        )}
+                        {isRandomSlot && (
+                          <div className="text-muted text-xs font-normal">Random access</div>
                         )}
                       </td>
                       <td>
@@ -555,6 +442,30 @@ export default function Dashboard() {
                       </td>
                       <td className="text-right">
                         <div className="dashboard-row-actions">
+                          {isRandomSlot && (
+                            <>
+                              <button
+                                type="button"
+                                className="btn-primary-soft"
+                                disabled={busyPort === port || ovpnFiles.length === 0}
+                                onClick={() => randomizePort(port)}
+                                title="Stop VPN, pick a random .ovpn, and start again."
+                              >
+                                {busyPort === port ? 'Working...' : 'Random'}
+                              </button>
+                              {showRefresh && (
+                                <button
+                                  type="button"
+                                  className="btn-secondary"
+                                  disabled={busyPort === port || isStarting}
+                                  onClick={() => refreshPort(port)}
+                                  title="Restart OpenVPN and proxy with the same profile."
+                                >
+                                  {busyPort === port ? 'Working...' : 'Refresh'}
+                                </button>
+                              )}
+                            </>
+                          )}
                           {!isActive ? (
                             <button
                               type="button"

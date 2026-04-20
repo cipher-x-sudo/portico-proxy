@@ -178,6 +178,95 @@ def _cfg_int(val: Any, default: int) -> int:
         return default
 
 
+def _optional_env_positive_port(name: str) -> Optional[int]:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw.isdigit():
+        return None
+    v = int(raw)
+    if 1 <= v <= 65535:
+        return v
+    return None
+
+
+def compute_docker_publish_alignment(
+    port_base: int,
+    num_ports: int,
+    published_proxy_port_base: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Read compose-aligned env (DOCKER_PROXY_*); detect misalignment vs locations and portBase.
+    Populates gateway_state and /api/status for UI hints.
+    """
+    h_first = _optional_env_positive_port("DOCKER_PROXY_HOST_PORT_FIRST")
+    h_last = _optional_env_positive_port("DOCKER_PROXY_HOST_PORT_LAST")
+    c_first = _optional_env_positive_port("DOCKER_PROXY_CONTAINER_PORT_FIRST")
+    c_last = _optional_env_positive_port("DOCKER_PROXY_CONTAINER_PORT_LAST")
+
+    reasons: List[str] = []
+    host_span: Optional[int] = None
+    container_span: Optional[int] = None
+
+    if h_first is not None and h_last is not None:
+        if h_first > h_last:
+            reasons.append("DOCKER_PROXY_HOST_PORT_FIRST is greater than DOCKER_PROXY_HOST_PORT_LAST")
+        else:
+            host_span = h_last - h_first + 1
+            if num_ports > host_span:
+                reasons.append(
+                    f"location count ({num_ports}) exceeds published host port span ({host_span}; {h_first}-{h_last})"
+                )
+
+    if c_first is not None and c_last is not None:
+        if c_first > c_last:
+            reasons.append(
+                "DOCKER_PROXY_CONTAINER_PORT_FIRST is greater than DOCKER_PROXY_CONTAINER_PORT_LAST"
+            )
+        else:
+            container_span = c_last - c_first + 1
+
+    if host_span is not None and container_span is not None and host_span != container_span:
+        reasons.append(
+            f"host publish span ({host_span}) does not match container publish span ({container_span})"
+        )
+
+    if c_first is not None and num_ports > 0 and port_base != c_first:
+        reasons.append(
+            f"openvpn-proxy-config portBase ({port_base}) must equal DOCKER_PROXY_CONTAINER_PORT_FIRST ({c_first})"
+        )
+
+    if c_last is not None and num_ports > 0:
+        port_max_cfg = port_base + num_ports - 1
+        if port_max_cfg > c_last:
+            reasons.append(
+                f"last listener port ({port_max_cfg}) exceeds DOCKER_PROXY_CONTAINER_PORT_LAST ({c_last})"
+            )
+
+    if published_proxy_port_base is not None and h_first is not None and published_proxy_port_base != h_first:
+        reasons.append(
+            f"PUBLISHED_PROXY_PORT_BASE ({published_proxy_port_base}) should match "
+            f"DOCKER_PROXY_HOST_PORT_FIRST ({h_first}) for linear Docker port mapping"
+        )
+
+    if published_proxy_port_base is not None and h_last is not None and num_ports > 0:
+        implied_last = published_proxy_port_base + num_ports - 1
+        if implied_last > h_last:
+            reasons.append(
+                f"implicit host ports through {implied_last} exceed DOCKER_PROXY_HOST_PORT_LAST ({h_last})"
+            )
+
+    hint = "; ".join(reasons) if reasons else ""
+    return {
+        "docker_published_host_port_first": h_first,
+        "docker_published_host_port_last": h_last,
+        "docker_published_port_span": host_span,
+        "docker_published_container_port_first": c_first,
+        "docker_published_container_port_last": c_last,
+        "docker_published_container_port_span": container_span,
+        "publish_mismatch": bool(reasons),
+        "publish_mismatch_hint": hint,
+    }
+
+
 def _enforce_default_proxy_auth(config: Dict[str, Any]) -> None:
     user = (config.get("proxyUsername") or "").strip()
     password = config.get("proxyPassword") or ""
@@ -1616,6 +1705,14 @@ def _control_api_handler_factory(
                 "running": True,
                 "portBase": state["port_base"],
                 "publishedPortBase": state.get("published_port_base"),
+                "dockerPublishedHostPortFirst": state.get("docker_published_host_port_first"),
+                "dockerPublishedHostPortLast": state.get("docker_published_host_port_last"),
+                "dockerPublishedPortSpan": state.get("docker_published_port_span"),
+                "dockerPublishedContainerPortFirst": state.get("docker_published_container_port_first"),
+                "dockerPublishedContainerPortLast": state.get("docker_published_container_port_last"),
+                "dockerPublishedContainerPortSpan": state.get("docker_published_container_port_span"),
+                "publishMismatch": bool(state.get("publish_mismatch")),
+                "publishMismatchHint": state.get("publish_mismatch_hint") or "",
                 "maxSlots": state["max_slots"],
                 "idleTimeoutMinutes": state["idle_timeout_minutes"],
                 "useDocker": state["use_docker"],
@@ -2380,6 +2477,10 @@ def main() -> int:
                 f"Published proxy port base (host UI): {published_proxy_port_base} "
                 "(no per-location listeners until config defines at least one location)"
             )
+
+    _docker_align = compute_docker_publish_alignment(port_base, num_ports, published_proxy_port_base)
+    if _docker_align.get("publish_mismatch"):
+        _log(f"Warning: Docker publish / config mismatch — {_docker_align.get('publish_mismatch_hint', '')}")
     # Windows select() supports at most 512 sockets
     if sys.platform == "win32" and num_ports > 512:
         _log("Warning: num_ports > 512 may fail on Windows (select limit). Consider reducing locations or port range.")
@@ -2480,6 +2581,7 @@ def main() -> int:
         "assignments_path": assignments_path,
         "redis_url": redis_url,
         "redis_state_key": redis_key,
+        **_docker_align,
     }
 
     idle_thread = threading.Thread(

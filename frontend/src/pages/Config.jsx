@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { publishedPortForIndex } from '../utils/portDisplay';
 import './Config.css';
 
 function normalizeRandomizeCountrySelect(v) {
@@ -16,6 +17,16 @@ export default function Config() {
   const [busyPort, setBusyPort] = useState(null);
   const [ovpnCountries, setOvpnCountries] = useState([]);
   const [ovpnScanMeta, setOvpnScanMeta] = useState({ count: 0, unclassified: 0 });
+  /** Fields from /api/status for host port display and Docker publish alignment hints */
+  const [statusPorts, setStatusPorts] = useState({
+    portBase: null,
+    publishedPortBase: null,
+    dockerPublishedHostPortFirst: null,
+    dockerPublishedHostPortLast: null,
+    dockerPublishedPortSpan: null,
+    publishMismatch: false,
+    publishMismatchHint: '',
+  });
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -51,6 +62,18 @@ export default function Config() {
         .then(data => {
           const ports = Array.isArray(data.enabledPorts) ? data.enabledPorts : [];
           setEnabledPorts(new Set(ports));
+          setStatusPorts({
+            portBase: typeof data.portBase === 'number' ? data.portBase : null,
+            publishedPortBase: typeof data.publishedPortBase === 'number' ? data.publishedPortBase : null,
+            dockerPublishedHostPortFirst:
+              typeof data.dockerPublishedHostPortFirst === 'number' ? data.dockerPublishedHostPortFirst : null,
+            dockerPublishedHostPortLast:
+              typeof data.dockerPublishedHostPortLast === 'number' ? data.dockerPublishedHostPortLast : null,
+            dockerPublishedPortSpan:
+              typeof data.dockerPublishedPortSpan === 'number' ? data.dockerPublishedPortSpan : null,
+            publishMismatch: !!data.publishMismatch,
+            publishMismatchHint: typeof data.publishMismatchHint === 'string' ? data.publishMismatchHint : '',
+          });
         })
         .catch(() => {
           // Status endpoint may be unavailable briefly during startup.
@@ -175,6 +198,20 @@ export default function Config() {
       </div>
     );
   }
+
+  const portDisplayStatus = {
+    portBase: statusPorts.portBase ?? config.portBase ?? 0,
+    publishedPortBase: statusPorts.publishedPortBase,
+  };
+  const showHostPortCol =
+    statusPorts.publishedPortBase != null && typeof statusPorts.publishedPortBase === 'number';
+  const hostRangeSummary =
+    statusPorts.dockerPublishedHostPortFirst != null && statusPorts.dockerPublishedHostPortLast != null
+      ? `Docker publishes host TCP ${statusPorts.dockerPublishedHostPortFirst}–${statusPorts.dockerPublishedHostPortLast}` +
+        (statusPorts.dockerPublishedPortSpan != null
+          ? ` (${statusPorts.dockerPublishedPortSpan} slots). Align location count and portBase with compose/.env.`
+          : '.')
+      : null;
 
   return (
     <div className="config-page">
@@ -509,12 +546,21 @@ export default function Config() {
             Add Location
           </button>
         </div>
+        {statusPorts.publishMismatch && statusPorts.publishMismatchHint ? (
+          <div className="config-publish-mismatch-banner" role="alert">
+            <strong>Publish range mismatch.</strong> {statusPorts.publishMismatchHint}
+          </div>
+        ) : null}
+        {hostRangeSummary ? (
+          <p className="config-host-range-hint text-muted text-sm px-4 pt-3 mb-0">{hostRangeSummary}</p>
+        ) : null}
         <div className="table-container">
           <table className="data-table">
             <thead>
               <tr>
                 <th>Label</th>
-                <th>Port</th>
+                <th>Listener (container)</th>
+                {showHostPortCol ? <th>Host port</th> : null}
                 <th>OVPN Filename</th>
                 <th>Username</th>
                 <th>Password</th>
@@ -538,6 +584,11 @@ export default function Config() {
                   <td>
                     <code>{(config.portBase || 0) + idx}</code>
                   </td>
+                  {showHostPortCol ? (
+                    <td>
+                      <code>{publishedPortForIndex(portDisplayStatus, idx) ?? '—'}</code>
+                    </td>
+                  ) : null}
                   <td>
                     <input 
                       type="text" 
@@ -600,7 +651,9 @@ export default function Config() {
               ))}
               {config.locations.length === 0 && (
                 <tr>
-                  <td colSpan="8" className="text-center p-6 text-muted">No locations added yet.</td>
+                  <td colSpan={showHostPortCol ? 9 : 8} className="text-center p-6 text-muted">
+                    No locations added yet.
+                  </td>
                 </tr>
               )}
             </tbody>
