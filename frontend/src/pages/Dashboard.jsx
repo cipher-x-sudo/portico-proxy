@@ -522,6 +522,7 @@ export default function Dashboard() {
           <table className="data-table">
             <thead>
               <tr>
+                <th style={{ width: '40px', textAlign: 'center' }}>#</th>
                 <th>ID</th>
                 <th>{portColumnLabel}</th>
                 <th>Location</th>
@@ -533,16 +534,16 @@ export default function Dashboard() {
             <tbody>
               {totalPorts === 0 || locations.length === 0 ? (
                 <tr>
-                  <td colSpan="6" className="text-center p-6 text-muted">No locations configured.</td>
+                  <td colSpan="7" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
               ) : filteredPortRows.length === 0 ? (
                 <tr>
-                  <td colSpan="6" className="text-center p-6 text-muted">
+                  <td colSpan="7" className="text-center p-6 text-muted">
                     No ports match this ID search.
                   </td>
                 </tr>
               ) : (
-                filteredPortRows.map(({ loc, idx }) => {
+                filteredPortRows.map(({ loc, idx }, arrayIndex) => {
                   const port = internalPortForIndex(status, idx);
                   const displayPort = publishedPortForIndex(status, idx);
                   const portKey = String(port);
@@ -556,6 +557,9 @@ export default function Dashboard() {
                   const selectedLocation = selected ? formatOvpnRichLabel(selected) : '';
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
+                      <td className="text-muted text-sm font-bold text-center border-r border-[var(--border-color)]" style={{ opacity: 0.5 }}>
+                        {arrayIndex + 1}
+                      </td>
                       <td className="dashboard-launcher-id-cell">
                         <input
                           type="text"
