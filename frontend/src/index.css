@@ -149,9 +149,14 @@ input, select {
 }
 
 /* Animations */
+/* Opacity only: transform on this ancestor breaks position:fixed modals (dimmer clipped on scroll). */
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .animate-fade-in {

@@ -58,6 +58,18 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
+  useEffect(() => {
+    const modalOpen = showCreateEntry || showEditEntry;
+    const page = document.querySelector('.main-content .page-container');
+    if (!page) return undefined;
+    if (!modalOpen) return undefined;
+    const prevOverflow = page.style.overflow;
+    page.style.overflow = 'hidden';
+    return () => {
+      page.style.overflow = prevOverflow;
+    };
+  }, [showCreateEntry, showEditEntry]);
+
   const sortedOvpnFiles = useMemo(() => sortOvpnFiles(ovpnFiles), [ovpnFiles]);
 
   const assignOvpn = async (port, ovpn) => {
