@@ -16,6 +16,11 @@ export default function Dashboard() {
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
 
+  const [showCreateEntry, setShowCreateEntry] = useState(false);
+  const [newEntryId, setNewEntryId] = useState('');
+  const [newEntryOvpn, setNewEntryOvpn] = useState('');
+  const [creatingEntry, setCreatingEntry] = useState(false);
+
   useEffect(() => {
     const loadStatus = () => {
       fetch('/api/status')
@@ -143,6 +148,68 @@ export default function Dashboard() {
     await assignOvpn(port, ovpn);
   };
 
+  const handleCreateEntry = async (e) => {
+    e.preventDefault();
+    if (!newEntryId.trim() || !newEntryOvpn) {
+      setError('Please provide an ID and select an OVPN file.');
+      return;
+    }
+    setCreatingEntry(true);
+    setError('');
+
+    try {
+      const totalPortsFromApi = typeof status.totalPorts === 'number' && status.totalPorts >= 0 ? status.totalPorts : 0;
+      const totalP = Math.max((status.locations || []).length, totalPortsFromApi);
+      const isConfiguredMap = new Map();
+      const enabledPortsSet = new Set(status.enabledPorts || []);
+      const mySelectedByPort = status.assignedOvpnByPort || {};
+
+      const unusedIdxs = [];
+      for (let idx = 0; idx < totalP; idx++) {
+        const loc = (status.locations || [])[idx] || {};
+        const port = internalPortForIndex(status, idx);
+        const portKey = String(port);
+        const hasLauncherId = typeof loc.launcherId === 'string' && loc.launcherId.trim() !== '';
+        const hasOvpn = !!mySelectedByPort[portKey];
+        const isEnabled = enabledPortsSet.has(port);
+        if (!hasLauncherId && !hasOvpn && !isEnabled) {
+          unusedIdxs.push({ idx, port });
+        }
+      }
+
+      if (unusedIdxs.length === 0) {
+        throw new Error("No unused ports available.");
+      }
+
+      const randItem = unusedIdxs[Math.floor(Math.random() * unusedIdxs.length)];
+      const targetPort = randItem.port;
+
+      const setLauncherRes = await fetch(`/api/set-launcher-id?port=${encodeURIComponent(targetPort)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ launcherId: newEntryId.trim() }),
+      });
+      
+      if (!setLauncherRes.ok) {
+        const errorData = await setLauncherRes.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to set Launcher ID');
+      }
+
+      const assignSuccess = await assignOvpn(targetPort, newEntryOvpn);
+      if (!assignSuccess) {
+        throw new Error('Assigned ID but failed to assign OVPN file.');
+      }
+
+      setNewEntryId('');
+      setNewEntryOvpn('');
+      setShowCreateEntry(false);
+    } catch (err) {
+      setError('Failed to create entry: ' + err.message);
+    } finally {
+      setCreatingEntry(false);
+    }
+  };
+
   if (!status) {
     return (
       <div className="loading-state">
@@ -191,13 +258,22 @@ export default function Dashboard() {
     allPortRows.push({ loc, idx });
   }
 
+  const configuredPortRows = allPortRows.filter(({ loc, idx }) => {
+    const port = internalPortForIndex(status, idx);
+    const portKey = String(port);
+    const hasLauncherId = typeof loc.launcherId === 'string' && loc.launcherId.trim() !== '';
+    const hasOvpn = !!selectedByPort[portKey];
+    const isEnabled = enabledPorts.has(port);
+    return hasLauncherId || hasOvpn || isEnabled;
+  });
+
   const launcherIdQuery = launcherIdFilter.trim().toLowerCase();
   const filteredPortRows = launcherIdQuery
-    ? allPortRows.filter(({ loc }) => {
+    ? configuredPortRows.filter(({ loc }) => {
         const id = typeof loc.launcherId === 'string' ? loc.launcherId : '';
         return id.toLowerCase().includes(launcherIdQuery);
       })
-    : allPortRows;
+    : configuredPortRows;
 
   const portColumnLabel =
     status.publishedPortBase != null && typeof status.publishedPortBase === 'number'
@@ -316,11 +392,11 @@ export default function Dashboard() {
           </div>
           <span className="badge-primary">
             {launcherIdQuery
-              ? `${filteredPortRows.length} of ${totalPorts} shown`
-              : `${totalPorts} locations`}
+              ? `${filteredPortRows.length} of ${configuredPortRows.length} shown`
+              : `${configuredPortRows.length} entries`}
           </span>
         </div>
-        <div className="dashboard-ports-launcher-toolbar">
+        <div className="dashboard-ports-launcher-toolbar flex items-center justify-between">
           <label className="dashboard-ports-launcher-search">
             <span className="material-symbols-outlined" aria-hidden>
               search
@@ -336,7 +412,52 @@ export default function Dashboard() {
               spellCheck={false}
             />
           </label>
+          <button 
+            type="button" 
+            className="btn-primary" 
+            onClick={() => setShowCreateEntry(!showCreateEntry)}
+          >
+            <span className="material-symbols-outlined">{showCreateEntry ? 'close' : 'add'}</span>
+            {showCreateEntry ? 'Cancel' : 'Create Entry'}
+          </button>
         </div>
+        
+        {showCreateEntry && (
+          <form className="p-4 border-b border-[var(--border-color)] bg-[var(--surface-color)]" onSubmit={handleCreateEntry}>
+            <div className="flex items-end gap-4 flex-wrap">
+              <label className="flex flex-col gap-1 flex-1 min-w-[200px]">
+                <span className="font-bold text-sm">Launcher ID</span>
+                <input
+                  type="text"
+                  className="input-field"
+                  style={{ padding: '0.6rem', borderRadius: '4px', border: '1px solid var(--border-color)' }}
+                  value={newEntryId}
+                  onChange={(e) => setNewEntryId(e.target.value)}
+                  placeholder="Enter a unique ID..."
+                  required
+                />
+              </label>
+              <label className="flex flex-col gap-1 flex-1 min-w-[200px]">
+                <span className="font-bold text-sm">Location Configuration</span>
+                <OvpnFileSelect
+                  files={sortedOvpnFiles}
+                  value={newEntryOvpn}
+                  onChange={setNewEntryOvpn}
+                  disabled={creatingEntry}
+                  placeholder="Select location .ovpn…"
+                />
+              </label>
+              <button 
+                type="submit" 
+                className="btn-primary" 
+                disabled={creatingEntry || !newEntryId.trim() || !newEntryOvpn}
+                style={{ padding: '0.6rem 1.2rem', height: 'max-content' }}
+              >
+                {creatingEntry ? 'Creating...' : 'Create Config'}
+              </button>
+            </div>
+          </form>
+        )}
         <div className="table-container">
           <table className="data-table">
             <thead>
@@ -410,7 +531,7 @@ export default function Dashboard() {
                           files={sortedOvpnFiles}
                           value={selected}
                           onChange={(file) => onSelectRowFile(port, file)}
-                          disabled={busyPort === port}
+                          disabled={true}
                           placeholder="Select profile…"
                         />
                       </td>
