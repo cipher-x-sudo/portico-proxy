@@ -12,6 +12,7 @@ export default function Dashboard() {
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
   const [savingLauncherIdPort, setSavingLauncherIdPort] = useState(null);
+  const [savingProxyTypePort, setSavingProxyTypePort] = useState(null);
   const [launcherIdFilter, setLauncherIdFilter] = useState('');
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
@@ -100,6 +101,33 @@ export default function Dashboard() {
       setError(`Failed to ${activate ? 'activate' : 'deactivate'} port: ` + err.message);
     } finally {
       setBusyPort(null);
+    }
+  };
+
+  const saveProxyType = async (port, nextType, previousFromServer) => {
+    const next = nextType === 'socks5' ? 'socks5' : 'http';
+    const prev = previousFromServer === 'socks5' ? 'socks5' : 'http';
+    if (next === prev) return;
+    setSavingProxyTypePort(port);
+    setError('');
+    try {
+      const res = await fetch(`/api/set-proxy-type?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxyType: next }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to save proxy type');
+        return;
+      }
+      const refreshed = await fetch('/api/status').then((r) => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
+    } catch (err) {
+      setError('Failed to save proxy type: ' + err.message);
+    } finally {
+      setSavingProxyTypePort(null);
     }
   };
 
@@ -313,6 +341,7 @@ export default function Dashboard() {
   const proxyUser = status.proxyUsername ?? '';
   const proxyPass = status.proxyPassword ?? '';
 
+  const encUrl = (s) => encodeURIComponent(s ?? '');
   const runningProxyRows = [];
   locations.forEach((loc, idx) => {
     const internalPort = internalPortForIndex(status, idx);
@@ -322,6 +351,11 @@ export default function Dashboard() {
     const hostPort = internalToPublishedPort(status, internalPort);
     const colonFormat = `${proxyHost}:${hostPort}:${proxyUser}:${proxyPass}`;
     const atFormat = `${proxyHost}:${hostPort}@${proxyUser}:${proxyPass}`;
+    const ptype = loc.proxyType === 'socks5' ? 'socks5' : 'http';
+    const schemeUrl =
+      proxyUser || proxyPass
+        ? `${ptype}://${encUrl(proxyUser)}:${encUrl(proxyPass)}@${proxyHost}:${hostPort}`
+        : `${ptype}://${proxyHost}:${hostPort}`;
     const selected = selectedByPort[portKey] || '';
     const fileLabel = selected ? formatOvpnDisplayLabel(selected) : '';
     runningProxyRows.push({
@@ -329,6 +363,8 @@ export default function Dashboard() {
       hostPort,
       colonFormat,
       atFormat,
+      schemeUrl,
+      proxyType: ptype,
       label: fileLabel || loc.label || `Location #${idx}`,
     });
   });
@@ -415,6 +451,7 @@ export default function Dashboard() {
               <thead>
                 <tr>
                   <th>Location</th>
+                  <th>Type</th>
                   <th>Host port</th>
                   <th>
                     <span className="block">host:port:user:pass</span>
@@ -424,15 +461,23 @@ export default function Dashboard() {
                     <span className="block">host:port@user:pass</span>
                     <span className="text-muted text-xs font-normal">at format</span>
                   </th>
+                  <th>
+                    <span className="block">scheme://user:pass@host:port</span>
+                    <span className="text-muted text-xs font-normal">URL</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {runningProxyRows.map((row) => {
                   const tokColon = `colon-${row.internalPort}`;
                   const tokAt = `at-${row.internalPort}`;
+                  const tokUrl = `url-${row.internalPort}`;
                   return (
                     <tr key={row.internalPort}>
                       <td className="font-medium">{row.label}</td>
+                      <td>
+                        <span className="badge-outline">{row.proxyType === 'socks5' ? 'SOCKS5' : 'HTTP'}</span>
+                      </td>
                       <td className="text-primary text-mono font-bold">{row.hostPort}</td>
                       <td>
                         <button
@@ -456,6 +501,19 @@ export default function Dashboard() {
                         >
                           <code className="dashboard-copy-code">{row.atFormat}</code>
                           {copiedToken === tokAt && (
+                            <span className="dashboard-copy-toast">Copied</span>
+                          )}
+                        </button>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className="dashboard-copy-line"
+                          title="Click to copy"
+                          onClick={() => copyProxyLine(row.schemeUrl, tokUrl)}
+                        >
+                          <code className="dashboard-copy-code">{row.schemeUrl}</code>
+                          {copiedToken === tokUrl && (
                             <span className="dashboard-copy-toast">Copied</span>
                           )}
                         </button>
@@ -625,6 +683,7 @@ export default function Dashboard() {
               <tr>
                 <th style={{ width: '40px', textAlign: 'center' }}>#</th>
                 <th>ID</th>
+                <th>Proxy</th>
                 <th>{portColumnLabel}</th>
                 <th>Selected OVPN File</th>
                 <th>Status</th>
@@ -634,11 +693,11 @@ export default function Dashboard() {
             <tbody>
               {totalPorts === 0 || locations.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="text-center p-6 text-muted">No locations configured.</td>
+                  <td colSpan="8" className="text-center p-6 text-muted">No locations configured.</td>
                 </tr>
               ) : filteredPortRows.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="text-center p-6 text-muted">
+                  <td colSpan="8" className="text-center p-6 text-muted">
                     No ports match this ID search.
                   </td>
                 </tr>
@@ -649,6 +708,7 @@ export default function Dashboard() {
                   const portKey = String(port);
                   const selected = selectedByPort[portKey] || '';
                   const launcherIdServer = typeof loc.launcherId === 'string' ? loc.launcherId : '';
+                  const proxyTypeServer = loc.proxyType === 'socks5' ? 'socks5' : 'http';
                   const activationState = activationStateByPort[portKey] || (enabledPorts.has(port) ? 'active' : 'inactive');
                   const isStarting = activationState === 'starting';
                   const isActive = activationState === 'active';
@@ -679,6 +739,21 @@ export default function Dashboard() {
                             <span className="dashboard-copy-toast">Copied!</span>
                           )}
                         </div>
+                      </td>
+                      <td>
+                        <select
+                          className="dashboard-proxy-type-select"
+                          value={proxyTypeServer}
+                          disabled={savingProxyTypePort === port || busyPort === port}
+                          aria-label={`Proxy type for port ${displayPort}`}
+                          onChange={(e) => saveProxyType(port, e.target.value, proxyTypeServer)}
+                        >
+                          <option value="http">HTTP</option>
+                          <option value="socks5">SOCKS5</option>
+                        </select>
+                        {savingProxyTypePort === port && (
+                          <span className="text-muted text-xs ml-1">Saving…</span>
+                        )}
                       </td>
                       <td className="text-primary text-mono font-bold">
                         {displayPort}

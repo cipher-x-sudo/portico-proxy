@@ -421,3 +421,21 @@
     opacity: 1;
   }
 }
+
+.dashboard-proxy-type-select {
+  min-width: 6.5rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-color);
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text-main);
+}
+.dashboard-proxy-type-select:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+.dashboard-proxy-type-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

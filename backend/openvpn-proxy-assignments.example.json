@@ -2,5 +2,6 @@
   "version": 1,
   "assignments": {},
   "activePorts": [],
-  "launcherIds": {}
+  "launcherIds": {},
+  "proxyTypes": {}
 }

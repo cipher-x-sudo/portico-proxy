@@ -36,9 +36,13 @@ if ! grep -q "$MARKER" "$LOG" 2>/dev/null; then
   exit 1
 fi
 
-# HTTP proxy only on 8080
+# pproxy listen scheme: http (default) or socks5 — one protocol per worker on 8080
+SCHEME="${PROXY_LISTEN_SCHEME:-http}"
+if [ "$SCHEME" != "http" ] && [ "$SCHEME" != "socks5" ]; then
+  SCHEME=http
+fi
 if [ -n "$PROXY_USER" ] && [ -n "$PROXY_PASS" ]; then
-  exec python3 -m pproxy -l "http://0.0.0.0:8080#${PROXY_USER}:${PROXY_PASS}"
+  exec python3 -m pproxy -l "${SCHEME}://0.0.0.0:8080#${PROXY_USER}:${PROXY_PASS}"
 else
-  exec python3 -m pproxy -l "http://0.0.0.0:8080"
+  exec python3 -m pproxy -l "${SCHEME}://0.0.0.0:8080"
 fi

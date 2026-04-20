@@ -3,7 +3,7 @@
 Portico — dynamic VPN proxy gateway: listens on one port per location (e.g. 50000, 50001, …),
 runs at most maxSlots VPN+proxy pairs at a time, starts a proxy on-demand when a
 client connects (holding the connection until ready), and shuts down proxies idle
-for idleTimeoutMinutes (no proxy traffic; timer resets when bytes flow). HTTP proxy only (one port per location).
+for idleTimeoutMinutes (no proxy traffic; timer resets when bytes flow). Per listener port: HTTP or SOCKS5 proxy (one scheme per port).
 """
 from pathlib import Path
 # Allow importing openvpn_proxy_runner when run from project root
@@ -58,7 +58,7 @@ BACKEND_CONNECT_TIMEOUT = 0.3  # socket timeout when probing backend (fail fast)
 IDLE_CHECK_INTERVAL = 60  # seconds between idle eviction passes
 INITIAL_READ_SELECT_TIMEOUT = 0.01  # 10ms: proceed almost instantly after first chunk
 INITIAL_READ_DEADLINE = 0.5  # max seconds to wait for first byte (avoids long stall per connection)
-PORTS_PER_LOCATION = 1  # One HTTP proxy port per location
+PORTS_PER_LOCATION = 1  # One client listener per location (pproxy: http or socks5 on worker :8080)
 BACKEND_HTTP_PORT = 8080
 EXTEND_PORT_IDLE_SECONDS = 30 * 60  # user extend: add this much idle budget (monotonic last_activity)
 
@@ -649,10 +649,14 @@ def assignments_state_payload(
     assignments: Dict[int, str],
     active_ports: Optional[Iterable[int]],
     launcher_ids: Optional[Dict[int, str]] = None,
+    proxy_types: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
     ap_list = sorted(set(active_ports)) if active_ports is not None else []
     lid = launcher_ids or {}
     lid_out = {str(p): s for p, s in sorted(lid.items()) if (s or "").strip()}
+    pt = proxy_types or {}
+    # Persist only socks5 overrides; missing port implies http
+    pt_out = {str(p): t for p, t in sorted(pt.items()) if t == "socks5"}
     payload: Dict[str, Any] = {
         "version": ASSIGNMENTS_STATE_VERSION,
         "assignments": {str(p): name for p, name in sorted(assignments.items())},
@@ -660,6 +664,8 @@ def assignments_state_payload(
     }
     if lid_out:
         payload["launcherIds"] = lid_out
+    if pt_out:
+        payload["proxyTypes"] = pt_out
     return payload
 
 
@@ -728,6 +734,29 @@ def _parse_launcher_ids_block(
     return out
 
 
+def _parse_proxy_types_block(
+    raw_types: Any,
+    port_base: int,
+    num_ports: int,
+) -> Dict[int, str]:
+    """Per-listener SOCKS5 overrides only (missing port => http)."""
+    out: Dict[int, str] = {}
+    if not isinstance(raw_types, dict) or num_ports <= 0:
+        return out
+    port_max = port_base + num_ports - 1
+    for k, v in raw_types.items():
+        try:
+            port = int(str(k))
+        except (TypeError, ValueError):
+            continue
+        if port < port_base or port > port_max:
+            continue
+        s = (str(v) if v is not None else "").strip().lower()
+        if s == "socks5":
+            out[port] = "socks5"
+    return out
+
+
 def _ingest_assignments_raw(
     raw: Dict[str, Any],
     port_base: int,
@@ -736,19 +765,21 @@ def _ingest_assignments_raw(
     cfg_path: Path,
     use_docker: bool,
     source_label: str,
-) -> Tuple[Dict[int, str], List[int], Dict[int, str]]:
-    """Parse stored JSON blob (same shape as openvpn-proxy-assignments.json) into assignments + active ports + launcherIds."""
+) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str]]:
+    """Parse stored JSON blob into assignments + active ports + launcherIds + proxyTypes (socks5 overrides)."""
     assignments: Dict[int, str] = {}
     active_listener_ports: List[int] = []
     launcher_ids: Dict[int, str] = {}
+    proxy_types: Dict[int, str] = {}
     if num_ports <= 0:
-        return assignments, active_listener_ports, launcher_ids
+        return assignments, active_listener_ports, launcher_ids, proxy_types
     if isinstance(raw, dict) and isinstance(raw.get("assignments"), dict):
         data = raw["assignments"]
     elif isinstance(raw, dict):
-        data = {k: v for k, v in raw.items() if str(k) not in ("version", "activePorts")}
+        skip = ("version", "activePorts", "launcherIds", "proxyTypes")
+        data = {k: v for k, v in raw.items() if str(k) not in skip}
     else:
-        return assignments, active_listener_ports, launcher_ids
+        return assignments, active_listener_ports, launcher_ids, proxy_types
     nkeys = len(data) if isinstance(data, dict) else 0
     allowed = set(list_allowed_ovpn_files(runtime_config, cfg_path, use_docker))
     _log(
@@ -775,7 +806,8 @@ def _ingest_assignments_raw(
             if port_base <= p <= port_max:
                 active_listener_ports.append(p)
     launcher_ids = _parse_launcher_ids_block(raw.get("launcherIds"), port_base, num_ports)
-    return assignments, sorted(set(active_listener_ports)), launcher_ids
+    proxy_types = _parse_proxy_types_block(raw.get("proxyTypes"), port_base, num_ports)
+    return assignments, sorted(set(active_listener_ports)), launcher_ids, proxy_types
 
 
 def load_gateway_assignments_state(
@@ -787,10 +819,10 @@ def load_gateway_assignments_state(
     runtime_config: Dict[str, Any],
     cfg_path: Path,
     use_docker: bool,
-) -> Tuple[Dict[int, str], List[int], Dict[int, str]]:
-    """Load OVPN picks + activePorts + launcherIds from Redis when configured, else JSON file; migrate file→Redis if needed."""
+) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str]]:
+    """Load OVPN picks + activePorts + launcherIds + proxyTypes from Redis or JSON file; migrate file→Redis if needed."""
     if num_ports <= 0:
-        return {}, [], {}
+        return {}, [], {}, {}
     raw: Optional[Dict[str, Any]] = None
     source = ""
     loaded_from_redis = False
@@ -854,9 +886,10 @@ def save_port_assignments_file(
     assignments: Dict[int, str],
     active_ports: Optional[Iterable[int]] = None,
     launcher_ids: Optional[Dict[int, str]] = None,
+    proxy_types: Optional[Dict[int, str]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = assignments_state_payload(assignments, active_ports, launcher_ids)
+    payload = assignments_state_payload(assignments, active_ports, launcher_ids, proxy_types)
     tmp = path.parent / (path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -915,8 +948,9 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             snap_assign = dict(state["port_ovpn_assignment"])
             snap_active = set(state["active_ports"])
             snap_launcher_ids = dict(state.get("launcher_ids_by_port") or {})
+            snap_proxy_types = dict(state.get("proxy_types_by_port") or {})
         snap_assign = _anti_wipe_merge_assignments(state, snap_assign, port_base, num_ports)
-        payload = assignments_state_payload(snap_assign, snap_active, snap_launcher_ids)
+        payload = assignments_state_payload(snap_assign, snap_active, snap_launcher_ids, snap_proxy_types)
         if redis_url:
             try:
                 _redis_save_json(redis_url, redis_key, payload)
@@ -926,12 +960,12 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             if p.exists() and not p.is_file():
                 _log(f"Cannot persist assignments: path is not a file: {p}")
             else:
-                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids)
+                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids, snap_proxy_types)
         elif mirror_file:
             if p.exists() and not p.is_file():
                 _log(f"REDIS_ASSIGNMENTS_MIRROR_FILE set but path is not a file: {p}")
             else:
-                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids)
+                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids, snap_proxy_types)
     except Exception as e:
         _log(f"Could not persist assignments: {e}")
 
@@ -1139,6 +1173,30 @@ def teardown_slot(slot: Dict[str, Any], use_docker: bool = False) -> None:
     slot["location_index"] = None
 
 
+def _deactivate_listener_port_unlocked(state: Dict[str, Any], port: int) -> None:
+    """Caller must hold state['lock']. Tear down worker for this listener port and mark inactive."""
+    port_to_slot = state["port_to_slot"]
+    port_base = state["port_base"]
+    use_docker = state["use_docker"]
+    state["active_ports"].discard(port)
+    state["activation_cancelled_ports"].add(port)
+    state["activation_state_by_port"][port] = "inactive"
+    state["activation_error_by_port"].pop(port, None)
+    slot = port_to_slot.get(port)
+    if slot is not None:
+        loc = slot.get("location_index")
+        if loc is not None:
+            port_to_slot.pop(port_base + loc, None)
+        teardown_slot(slot, use_docker)
+        slot["external_port"] = None
+        slot["location_index"] = None
+
+
+def deactivate_listener_port(state: Dict[str, Any], port: int) -> None:
+    with state["lock"]:
+        _deactivate_listener_port_unlocked(state, port)
+
+
 def forward(
     client_sock: socket.socket,
     backend_host: str,
@@ -1233,7 +1291,12 @@ def handle_connection(
     docker_image: str = "",
     docker_network: str = "proxynet",
     ovpn_volume_name: str = "ovpn_data",
+    proxy_types_by_port: Optional[Dict[int, str]] = None,
 ) -> None:
+    proxy_types_by_port = proxy_types_by_port or {}
+    listen_scheme = (proxy_types_by_port.get(external_port) or "http").strip().lower()
+    if listen_scheme not in ("http", "socks5"):
+        listen_scheme = "http"
     location_index = (external_port - port_base)
     locations = config.get("locations") or []
     _log(f"Connection on port {external_port} -> location_index={location_index}")
@@ -1370,6 +1433,7 @@ def handle_connection(
                 "container_name": None,
                 "last_activity": time.monotonic(),
                 "external_port": None,
+                "proxy_type": None,
             }
             slots.append(slot)
             _log(f"New slot allocated internal_port={slot['internal_port']}")
@@ -1388,14 +1452,15 @@ def handle_connection(
         launch_locations[location_index]["ovpn"] = assigned_ovpn
     launch_config["locations"] = launch_locations
     if use_docker:
-        _log(f"Starting Docker worker for location {location_index} port {first_port}")
+        _log(f"Starting Docker worker for location {location_index} port {first_port} scheme={listen_scheme}")
         try:
             from backend_docker import start_docker_backend
             backend_host, _ = start_docker_backend(
                 location_index, first_port, launch_config,
                 docker_image, docker_network, ovpn_volume_name,
+                proxy_listen_scheme=listen_scheme,
             )
-            _log(f"Docker worker started: {backend_host} (HTTP:{BACKEND_HTTP_PORT})")
+            _log(f"Docker worker started: {backend_host} ({listen_scheme.upper()}:{BACKEND_HTTP_PORT})")
         except Exception as e:
             _log(f"Failed to start Docker worker for location {location_index}: {e}")
             try:
@@ -1412,6 +1477,7 @@ def handle_connection(
             slot["backend_port"] = BACKEND_HTTP_PORT
             slot["container_name"] = backend_host
             slot["last_activity"] = time.monotonic()
+            slot["proxy_type"] = listen_scheme
         _log(f"Waiting for backend {backend_host}:{BACKEND_HTTP_PORT} (timeout={BACKEND_READY_TIMEOUT}s)")
         if not wait_for_backend(backend_host, BACKEND_HTTP_PORT):
             _log(f"Docker worker for location {location_index} did not become ready in time")
@@ -1440,10 +1506,14 @@ def handle_connection(
         _log(f"Forwarding port {external_port} -> {backend_host}:{backend_port}")
         forward(client_sock, backend_host, backend_port, initial_data, slot, lock)
     else:
-        _log(f"Starting local backend for location {location_index} port {external_port} internal_port={slot['internal_port']}")
+        _log(
+            f"Starting local backend for location {location_index} port {external_port} "
+            f"internal_port={slot['internal_port']} scheme={listen_scheme}"
+        )
         try:
             openvpn_process, proxy_process, log_path, auth_path = start_one_location(
-                launch_config, location_index, slot["internal_port"], config_path
+                launch_config, location_index, slot["internal_port"], config_path,
+                listen_scheme=listen_scheme,
             )
             _log(f"Local backend started for location {location_index}")
         except Exception as e:
@@ -1466,6 +1536,7 @@ def handle_connection(
             slot["backend_host"] = "127.0.0.1"
             slot["backend_port"] = slot["internal_port"]
             slot["last_activity"] = time.monotonic()
+            slot["proxy_type"] = listen_scheme
 
         _log(f"Waiting for local backend 127.0.0.1:{slot['internal_port']}")
         if not wait_for_backend("127.0.0.1", slot["internal_port"]):
@@ -1537,6 +1608,7 @@ def _start_backend_for_port_now(
     docker_image: str = "",
     docker_network: str = "proxynet",
     ovpn_volume_name: str = "ovpn_data",
+    listen_scheme: str = "http",
 ) -> Optional[str]:
     location_index = port - port_base
     locations = config.get("locations") or []
@@ -1588,11 +1660,16 @@ def _start_backend_for_port_now(
                 "container_name": None,
                 "last_activity": time.monotonic(),
                 "external_port": None,
+                "proxy_type": None,
             }
             slots.append(slot)
         slot["location_index"] = location_index
         slot["external_port"] = port
         port_to_slot[port] = slot
+
+    ls = (listen_scheme or "http").strip().lower()
+    if ls not in ("http", "socks5"):
+        ls = "http"
 
     launch_config = dict(config)
     launch_locations = [dict(loc) for loc in (config.get("locations") or [])]
@@ -1603,7 +1680,8 @@ def _start_backend_for_port_now(
         try:
             from backend_docker import start_docker_backend
             backend_host, _ = start_docker_backend(
-                location_index, port, launch_config, docker_image, docker_network, ovpn_volume_name
+                location_index, port, launch_config, docker_image, docker_network, ovpn_volume_name,
+                proxy_listen_scheme=ls,
             )
         except Exception as e:
             with lock:
@@ -1616,6 +1694,7 @@ def _start_backend_for_port_now(
             slot["backend_port"] = BACKEND_HTTP_PORT
             slot["container_name"] = backend_host
             slot["last_activity"] = time.monotonic()
+            slot["proxy_type"] = ls
         if not wait_for_backend(backend_host, BACKEND_HTTP_PORT):
             teardown_slot(slot, use_docker)
             with lock:
@@ -1627,7 +1706,8 @@ def _start_backend_for_port_now(
 
     try:
         openvpn_process, proxy_process, log_path, auth_path = start_one_location(
-            launch_config, location_index, slot["internal_port"], config_path
+            launch_config, location_index, slot["internal_port"], config_path,
+            listen_scheme=ls,
         )
     except Exception as e:
         with lock:
@@ -1644,6 +1724,7 @@ def _start_backend_for_port_now(
         slot["backend_host"] = "127.0.0.1"
         slot["backend_port"] = slot["internal_port"]
         slot["last_activity"] = time.monotonic()
+        slot["proxy_type"] = ls
 
     if not wait_for_backend("127.0.0.1", slot["internal_port"]):
         teardown_slot(slot, use_docker)
@@ -1660,6 +1741,10 @@ def _activate_port_async(
     runtime_config: Dict[str, Any],
     state: Dict[str, Any],
 ) -> None:
+    with state["lock"]:
+        listen_scheme = (state.get("proxy_types_by_port") or {}).get(port) or "http"
+    if listen_scheme not in ("http", "socks5"):
+        listen_scheme = "http"
     start_err = _start_backend_for_port_now(
         port=port,
         config=runtime_config,
@@ -1675,6 +1760,7 @@ def _activate_port_async(
         docker_image=runtime_config.get("dockerImage") or os.environ.get("DOCKER_IMAGE", "portico-worker"),
         docker_network=runtime_config.get("dockerNetwork") or os.environ.get("DOCKER_NETWORK", "proxynet"),
         ovpn_volume_name=runtime_config.get("dockerOvpnVolume") or os.environ.get("DOCKER_OVPN_VOLUME", "ovpn_data"),
+        listen_scheme=listen_scheme,
     )
 
     lock = state["lock"]
@@ -1786,6 +1872,7 @@ def _control_api_handler_factory(
             now = time.monotonic()
             with lock:
                 launcher_ids = dict(state.get("launcher_ids_by_port") or {})
+                proxy_types = dict(state.get("proxy_types_by_port") or {})
                 active = []
                 for port, slot in list(port_to_slot.items()):
                     loc_idx = slot.get("location_index")
@@ -1794,12 +1881,15 @@ def _control_api_handler_factory(
                     label = locations[loc_idx].get("label", "") if loc_idx < len(locations) else ""
                     last = slot.get("last_activity") or 0
                     age_seconds = max(0.0, now - last) if last else 0.0
+                    ptype = (slot.get("proxy_type") or proxy_types.get(port) or "http")
+                    if ptype not in ("http", "socks5"):
+                        ptype = "http"
                     entry = {
                         "port": port,
                         "locationIndex": loc_idx,
                         "locationLabel": label,
                         "lastActivityAgeSeconds": round(age_seconds, 1),
-                        "proxyType": "http",
+                        "proxyType": ptype,
                     }
                     if state.get("use_docker") and slot.get("container_name"):
                         entry["containerName"] = slot["container_name"]
@@ -1866,6 +1956,11 @@ def _control_api_handler_factory(
                         "ovpn": loc.get("ovpn", ""),
                         "randomAccess": bool(loc.get("randomAccess")),
                         "launcherId": launcher_ids.get(port_base + i, ""),
+                        "proxyType": (
+                            "socks5"
+                            if proxy_types.get(port_base + i) == "socks5"
+                            else "http"
+                        ),
                     }
                     for i, loc in enumerate(locations)
                 ],
@@ -1976,19 +2071,72 @@ def _control_api_handler_factory(
             )
             proxy_user = state.get("proxy_username") or ""
             proxy_pass = state.get("proxy_password") or ""
-            if proxy_user and proxy_pass:
-                user_enc = urllib.parse.quote(proxy_user, safe="")
-                pass_enc = urllib.parse.quote(proxy_pass, safe="")
-                proxy_url = f"http://{user_enc}:{pass_enc}@{connect_host}:{port}"
-            else:
-                proxy_url = f"http://{connect_host}:{port}"
+            with state["lock"]:
+                ptype = (state.get("proxy_types_by_port") or {}).get(port) or "http"
+            if ptype not in ("http", "socks5"):
+                ptype = "http"
             try:
-                import urllib.request as urllib_request
-                proxy_handler = urllib_request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-                opener = urllib_request.build_opener(proxy_handler)
-                req = urllib_request.Request("https://api.ipify.org?format=json", headers={"User-Agent": "OpenVPN-Proxy-Gateway/1.0"})
-                with opener.open(req, timeout=15) as resp:
-                    body = resp.read().decode("utf-8")
+                if ptype == "http":
+                    if proxy_user and proxy_pass:
+                        user_enc = urllib.parse.quote(proxy_user, safe="")
+                        pass_enc = urllib.parse.quote(proxy_pass, safe="")
+                        proxy_url = f"http://{user_enc}:{pass_enc}@{connect_host}:{port}"
+                    else:
+                        proxy_url = f"http://{connect_host}:{port}"
+                    import urllib.request as urllib_request
+
+                    proxy_handler = urllib_request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                    opener = urllib_request.build_opener(proxy_handler)
+                    req = urllib_request.Request(
+                        "https://api.ipify.org?format=json",
+                        headers={"User-Agent": "OpenVPN-Proxy-Gateway/1.0"},
+                    )
+                    with opener.open(req, timeout=15) as resp:
+                        body = resp.read().decode("utf-8")
+                    match = re.search(r'"ip"\s*:\s*"([^"]+)"', body) if body else None
+                    exit_ip = match.group(1) if match else body.strip()
+                    self._send_json({"ok": True, "exitIp": exit_ip})
+                    return
+                try:
+                    import socks  # type: ignore
+                except ImportError:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": "SOCKS5 test requires PySocks (pip install PySocks).",
+                        },
+                        status=500,
+                    )
+                    return
+                s = socks.socksocket()
+                s.set_proxy(
+                    socks.SOCKS5,
+                    connect_host,
+                    port,
+                    rdns=True,
+                    username=proxy_user or None,
+                    password=proxy_pass or None,
+                )
+                s.settimeout(20)
+                s.connect(("api.ipify.org", 443))
+                ctx = __import__("ssl").create_default_context()
+                tls = ctx.wrap_socket(s, server_hostname="api.ipify.org")
+                req_line = (
+                    b"GET /?format=json HTTP/1.1\r\n"
+                    b"Host: api.ipify.org\r\n"
+                    b"User-Agent: OpenVPN-Proxy-Gateway/1.0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                tls.sendall(req_line)
+                chunks: List[bytes] = []
+                while True:
+                    chunk = tls.recv(8192)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                tls.close()
+                raw = b"".join(chunks).decode("utf-8", errors="replace")
+                _hdr, _, body = raw.partition("\r\n\r\n")
                 match = re.search(r'"ip"\s*:\s*"([^"]+)"', body) if body else None
                 exit_ip = match.group(1) if match else body.strip()
                 self._send_json({"ok": True, "exitIp": exit_ip})
@@ -2018,6 +2166,8 @@ def _control_api_handler_factory(
                 self._handle_post_evict(parsed.query)
             elif path == "/api/set-launcher-id":
                 self._handle_post_set_launcher_id(parsed.query)
+            elif path == "/api/set-proxy-type":
+                self._handle_post_set_proxy_type(parsed.query)
             else:
                 self.send_error(404)
 
@@ -2165,6 +2315,48 @@ def _control_api_handler_factory(
             persist_assignments_snapshot(state)
             self._send_json({"ok": True, "port": port, "launcherId": s})
 
+        def _handle_post_set_proxy_type(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            ports = params.get("port", [])
+            if not ports:
+                self._send_error_body("Missing port", 400)
+                return
+            try:
+                port = int(ports[0])
+            except ValueError:
+                self._send_error_body("Invalid port", 400)
+                return
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length < 0 or content_length > 4096:
+                self._send_error_body("Invalid Content-Length", 400)
+                return
+            try:
+                body = (self.rfile.read(content_length).decode("utf-8") if content_length else "{}")
+                payload = json.loads(body)
+            except Exception as e:
+                self._send_error_body(str(e), 400)
+                return
+            raw_type = payload.get("proxyType")
+            scheme = (str(raw_type) if raw_type is not None else "").strip().lower()
+            if scheme not in ("http", "socks5"):
+                self._send_error_body('proxyType must be "http" or "socks5"', 400)
+                return
+            port_base = state["port_base"]
+            num_ports = state.get("num_ports") or len(state["locations"])
+            if port < port_base or port >= port_base + num_ports:
+                self._send_error_body("Port out of location range", 400)
+                return
+            lock = state["lock"]
+            with lock:
+                pt = state.setdefault("proxy_types_by_port", {})
+                if scheme == "http":
+                    pt.pop(port, None)
+                else:
+                    pt[port] = "socks5"
+                _deactivate_listener_port_unlocked(state, port)
+            persist_assignments_snapshot(state)
+            self._send_json({"ok": True, "port": port, "proxyType": scheme})
+
         def _handle_post_activate(self, query: str) -> None:
             params = urllib.parse.parse_qs(query)
             ports = params.get("port", [])
@@ -2244,23 +2436,7 @@ def _control_api_handler_factory(
                 self._send_error_body("Invalid port", 400)
                 return
 
-            lock = state["lock"]
-            port_to_slot = state["port_to_slot"]
-            port_base = state["port_base"]
-            use_docker = state["use_docker"]
-            with lock:
-                state["active_ports"].discard(port)
-                state["activation_cancelled_ports"].add(port)
-                state["activation_state_by_port"][port] = "inactive"
-                state["activation_error_by_port"].pop(port, None)
-                slot = port_to_slot.get(port)
-                if slot is not None:
-                    loc = slot.get("location_index")
-                    if loc is not None:
-                        port_to_slot.pop(port_base + loc, None)
-                    teardown_slot(slot, use_docker)
-                    slot["external_port"] = None
-                    slot["location_index"] = None
+            deactivate_listener_port(state, port)
             persist_assignments_snapshot(state)
             self._send_json({"ok": True, "port": port})
 
@@ -2730,7 +2906,7 @@ def main() -> int:
     redis_key = _redis_state_key()
     if redis_url:
         _log(f"Assignment store: Redis key={redis_key!r}")
-    _loaded_assign, _loaded_active_ports, _loaded_launcher_ids = load_gateway_assignments_state(
+    _loaded_assign, _loaded_active_ports, _loaded_launcher_ids, _loaded_proxy_types = load_gateway_assignments_state(
         assignments_path,
         redis_url,
         redis_key,
@@ -2742,10 +2918,12 @@ def main() -> int:
     )
     port_ovpn_assignment.update(_loaded_assign)
     launcher_ids_by_port: Dict[int, str] = dict(_loaded_launcher_ids)
+    proxy_types_by_port: Dict[int, str] = dict(_loaded_proxy_types)
     _log(
         f"Assignments ({assignments_path}): loaded {len(_loaded_assign)} OVPN pick(s), "
         f"{len(_loaded_active_ports)} persisted active port(s), "
-        f"{len(launcher_ids_by_port)} launcher ID(s)"
+        f"{len(launcher_ids_by_port)} launcher ID(s), "
+        f"{len(proxy_types_by_port)} SOCKS5 port override(s)"
     )
 
     activation_state_by_port: Dict[int, str] = {}
@@ -2763,6 +2941,7 @@ def main() -> int:
         "active_ports": active_ports,
         "port_ovpn_assignment": port_ovpn_assignment,
         "launcher_ids_by_port": launcher_ids_by_port,
+        "proxy_types_by_port": proxy_types_by_port,
         "activation_state_by_port": activation_state_by_port,
         "activation_error_by_port": activation_error_by_port,
         "activation_cancelled_ports": activation_cancelled_ports,
@@ -2883,6 +3062,7 @@ def main() -> int:
                 docker_image,
                 docker_network,
                 ovpn_volume_name,
+                gateway_state["proxy_types_by_port"],
             ),
             daemon=True,
         )

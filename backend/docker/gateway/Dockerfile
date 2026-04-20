@@ -2,7 +2,7 @@
 # Build context = ./backend (set by docker-compose at repo root).
 FROM python:3.10-slim
 
-RUN pip install --no-cache-dir docker redis
+RUN pip install --no-cache-dir docker redis PySocks
 
 WORKDIR /app
 # Context is backend/ when built via docker-compose

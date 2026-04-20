@@ -63,6 +63,7 @@ def start_docker_backend(
     docker_image: str,
     docker_network: str,
     ovpn_volume_name: str,
+    proxy_listen_scheme: str = "http",
 ) -> Tuple[str, int]:
     """
     Start a worker container for the given location. Returns (backend_host, backend_port).
@@ -108,12 +109,16 @@ def start_docker_backend(
     except Exception:
         pass
 
+    scheme = (proxy_listen_scheme or "http").strip().lower()
+    if scheme not in ("http", "socks5"):
+        scheme = "http"
     env = [
         f"OVPN_FILE={ovpn_file}",
         f"AUTH_USER={auth_user}",
         f"AUTH_PASS={auth_pass}",
         f"PROXY_USER={proxy_user}",
         f"PROXY_PASS={proxy_pass}",
+        f"PROXY_LISTEN_SCHEME={scheme}",
     ]
     _log(f"Creating container name={container_name} image={docker_image} network={resolved_network} volume={ovpn_volume_name}:/ovpn:ro ovpn_file={ovpn_file}")
     try:

@@ -71,6 +71,7 @@ def start_one_location(
     location_index: int,
     internal_port: int,
     config_path: Path,
+    listen_scheme: str = "http",
 ) -> Tuple[subprocess.Popen, subprocess.Popen, str, str]:
     """
     Start OpenVPN and pproxy for one location. Uses ForceBindIP so traffic exits via that VPN.
@@ -176,9 +177,12 @@ def start_one_location(
                 pass
         raise RuntimeError(f"Could not detect VPN IP from log for location {location_index}.")
 
-    # HTTP only for gateway internal proxies; listen on 127.0.0.1:internal_port
-    http_uri = f"http://{proxy_listen_host}:{internal_port}#{proxy_user}:{proxy_pass}"
-    pproxy_args = ["-m", "pproxy", "-l", http_uri]
+    scheme = (listen_scheme or "http").strip().lower()
+    if scheme not in ("http", "socks5"):
+        scheme = "http"
+    # Gateway internal proxies; listen on 127.0.0.1:internal_port (http or socks5, mutually exclusive)
+    listen_uri = f"{scheme}://{proxy_listen_host}:{internal_port}#{proxy_user}:{proxy_pass}"
+    pproxy_args = ["-m", "pproxy", "-l", listen_uri]
 
     if force_bind_ip and Path(force_bind_ip).exists():
         cmd = [force_bind_ip, vpn_ip, python_path] + pproxy_args
