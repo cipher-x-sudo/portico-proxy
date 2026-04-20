@@ -91,15 +91,20 @@ flowchart TB
 
 ### Linux host: install Docker (Debian / Ubuntu)
 
-On a fresh VPS or workstation, install Docker and grant your user access to the daemon:
+On a fresh VPS or workstation, install Docker and **Compose v2** (the `docker compose` plugin). Do **not** rely on the legacy **`docker-compose`** Python package (v1.29.x): it breaks against current Docker Engine with **`KeyError: 'ContainerConfig'`** when recreating containers.
 
 ```bash
-sudo apt install docker.io docker-compose -y
+sudo apt update
+sudo apt install -y docker.io docker-compose-v2
 sudo usermod -aG docker $USER
 newgrp docker
 ```
 
-After `usermod`, you may need to log out and back in instead of `newgrp docker` for the group change to apply in all sessions. Use **`docker compose`** (with a space) for this project’s Compose V2 workflows when your install provides it.
+Verify Compose v2: **`docker compose version`**. Run this project with **`docker compose`** (space), never **`docker-compose`** (hyphen), unless you know you are on a patched v1.
+
+If **`docker-compose-v2`** is not in your distro’s repositories, install Docker Engine from [Docker’s Linux install docs](https://docs.docker.com/engine/install/) so you get the **`docker-compose-plugin`** package, then use **`docker compose`**.
+
+After `usermod`, you may need to log out and back in instead of `newgrp docker` for the group change to apply in all sessions.
 
 ---
 
@@ -247,6 +252,8 @@ Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount tar
 
 | Symptom | Likely cause | Action |
 |--------|----------------|--------|
+| **`KeyError: 'ContainerConfig'`** when running **`docker-compose up`** | Legacy Compose **v1** (`docker-compose` 1.29.x) vs modern Docker Engine. | Install **Compose v2** (see [Linux host: install Docker](#linux-host-install-docker-debian--ubuntu)), then use **`docker compose up -d`**. Optionally `sudo apt remove docker-compose` so the old binary is not used by mistake. |
+| **`Conflict. The container name "...portico-gateway" is already in use`** | A **leftover gateway container** from an earlier Compose run (often v1), with a name like **`<hex>_portico-gateway`**, was not removed before **`docker compose up`**. | From the repo root: **`docker compose down`**. Run **`docker ps -a`**, find any stray **`*portico-gateway*`** row, then **`docker rm -f <CONTAINER_ID>`** (use the full ID from the error if given). Bring the stack up again: **`docker compose up -d`**. |
 | **502** on `/api/status` | Gateway not listening (crash loop, port bind, old image). | `docker compose logs portico-gateway` (or `docker compose logs gateway`); rebuild with `docker compose build gateway --no-cache && docker compose up -d gateway`. |
 | **`portico-gateway` restarting** | Bad config mount, bind error, or missing files. | Ensure **`backend/openvpn-proxy-config.json`** exists on the host **before** the first `up` (otherwise Docker creates a **directory** at the mount path and the gateway exits). Same for **`openvpn-proxy-assignments.json`**. Read logs for `Failed to bind` or `Config path is a directory`. |
 | **Cannot open dashboard from public IP** | Firewall or bind address. | With default Compose, use **`http://PUBLIC_IP:8080`**. Allow **8080/tcp** (and proxy ports) in **ufw**/cloud security group. For local-only, set **`127.0.0.1:8080:80`** in **`docker-compose.yml`**. |
