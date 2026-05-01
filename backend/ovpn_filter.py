@@ -67,6 +67,7 @@ _PROTON_NAME_RE = re.compile(
     r"^(\d+)-([a-z]{2})-([a-z0-9_-]+)\.protonvpn\.(tcp|udp)\.ovpn$",
     re.IGNORECASE,
 )
+_VENDOR_ISO2_RE = re.compile(r"^[a-z0-9]+vpn-([a-z]{2})[-_].+\.ovpn$", re.IGNORECASE)
 
 # Optional: de_city.ovpn, fr-paris.ovpn (two-letter ISO at start, then - or _).
 _ISO2_PREFIX_RE = re.compile(r"^([a-z]{2})[-_].", re.IGNORECASE)
@@ -255,16 +256,23 @@ def infer_ovpn_country_code(filename: str) -> Optional[str]:
     """Best-effort ISO 3166-1 alpha-2 from filename, or None if unknown."""
     if not filename or not filename.endswith(".ovpn"):
         return None
-    proton = parse_proton_ovpn_meta(filename)
+    # Parse by basename so nested provider folders (e.g. NC/NCVPN-US-*.ovpn)
+    # don't prevent country extraction.
+    base_name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+
+    proton = parse_proton_ovpn_meta(base_name)
     if proton:
         return proton["country"]
-    base = filename[: -len(".ovpn")]
+    base = base_name[: -len(".ovpn")]
     if base.startswith("United_States_") or base == "United_States":
         return "US"
     slug_iso = _infer_country_from_place_slug_basename(base)
     if slug_iso:
         return slug_iso
-    m = _ISO2_PREFIX_RE.match(filename)
+    vm = _VENDOR_ISO2_RE.match(base_name)
+    if vm:
+        return vm.group(1).upper()
+    m = _ISO2_PREFIX_RE.match(base_name)
     if m:
         return m.group(1).upper()
     return None
