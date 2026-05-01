@@ -1188,7 +1188,7 @@ export default function Dashboard() {
                   const isStarting = activationState === 'starting';
                   const isActive = activationState === 'active';
                   const isFailed = activationState === 'failed';
-                  const canStart = !isStarting && !!selected;
+                  const canStart = !isStarting && (!!selected || isRotating);
                   const rowChecked = selectedTablePorts.includes(port);
                   return (
                     <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>

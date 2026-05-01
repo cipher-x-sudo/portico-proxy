@@ -3028,8 +3028,32 @@ def _control_api_handler_factory(
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
             assigned_ovpn = ""
+            rotation_minutes = 0
+            rotation_country = ""
             with state["lock"]:
                 assigned_ovpn = (state["port_ovpn_assignment"].get(port) or "").strip()
+                rotation_minutes = int((state.get("rotation_intervals_by_port") or {}).get(port, 0) or 0)
+                rotation_country = (state.get("rotation_countries_by_port") or {}).get(port, "")
+            if not assigned_ovpn and rotation_minutes > 0:
+                chosen, pick_err = _pick_rotation_ovpn(
+                    runtime_config,
+                    config_path,
+                    bool(state.get("use_docker")),
+                    rotation_country,
+                    "",
+                )
+                if pick_err or not chosen:
+                    self._send_error_body(
+                        pick_err or "No .ovpn files available to rotate",
+                        400,
+                    )
+                    return
+                with state["lock"]:
+                    state["port_ovpn_assignment"][port] = chosen
+                    # Activation starts from now; do not trigger immediate rotation.
+                    state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
+                persist_assignments_snapshot(state)
+                assigned_ovpn = chosen
             if not assigned_ovpn:
                 self._send_error_body("Select an OVPN file for this port before activation", 400)
                 return
