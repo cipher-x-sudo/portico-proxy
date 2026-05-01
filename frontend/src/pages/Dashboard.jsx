@@ -63,7 +63,8 @@ export default function Dashboard() {
     };
     loadStatus();
     loadFiles();
-    const id = setInterval(loadStatus, 5000);
+    // Keep selected OVPN display in sync with auto-rotation quickly.
+    const id = setInterval(loadStatus, 1000);
     return () => clearInterval(id);
   }, []);
 
