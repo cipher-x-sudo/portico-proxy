@@ -13,6 +13,9 @@ function normalizeRandomizeCountrySelect(v) {
 export default function Config() {
   const [config, setConfig] = useState(null);
   const [isDirty, setIsDirty] = useState(false);
+  const [providerAuthRows, setProviderAuthRows] = useState([]);
+  const [providerAuthBusy, setProviderAuthBusy] = useState(false);
+  const [providerAuthError, setProviderAuthError] = useState('');
   const [enabledPorts, setEnabledPorts] = useState(new Set());
   const [busyPort, setBusyPort] = useState(null);
   const [ovpnCountries, setOvpnCountries] = useState([]);
@@ -36,8 +39,11 @@ export default function Config() {
       fetch('/api/ovpn-files')
         .then((res) => res.json())
         .catch(() => ({ countries: [], ovpnCount: 0, unclassifiedOvpnCount: 0 })),
+      fetch('/api/provider-auth')
+        .then((res) => res.json())
+        .catch(() => ({ providers: [] })),
     ])
-      .then(([data, ovpnPayload]) => {
+      .then(([data, ovpnPayload, providerAuthPayload]) => {
         if (!data.locations) data.locations = [];
         if (data.randomizeCountry == null || data.randomizeCountry === '') {
           data.randomizeCountry = 'random';
@@ -51,6 +57,10 @@ export default function Config() {
               ? ovpnPayload.unclassifiedOvpnCount
               : 0,
         });
+        setProviderAuthRows(
+          Array.isArray(providerAuthPayload.providers) ? providerAuthPayload.providers : [],
+        );
+        setProviderAuthError('');
         setIsDirty(false);
       })
       .catch((err) => console.error('Error fetching config:', err));
@@ -100,6 +110,46 @@ export default function Config() {
     setIsDirty(true);
   };
 
+  const handleProviderAuthChange = (index, field, value) => {
+    setProviderAuthRows((prev) => {
+      const next = [...prev];
+      next[index] = { ...next[index], [field]: value };
+      return next;
+    });
+    setProviderAuthError('');
+    setIsDirty(true);
+  };
+
+  const saveProviderAuth = async () => {
+    setProviderAuthBusy(true);
+    setProviderAuthError('');
+    try {
+      const payload = {
+        providers: providerAuthRows.map((row) => ({
+          provider: row.provider || '',
+          username: row.username || '',
+          password: row.password || '',
+        })),
+      };
+      const res = await fetch('/api/provider-auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        const firstErr = Array.isArray(data.results)
+          ? (data.results.find((r) => r && r.ok === false)?.error || '')
+          : '';
+        throw new Error(firstErr || data.error || 'Failed to save provider auth files');
+      }
+      const refreshed = await fetch('/api/provider-auth').then((r) => r.json());
+      setProviderAuthRows(Array.isArray(refreshed.providers) ? refreshed.providers : []);
+    } finally {
+      setProviderAuthBusy(false);
+    }
+  };
+
   const addLocation = () => {
     setConfig(prev => ({
       ...prev,
@@ -126,8 +176,15 @@ export default function Config() {
       });
       const data = await res.json();
       if (data.ok) {
+        try {
+          await saveProviderAuth();
+        } catch (authErr) {
+          setProviderAuthError(authErr.message || 'Provider auth save failed');
+          alert('Configuration saved, but provider auth files failed: ' + (authErr.message || 'Unknown error'));
+          return;
+        }
         setIsDirty(false);
-        alert('Configuration saved! Please restart the gateway to apply changes.');
+        alert('Configuration and provider auth files saved! Please restart the gateway to apply changes.');
       } else {
         alert('Failed to save config: ' + data.error);
       }
@@ -535,143 +592,77 @@ export default function Config() {
             </div>
           )}
         </section>
+
+        <section className="card config-card col-span-2">
+          <div className="card-header">
+            <span className="material-symbols-outlined text-primary">vpn_key</span>
+            <h3 className="card-title">VPN Provider Auth Files</h3>
+          </div>
+          <p className="text-muted text-sm mt-1 mb-3">
+            Edit username/password per provider folder. Saving writes directly to each provider
+            <code className="text-mono"> auth.txt </code>
+            file under OVPN root.
+          </p>
+          {providerAuthError ? (
+            <div className="config-publish-mismatch-banner" role="alert">
+              <strong>Provider auth save failed.</strong> {providerAuthError}
+            </div>
+          ) : null}
+          <div className="table-container">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>Auth file</th>
+                  <th>Username</th>
+                  <th>Password</th>
+                </tr>
+              </thead>
+              <tbody>
+                {providerAuthRows.map((row, idx) => (
+                  <tr key={row.provider || idx}>
+                    <td>
+                      <code>{row.provider || '—'}</code>
+                    </td>
+                    <td>
+                      <code>{row.authPath || ''}</code>
+                    </td>
+                    <td>
+                      <input
+                        type="text"
+                        className="premium-input seamless"
+                        value={row.username || ''}
+                        onChange={(e) => handleProviderAuthChange(idx, 'username', e.target.value)}
+                        placeholder="Provider username"
+                        disabled={providerAuthBusy}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        type="password"
+                        className="premium-input seamless"
+                        value={row.password || ''}
+                        onChange={(e) => handleProviderAuthChange(idx, 'password', e.target.value)}
+                        placeholder="Provider password"
+                        disabled={providerAuthBusy}
+                      />
+                    </td>
+                  </tr>
+                ))}
+                {providerAuthRows.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="text-center p-6 text-muted">
+                      No provider folders detected under current OVPN root.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
       </div>
 
-      <section className="card p-0 overflow-hidden">
-        <div className="table-header">
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-primary">public</span>
-            <h3 className="font-bold">Proxy Locations</h3>
-          </div>
-          <button className="btn-primary-soft" onClick={addLocation}>
-            <span className="material-symbols-outlined">add_location_alt</span>
-            Add Location
-          </button>
-        </div>
-        {statusPorts.publishMismatch && statusPorts.publishMismatchHint ? (
-          <div className="config-publish-mismatch-banner" role="alert">
-            <strong>Publish range mismatch.</strong> {statusPorts.publishMismatchHint}
-          </div>
-        ) : null}
-        {hostRangeSummary ? (
-          <p className="config-host-range-hint text-muted text-sm px-4 pt-3 mb-0">{hostRangeSummary}</p>
-        ) : null}
-        {statusPorts.gatewayListenerCount != null &&
-          config.locations.length > 0 &&
-          statusPorts.gatewayListenerCount > config.locations.length && (
-            <p className="text-muted text-sm px-4 pt-2 mb-0" role="status">
-              The gateway is listening on <strong>{statusPorts.gatewayListenerCount}</strong> port(s) (Docker publish
-              span). This file only defines <strong>{config.locations.length}</strong> row(s); extra slots use{' '}
-              <code className="text-xs">locationSpec.defaultOvpn</code> (or the first configured OVPN path) until you
-              edit JSON. Use the <strong>Dashboard</strong> to pick any profile per port.
-            </p>
-          )}
-        <div className="table-container">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Label</th>
-                <th>Listener (container)</th>
-                {showHostPortCol ? <th>Host port</th> : null}
-                <th>OVPN Filename</th>
-                <th>Username</th>
-                <th>Password</th>
-                <th>Random access</th>
-                <th>Activation</th>
-                <th className="text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {config.locations.map((loc, idx) => (
-                <tr key={idx}>
-                  <td>
-                    <input 
-                      type="text" 
-                      className="premium-input seamless" 
-                      value={loc.label || ''}
-                      onChange={e => handleLocationChange(idx, 'label', e.target.value)}
-                      placeholder="e.g. US East"
-                    />
-                  </td>
-                  <td>
-                    <code>{(config.portBase || 0) + idx}</code>
-                  </td>
-                  {showHostPortCol ? (
-                    <td>
-                      <code>{publishedPortForIndex(portDisplayStatus, idx) ?? '—'}</code>
-                    </td>
-                  ) : null}
-                  <td>
-                    <input 
-                      type="text" 
-                      className="premium-input seamless" 
-                      value={loc.ovpn || ''}
-                      onChange={e => handleLocationChange(idx, 'ovpn', e.target.value)}
-                      placeholder="file.ovpn"
-                    />
-                  </td>
-                  <td>
-                    <input 
-                      type="text" 
-                      className="premium-input seamless" 
-                      value={loc.username || ''}
-                      onChange={e => handleLocationChange(idx, 'username', e.target.value)}
-                      placeholder="Optional"
-                    />
-                  </td>
-                  <td>
-                    <input 
-                      type="password" 
-                      className="premium-input seamless" 
-                      value={loc.password || ''}
-                      onChange={e => handleLocationChange(idx, 'password', e.target.value)}
-                      placeholder="********"
-                    />
-                  </td>
-                  <td className="text-center">
-                    <label className="checkbox-label" style={{ justifyContent: 'center' }}>
-                      <input 
-                        type="checkbox" 
-                        checked={!!loc.randomAccess}
-                        onChange={e => handleLocationChange(idx, 'randomAccess', e.target.checked)}
-                      />
-                      <span className="checkbox-custom"></span>
-                    </label>
-                  </td>
-                  <td>
-                    {(() => {
-                      const port = (config.portBase || 0) + idx;
-                      const isEnabled = enabledPorts.has(port);
-                      return (
-                        <button
-                          className={isEnabled ? 'btn-outline' : 'btn-primary-soft'}
-                          disabled={busyPort === port}
-                          onClick={() => setPortActivation(port, !isEnabled)}
-                          title={isEnabled ? 'Deactivate this port' : 'Activate this port'}
-                        >
-                          {busyPort === port ? 'Working...' : (isEnabled ? 'Deactivate' : 'Activate')}
-                        </button>
-                      );
-                    })()}
-                  </td>
-                  <td className="text-right">
-                    <button className="text-danger hover-glow p-1" onClick={() => removeLocation(idx)}>
-                      <span className="material-symbols-outlined text-lg">delete</span>
-                    </button>
-                  </td>
-                </tr>
-              ))}
-              {config.locations.length === 0 && (
-                <tr>
-                  <td colSpan={showHostPortCol ? 9 : 8} className="text-center p-6 text-muted">
-                    No locations added yet.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
+
     </div>
   );
 }

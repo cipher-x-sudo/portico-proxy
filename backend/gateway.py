@@ -501,6 +501,80 @@ def _is_safe_relative_ovpn_name(name: str) -> bool:
     return True
 
 
+def _resolve_provider_auth_root(config: Dict[str, Any], config_path: Path, use_docker: bool) -> Path:
+    """Resolve the root folder where provider auth files live."""
+    if use_docker:
+        return _docker_ovpn_mount_path()
+    base_dir = config_path.resolve().parent
+    if config.get("ovpnRoot"):
+        return (base_dir / str(config.get("ovpnRoot") or "")).resolve()
+    return base_dir.resolve()
+
+
+def _parse_auth_file_credentials(auth_path: Path) -> Tuple[str, str]:
+    try:
+        lines = auth_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "", ""
+    username = lines[0].strip() if len(lines) >= 1 else ""
+    password = lines[1].strip() if len(lines) >= 2 else ""
+    return username, password
+
+
+def _collect_provider_auth_rows(
+    config: Dict[str, Any], config_path: Path, use_docker: bool
+) -> Tuple[List[Dict[str, Any]], Optional[str], int]:
+    ovpn_root = _resolve_provider_auth_root(config, config_path, use_docker)
+    if not ovpn_root.exists() or not ovpn_root.is_dir():
+        return [], f"ovpnRoot does not exist or is not a directory: {ovpn_root}", 400
+
+    provider_names: Set[str] = set()
+    for p in ovpn_root.rglob("*.ovpn"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(ovpn_root)
+        except ValueError:
+            continue
+        if len(rel.parts) >= 2:
+            provider_names.add(rel.parts[0])
+    for child in ovpn_root.iterdir():
+        if child.is_dir() and (child / "auth.txt").is_file():
+            provider_names.add(child.name)
+
+    rows: List[Dict[str, Any]] = []
+    for provider in sorted(provider_names, key=lambda s: s.casefold()):
+        provider_dir = ovpn_root / provider
+        auth_path = provider_dir / "auth.txt"
+        username = ""
+        password = ""
+        has_auth_file = auth_path.is_file()
+        if has_auth_file:
+            username, password = _parse_auth_file_credentials(auth_path)
+        rows.append(
+            {
+                "provider": provider,
+                "authPath": str(auth_path.resolve()),
+                "hasAuthFile": has_auth_file,
+                "username": username,
+                "password": password,
+            }
+        )
+
+    return rows, None, 200
+
+
+def _is_safe_provider_name(name: str) -> bool:
+    s = (name or "").strip()
+    if not s:
+        return False
+    if "/" in s or "\\" in s:
+        return False
+    if s in (".", ".."):
+        return False
+    return not any(c in s for c in "\r\n\t\x00")
+
+
 def list_allowed_ovpn_files(config: Dict[str, Any], config_path: Path, use_docker: bool = False) -> List[str]:
     # Docker mode: list only files that actually exist on the shared volume (same as worker /ovpn).
     if use_docker:
@@ -2211,6 +2285,8 @@ def _control_api_handler_factory(
                 self._handle_get_config()
             elif path == "/api/ovpn-files":
                 self._handle_get_ovpn_files()
+            elif path == "/api/provider-auth":
+                self._handle_get_provider_auth()
             elif path == "/api/logs":
                 self._handle_get_logs(parsed.query)
             elif path == "/api/worker-logs":
@@ -2375,6 +2451,27 @@ def _control_api_handler_factory(
             )
             self._send_json(payload)
 
+        def _handle_get_provider_auth(self) -> None:
+            config_path = state["config_path"]
+            runtime_config, load_err, load_status = load_disk_config_expanded(config_path)
+            if load_err:
+                self._send_error_body(load_err, load_status)
+                return
+            rows, err, status_code = _collect_provider_auth_rows(
+                runtime_config,
+                config_path,
+                bool(state.get("use_docker")),
+            )
+            if err:
+                self._send_error_body(err, status_code)
+                return
+            self._send_json(
+                {
+                    "providers": rows,
+                    "count": len(rows),
+                }
+            )
+
         def _handle_get_logs(self, query: str) -> None:
             params = urllib.parse.parse_qs(query)
             tail = 200
@@ -2521,6 +2618,8 @@ def _control_api_handler_factory(
             path = parsed.path.rstrip("/")
             if path == "/api/config":
                 self._handle_post_config()
+            elif path == "/api/provider-auth":
+                self._handle_post_provider_auth()
             elif path == "/api/assign-ovpn":
                 self._handle_post_assign_ovpn(parsed.query)
             elif path == "/api/activate":
@@ -2581,6 +2680,84 @@ def _control_api_handler_factory(
                     self._send_error_body(str(e), 500)
                 return
             self._send_json({"ok": True, "message": "Config saved. Restart the gateway to apply."})
+
+        def _handle_post_provider_auth(self) -> None:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length <= 0 or content_length > 256 * 1024:
+                self._send_error_body("Invalid Content-Length", 400)
+                return
+            try:
+                body = self.rfile.read(content_length).decode("utf-8")
+                payload = json.loads(body)
+            except Exception as e:
+                self._send_error_body(str(e), 400)
+                return
+            entries = payload.get("providers") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                self._send_error_body("providers must be an array", 400)
+                return
+
+            config_path = state["config_path"]
+            runtime_config, load_err, load_status = load_disk_config_expanded(config_path)
+            if load_err:
+                self._send_error_body(load_err, load_status)
+                return
+            ovpn_root = _resolve_provider_auth_root(
+                runtime_config,
+                config_path,
+                bool(state.get("use_docker")),
+            )
+            if not ovpn_root.exists() or not ovpn_root.is_dir():
+                self._send_error_body(f"ovpnRoot does not exist or is not a directory: {ovpn_root}", 400)
+                return
+
+            results: List[Dict[str, Any]] = []
+            had_error = False
+            for i, item in enumerate(entries):
+                if not isinstance(item, dict):
+                    results.append({"index": i, "ok": False, "error": "Entry must be an object"})
+                    had_error = True
+                    continue
+                provider = (str(item.get("provider") or "")).strip()
+                username = str(item.get("username") or "")
+                password = str(item.get("password") or "")
+                if not _is_safe_provider_name(provider):
+                    results.append(
+                        {
+                            "provider": provider,
+                            "ok": False,
+                            "error": "provider must be a safe single folder name",
+                        }
+                    )
+                    had_error = True
+                    continue
+                if any(c in username for c in "\r\n\x00"):
+                    results.append({"provider": provider, "ok": False, "error": "username contains invalid characters"})
+                    had_error = True
+                    continue
+                if any(c in password for c in "\r\n\x00"):
+                    results.append({"provider": provider, "ok": False, "error": "password contains invalid characters"})
+                    had_error = True
+                    continue
+                provider_dir = (ovpn_root / provider).resolve()
+                auth_path = (provider_dir / "auth.txt").resolve()
+                if not provider_dir.is_dir():
+                    results.append({"provider": provider, "ok": False, "error": "Provider directory not found under ovpnRoot"})
+                    had_error = True
+                    continue
+                if not _is_safe_under_root(provider_dir, ovpn_root) or not _is_safe_under_root(auth_path, ovpn_root):
+                    results.append({"provider": provider, "ok": False, "error": "Unsafe provider path"})
+                    had_error = True
+                    continue
+                try:
+                    auth_path.write_text(f"{username.strip()}\n{password}\n", encoding="utf-8")
+                    results.append({"provider": provider, "ok": True, "authPath": str(auth_path)})
+                except OSError as e:
+                    had_error = True
+                    results.append({"provider": provider, "ok": False, "error": str(e)})
+
+            status_code = 200 if not had_error else 400
+            self._send_json({"ok": not had_error, "results": results}, status=status_code)
 
         def _handle_post_shutdown(self) -> None:
             global shutdown_flag

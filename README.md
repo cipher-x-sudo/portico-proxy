@@ -256,7 +256,7 @@ Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount tar
 
 - **Docker socket** — The gateway can start arbitrary worker containers; isolate the daemon and restrict who can access the compose project directory.  
 - **Bind addresses** — Default Compose publishes the UI and proxy host ports on **`0.0.0.0`** (reachable on the LAN/public IP); the control API stays on **127.0.0.1** only. Treat **`8080`** and **`58000+`** as sensitive surfaces: **mandatory proxy authentication**, host firewall, and TLS or SSH tunneling on untrusted networks.  
-- **Secrets** — Provider credentials belong in `.env` or `ovpn/**/auth.txt`, not in tracked JSON. Rotate credentials if a workstation or volume was compromised.  
+- **Secrets** — Provider credentials belong in `.env` or `ovpn/**/auth.txt`, not in tracked JSON. The Config page can now edit provider credentials and writes directly to each provider `auth.txt` (for example `ovpn/NC/auth.txt`, `ovpn/EX/auth.txt`). Rotate credentials if a workstation or volume was compromised.  
 - **Control API** — Equivalent to administrative access; do not expose **`49999`** to untrusted networks without TLS termination and authentication in front (not included by default).
 
 ---
