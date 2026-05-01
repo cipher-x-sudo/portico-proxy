@@ -66,7 +66,7 @@ services:
       - ./backend/openvpn-proxy-config.json:/config/openvpn-proxy-config.json
       - ./backend/openvpn-proxy-assignments.json:/config/openvpn-proxy-assignments.json
       # Same bind/volume as workers so gateway can list and validate real .ovpn files (fixes UI showing config-only names missing on disk).
-      - ovpn_data:/ovpn:ro
+      - ovpn_data:/ovpn
     ports:
       - "127.0.0.1:49999:49999"           # control API bound to localhost only
       # Host:container ranges must span the same number of TCP ports; align portBase in openvpn-proxy-config.json with CONTAINER_FIRST.
