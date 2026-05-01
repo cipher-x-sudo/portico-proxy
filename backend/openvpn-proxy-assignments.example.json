@@ -3,5 +3,8 @@
   "assignments": {},
   "activePorts": [],
   "launcherIds": {},
-  "proxyTypes": {}
+  "proxyTypes": {},
+  "rotationIntervals": {},
+  "rotationCountries": {},
+  "rotationLastRun": {}
 }

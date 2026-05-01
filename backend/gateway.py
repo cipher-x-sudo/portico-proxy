@@ -650,6 +650,9 @@ def assignments_state_payload(
     active_ports: Optional[Iterable[int]],
     launcher_ids: Optional[Dict[int, str]] = None,
     proxy_types: Optional[Dict[int, str]] = None,
+    rotation_intervals: Optional[Dict[int, int]] = None,
+    rotation_countries: Optional[Dict[int, str]] = None,
+    rotation_last_run: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     ap_list = sorted(set(active_ports)) if active_ports is not None else []
     lid = launcher_ids or {}
@@ -657,6 +660,17 @@ def assignments_state_payload(
     pt = proxy_types or {}
     # Persist only socks5 overrides; missing port implies http
     pt_out = {str(p): t for p, t in sorted(pt.items()) if t == "socks5"}
+    ri = rotation_intervals or {}
+    ri_out = {str(p): int(v) for p, v in sorted(ri.items()) if isinstance(v, int) and v > 0}
+    rc = rotation_countries or {}
+    rc_out = {str(p): str(v) for p, v in sorted(rc.items()) if (v or "").strip()}
+    rl = rotation_last_run or {}
+    # Only persist last_run for ports that actually have an active rotation interval.
+    rl_out = {
+        str(p): float(v)
+        for p, v in sorted(rl.items())
+        if isinstance(v, (int, float)) and v > 0 and ri.get(p, 0) > 0
+    }
     payload: Dict[str, Any] = {
         "version": ASSIGNMENTS_STATE_VERSION,
         "assignments": {str(p): name for p, name in sorted(assignments.items())},
@@ -666,6 +680,12 @@ def assignments_state_payload(
         payload["launcherIds"] = lid_out
     if pt_out:
         payload["proxyTypes"] = pt_out
+    if ri_out:
+        payload["rotationIntervals"] = ri_out
+    if rc_out:
+        payload["rotationCountries"] = rc_out
+    if rl_out:
+        payload["rotationLastRun"] = rl_out
     return payload
 
 
@@ -757,6 +777,91 @@ def _parse_proxy_types_block(
     return out
 
 
+# Hard cap on rotation interval to keep persisted values sane (1 week).
+_ROTATION_INTERVAL_MAX_MINUTES = 7 * 24 * 60
+
+
+def _parse_rotation_intervals_block(
+    raw: Any,
+    port_base: int,
+    num_ports: int,
+) -> Dict[int, int]:
+    """Per-port rotation interval in minutes; 0 / missing means rotation disabled."""
+    out: Dict[int, int] = {}
+    if not isinstance(raw, dict) or num_ports <= 0:
+        return out
+    port_max = port_base + num_ports - 1
+    for k, v in raw.items():
+        try:
+            port = int(str(k))
+        except (TypeError, ValueError):
+            continue
+        if port < port_base or port > port_max:
+            continue
+        try:
+            mins = int(v)
+        except (TypeError, ValueError):
+            continue
+        if mins <= 0:
+            continue
+        if mins > _ROTATION_INTERVAL_MAX_MINUTES:
+            mins = _ROTATION_INTERVAL_MAX_MINUTES
+        out[port] = mins
+    return out
+
+
+def _parse_rotation_countries_block(
+    raw: Any,
+    port_base: int,
+    num_ports: int,
+) -> Dict[int, str]:
+    """Per-port country override (ISO-2 uppercase). Empty / missing means use global randomizeCountry."""
+    out: Dict[int, str] = {}
+    if not isinstance(raw, dict) or num_ports <= 0:
+        return out
+    port_max = port_base + num_ports - 1
+    for k, v in raw.items():
+        try:
+            port = int(str(k))
+        except (TypeError, ValueError):
+            continue
+        if port < port_base or port > port_max:
+            continue
+        s = (str(v) if v is not None else "").strip()
+        norm = normalize_randomize_country(s)
+        if norm == "random":
+            continue
+        out[port] = norm
+    return out
+
+
+def _parse_rotation_last_run_block(
+    raw: Any,
+    port_base: int,
+    num_ports: int,
+) -> Dict[int, float]:
+    """Per-port last rotation unix timestamp (seconds since epoch)."""
+    out: Dict[int, float] = {}
+    if not isinstance(raw, dict) or num_ports <= 0:
+        return out
+    port_max = port_base + num_ports - 1
+    for k, v in raw.items():
+        try:
+            port = int(str(k))
+        except (TypeError, ValueError):
+            continue
+        if port < port_base or port > port_max:
+            continue
+        try:
+            ts = float(v)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        out[port] = ts
+    return out
+
+
 def _ingest_assignments_raw(
     raw: Dict[str, Any],
     port_base: int,
@@ -765,21 +870,48 @@ def _ingest_assignments_raw(
     cfg_path: Path,
     use_docker: bool,
     source_label: str,
-) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str]]:
-    """Parse stored JSON blob into assignments + active ports + launcherIds + proxyTypes (socks5 overrides)."""
+) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str], Dict[int, int], Dict[int, str], Dict[int, float]]:
+    """Parse stored JSON blob into assignments + active ports + launcherIds + proxyTypes + rotation state."""
     assignments: Dict[int, str] = {}
     active_listener_ports: List[int] = []
     launcher_ids: Dict[int, str] = {}
     proxy_types: Dict[int, str] = {}
+    rotation_intervals: Dict[int, int] = {}
+    rotation_countries: Dict[int, str] = {}
+    rotation_last_run: Dict[int, float] = {}
     if num_ports <= 0:
-        return assignments, active_listener_ports, launcher_ids, proxy_types
+        return (
+            assignments,
+            active_listener_ports,
+            launcher_ids,
+            proxy_types,
+            rotation_intervals,
+            rotation_countries,
+            rotation_last_run,
+        )
     if isinstance(raw, dict) and isinstance(raw.get("assignments"), dict):
         data = raw["assignments"]
     elif isinstance(raw, dict):
-        skip = ("version", "activePorts", "launcherIds", "proxyTypes")
+        skip = (
+            "version",
+            "activePorts",
+            "launcherIds",
+            "proxyTypes",
+            "rotationIntervals",
+            "rotationCountries",
+            "rotationLastRun",
+        )
         data = {k: v for k, v in raw.items() if str(k) not in skip}
     else:
-        return assignments, active_listener_ports, launcher_ids, proxy_types
+        return (
+            assignments,
+            active_listener_ports,
+            launcher_ids,
+            proxy_types,
+            rotation_intervals,
+            rotation_countries,
+            rotation_last_run,
+        )
     nkeys = len(data) if isinstance(data, dict) else 0
     allowed = set(list_allowed_ovpn_files(runtime_config, cfg_path, use_docker))
     _log(
@@ -807,7 +939,21 @@ def _ingest_assignments_raw(
                 active_listener_ports.append(p)
     launcher_ids = _parse_launcher_ids_block(raw.get("launcherIds"), port_base, num_ports)
     proxy_types = _parse_proxy_types_block(raw.get("proxyTypes"), port_base, num_ports)
-    return assignments, sorted(set(active_listener_ports)), launcher_ids, proxy_types
+    rotation_intervals = _parse_rotation_intervals_block(raw.get("rotationIntervals"), port_base, num_ports)
+    rotation_countries = _parse_rotation_countries_block(raw.get("rotationCountries"), port_base, num_ports)
+    rotation_last_run = _parse_rotation_last_run_block(raw.get("rotationLastRun"), port_base, num_ports)
+    # Last-run timestamps without a matching interval are useless; drop them so persistence stays clean.
+    rotation_last_run = {p: ts for p, ts in rotation_last_run.items() if rotation_intervals.get(p, 0) > 0}
+    rotation_countries = {p: c for p, c in rotation_countries.items() if rotation_intervals.get(p, 0) > 0}
+    return (
+        assignments,
+        sorted(set(active_listener_ports)),
+        launcher_ids,
+        proxy_types,
+        rotation_intervals,
+        rotation_countries,
+        rotation_last_run,
+    )
 
 
 def load_gateway_assignments_state(
@@ -819,10 +965,10 @@ def load_gateway_assignments_state(
     runtime_config: Dict[str, Any],
     cfg_path: Path,
     use_docker: bool,
-) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str]]:
-    """Load OVPN picks + activePorts + launcherIds + proxyTypes from Redis or JSON file; migrate file→Redis if needed."""
+) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str], Dict[int, int], Dict[int, str], Dict[int, float]]:
+    """Load OVPN picks + activePorts + launcherIds + proxyTypes + rotation state from Redis or JSON file; migrate file→Redis if needed."""
     if num_ports <= 0:
-        return {}, [], {}, {}
+        return {}, [], {}, {}, {}, {}, {}
     raw: Optional[Dict[str, Any]] = None
     source = ""
     loaded_from_redis = False
@@ -887,9 +1033,20 @@ def save_port_assignments_file(
     active_ports: Optional[Iterable[int]] = None,
     launcher_ids: Optional[Dict[int, str]] = None,
     proxy_types: Optional[Dict[int, str]] = None,
+    rotation_intervals: Optional[Dict[int, int]] = None,
+    rotation_countries: Optional[Dict[int, str]] = None,
+    rotation_last_run: Optional[Dict[int, float]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = assignments_state_payload(assignments, active_ports, launcher_ids, proxy_types)
+    payload = assignments_state_payload(
+        assignments,
+        active_ports,
+        launcher_ids,
+        proxy_types,
+        rotation_intervals,
+        rotation_countries,
+        rotation_last_run,
+    )
     tmp = path.parent / (path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -949,8 +1106,19 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             snap_active = set(state["active_ports"])
             snap_launcher_ids = dict(state.get("launcher_ids_by_port") or {})
             snap_proxy_types = dict(state.get("proxy_types_by_port") or {})
+            snap_rot_intervals = dict(state.get("rotation_intervals_by_port") or {})
+            snap_rot_countries = dict(state.get("rotation_countries_by_port") or {})
+            snap_rot_last_run = dict(state.get("rotation_last_run_by_port") or {})
         snap_assign = _anti_wipe_merge_assignments(state, snap_assign, port_base, num_ports)
-        payload = assignments_state_payload(snap_assign, snap_active, snap_launcher_ids, snap_proxy_types)
+        payload = assignments_state_payload(
+            snap_assign,
+            snap_active,
+            snap_launcher_ids,
+            snap_proxy_types,
+            snap_rot_intervals,
+            snap_rot_countries,
+            snap_rot_last_run,
+        )
         if redis_url:
             try:
                 _redis_save_json(redis_url, redis_key, payload)
@@ -960,12 +1128,30 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             if p.exists() and not p.is_file():
                 _log(f"Cannot persist assignments: path is not a file: {p}")
             else:
-                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids, snap_proxy_types)
+                save_port_assignments_file(
+                    p,
+                    snap_assign,
+                    snap_active,
+                    snap_launcher_ids,
+                    snap_proxy_types,
+                    snap_rot_intervals,
+                    snap_rot_countries,
+                    snap_rot_last_run,
+                )
         elif mirror_file:
             if p.exists() and not p.is_file():
                 _log(f"REDIS_ASSIGNMENTS_MIRROR_FILE set but path is not a file: {p}")
             else:
-                save_port_assignments_file(p, snap_assign, snap_active, snap_launcher_ids, snap_proxy_types)
+                save_port_assignments_file(
+                    p,
+                    snap_assign,
+                    snap_active,
+                    snap_launcher_ids,
+                    snap_proxy_types,
+                    snap_rot_intervals,
+                    snap_rot_countries,
+                    snap_rot_last_run,
+                )
     except Exception as e:
         _log(f"Could not persist assignments: {e}")
 
@@ -1799,6 +1985,181 @@ def _activate_port_async(
     persist_assignments_snapshot(state)
 
 
+def _pick_rotation_ovpn(
+    runtime_config: Dict[str, Any],
+    config_path: Path,
+    use_docker: bool,
+    country_override: str,
+    current_ovpn: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return (chosen_ovpn, error). Filter allowed list by country (override or global), pick random different from current."""
+    allowed = list_allowed_ovpn_files(runtime_config, config_path, use_docker)
+    if not allowed:
+        return None, "No .ovpn files available to rotate"
+    rc = (country_override or "").strip()
+    if not rc:
+        rc = normalize_randomize_country(runtime_config.get("randomizeCountry"))
+    if rc != "random":
+        filtered = filter_ovpn_files_by_country(allowed, rc)
+        if not filtered:
+            return None, f"No .ovpn files for country {rc} (rotation pool is empty)"
+        allowed = filtered
+    pool = list(allowed)
+    if len(pool) > 1 and current_ovpn:
+        others = [f for f in pool if f != current_ovpn]
+        if others:
+            pool = others
+    return secrets.choice(pool), None
+
+
+def _perform_port_rotation_to(
+    state: Dict[str, Any],
+    port: int,
+    new_ovpn: str,
+    runtime_config: Dict[str, Any],
+    config_path: Path,
+) -> Optional[str]:
+    """Tear down active slot (if any), reassign ovpn, validate, restart asynchronously.
+
+    Returns None on success or error string on failure. Caller must not hold state['lock'].
+    """
+    port_base = state["port_base"]
+    locations = state["locations"]
+    loc_idx = port - port_base
+    if loc_idx < 0 or loc_idx >= len(locations):
+        return "Port out of location range"
+    use_docker = bool(state.get("use_docker"))
+    lock = state["lock"]
+    port_to_slot = state["port_to_slot"]
+
+    with lock:
+        state["active_ports"].discard(port)
+        state["activation_cancelled_ports"].add(port)
+        state["activation_state_by_port"][port] = "inactive"
+        state["activation_error_by_port"].pop(port, None)
+        slot = port_to_slot.get(port)
+        if slot is not None:
+            loc_slot = slot.get("location_index")
+            if loc_slot is not None:
+                port_to_slot.pop(port_base + loc_slot, None)
+            teardown_slot(slot, use_docker)
+            slot["external_port"] = None
+            slot["location_index"] = None
+        state["port_ovpn_assignment"][port] = new_ovpn
+    persist_assignments_snapshot(state)
+
+    err = validate_location_assets(
+        runtime_config, config_path, loc_idx, use_docker, new_ovpn,
+    )
+    if err:
+        with lock:
+            state["port_ovpn_assignment"].pop(port, None)
+            state["activation_cancelled_ports"].discard(port)
+        persist_assignments_snapshot(state)
+        return err
+
+    with lock:
+        state["activation_cancelled_ports"].discard(port)
+        state["active_ports"].add(port)
+        state["activation_state_by_port"][port] = "starting"
+        state["activation_error_by_port"].pop(port, None)
+
+    threading.Thread(
+        target=_activate_port_async,
+        args=(port, runtime_config, state),
+        daemon=True,
+    ).start()
+    persist_assignments_snapshot(state)
+    return None
+
+
+# Tick interval for the rotation worker thread. Smaller than the smallest sane rotation interval.
+ROTATION_TICK_SECONDS = 5.0
+
+
+def rotation_loop(state: Dict[str, Any]) -> None:
+    """Background worker: rotate active ports whose interval has elapsed.
+
+    Only ports with rotation_intervals_by_port[port] > 0 AND activation_state == 'active'
+    are rotated. Uses wall-clock timestamps so the schedule survives gateway restarts.
+    """
+    global shutdown_flag
+    config_path = state["config_path"]
+    while not shutdown_flag:
+        time.sleep(ROTATION_TICK_SECONDS)
+        if shutdown_flag:
+            break
+        try:
+            now_wall = time.time()
+            with state["lock"]:
+                intervals = dict(state.get("rotation_intervals_by_port") or {})
+                last_runs = dict(state.get("rotation_last_run_by_port") or {})
+                countries = dict(state.get("rotation_countries_by_port") or {})
+                act_state = dict(state.get("activation_state_by_port") or {})
+                current_assign = dict(state["port_ovpn_assignment"])
+
+            due: List[Tuple[int, str, str]] = []  # (port, country_override, current_ovpn)
+            for port, mins in intervals.items():
+                if mins <= 0:
+                    continue
+                if act_state.get(port) != "active":
+                    continue
+                last = last_runs.get(port, 0.0)
+                if last <= 0:
+                    # Never rotated yet on this active port; seed last_run so the first rotation fires
+                    # exactly `mins` minutes from now rather than immediately.
+                    with state["lock"]:
+                        state.setdefault("rotation_last_run_by_port", {})[port] = now_wall
+                    continue
+                if (now_wall - last) >= (mins * 60.0):
+                    due.append((port, countries.get(port, ""), current_assign.get(port, "")))
+
+            if not due:
+                continue
+
+            # Reload runtime config once per tick when something is due.
+            runtime_config, load_err, _ = load_disk_config_expanded(config_path)
+            if load_err or runtime_config is None:
+                _log(f"Rotation tick: could not load config: {load_err}")
+                continue
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config, bool(state.get("use_docker"))
+            )
+            _enforce_default_proxy_auth(runtime_config)
+            apply_openvpn_auth_env(runtime_config)
+
+            for port, country_override, current_ovpn in due:
+                # Re-check activation under lock right before rotating; skip if user just stopped it.
+                with state["lock"]:
+                    if (state.get("activation_state_by_port") or {}).get(port) != "active":
+                        continue
+                chosen, pick_err = _pick_rotation_ovpn(
+                    runtime_config,
+                    config_path,
+                    bool(state.get("use_docker")),
+                    country_override,
+                    current_ovpn,
+                )
+                if pick_err or not chosen:
+                    _log(f"Rotation skip port {port}: {pick_err or 'no ovpn chosen'}")
+                    # Push last_run forward so we do not hammer the loop on every tick when the pool is empty.
+                    with state["lock"]:
+                        state.setdefault("rotation_last_run_by_port", {})[port] = now_wall
+                    continue
+                err = _perform_port_rotation_to(
+                    state, port, chosen, runtime_config, config_path,
+                )
+                with state["lock"]:
+                    state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
+                if err:
+                    _log(f"Rotation port {port} -> {chosen}: failed: {err}")
+                else:
+                    _log(f"Rotation port {port} -> {chosen}")
+            persist_assignments_snapshot(state)
+        except Exception as e:
+            _log(f"Rotation loop error: {e}")
+
+
 def _control_api_handler_factory(
     gui_dir: Path,
     state: Dict[str, Any],
@@ -1873,6 +2234,9 @@ def _control_api_handler_factory(
             with lock:
                 launcher_ids = dict(state.get("launcher_ids_by_port") or {})
                 proxy_types = dict(state.get("proxy_types_by_port") or {})
+                rotation_intervals = dict(state.get("rotation_intervals_by_port") or {})
+                rotation_countries = dict(state.get("rotation_countries_by_port") or {})
+                rotation_last_run = dict(state.get("rotation_last_run_by_port") or {})
                 active = []
                 for port, slot in list(port_to_slot.items()):
                     loc_idx = slot.get("location_index")
@@ -1960,6 +2324,15 @@ def _control_api_handler_factory(
                             "socks5"
                             if proxy_types.get(port_base + i) == "socks5"
                             else "http"
+                        ),
+                        "rotationIntervalMinutes": int(rotation_intervals.get(port_base + i, 0)),
+                        "rotationCountry": rotation_countries.get(port_base + i, ""),
+                        "nextRotationAt": (
+                            float(rotation_last_run.get(port_base + i, 0.0))
+                            + float(rotation_intervals.get(port_base + i, 0)) * 60.0
+                            if rotation_intervals.get(port_base + i, 0) > 0
+                            and rotation_last_run.get(port_base + i, 0.0) > 0
+                            else None
                         ),
                     }
                     for i, loc in enumerate(locations)
@@ -2168,6 +2541,8 @@ def _control_api_handler_factory(
                 self._handle_post_set_launcher_id(parsed.query)
             elif path == "/api/set-proxy-type":
                 self._handle_post_set_proxy_type(parsed.query)
+            elif path == "/api/set-rotation":
+                self._handle_post_set_rotation(parsed.query)
             else:
                 self.send_error(404)
 
@@ -2243,6 +2618,8 @@ def _control_api_handler_factory(
             if not ovpn:
                 with state["lock"]:
                     state["port_ovpn_assignment"].pop(port, None)
+                    if (state.get("rotation_intervals_by_port") or {}).get(port, 0) > 0:
+                        state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
                 persist_assignments_snapshot(state)
                 self._send_json({"ok": True, "port": port, "ovpn": ""})
                 return
@@ -2270,6 +2647,8 @@ def _control_api_handler_factory(
 
             with state["lock"]:
                 state["port_ovpn_assignment"][port] = ovpn
+                if (state.get("rotation_intervals_by_port") or {}).get(port, 0) > 0:
+                    state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
             persist_assignments_snapshot(state)
             self._send_json({"ok": True, "port": port, "ovpn": ovpn})
 
@@ -2357,6 +2736,78 @@ def _control_api_handler_factory(
             persist_assignments_snapshot(state)
             self._send_json({"ok": True, "port": port, "proxyType": scheme})
 
+        def _handle_post_set_rotation(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            ports = params.get("port", [])
+            if not ports:
+                self._send_error_body("Missing port", 400)
+                return
+            try:
+                port = int(ports[0])
+            except ValueError:
+                self._send_error_body("Invalid port", 400)
+                return
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length < 0 or content_length > 4096:
+                self._send_error_body("Invalid Content-Length", 400)
+                return
+            try:
+                body = (self.rfile.read(content_length).decode("utf-8") if content_length else "{}")
+                payload = json.loads(body)
+            except Exception as e:
+                self._send_error_body(str(e), 400)
+                return
+            raw_interval = payload.get("intervalMinutes")
+            try:
+                interval_minutes = int(raw_interval) if raw_interval is not None else 0
+            except (TypeError, ValueError):
+                self._send_error_body("intervalMinutes must be a non-negative integer", 400)
+                return
+            if interval_minutes < 0:
+                self._send_error_body("intervalMinutes must be a non-negative integer", 400)
+                return
+            if interval_minutes > _ROTATION_INTERVAL_MAX_MINUTES:
+                interval_minutes = _ROTATION_INTERVAL_MAX_MINUTES
+            raw_country = payload.get("country")
+            country_str = (str(raw_country) if raw_country is not None else "").strip()
+            country_norm = normalize_randomize_country(country_str) if country_str else "random"
+            if country_str and country_norm == "random" and country_str.lower() not in ("", "random"):
+                self._send_error_body(
+                    'country must be a 2-letter ISO code or empty for "use global default"',
+                    400,
+                )
+                return
+            port_base = state["port_base"]
+            num_ports = state.get("num_ports") or len(state["locations"])
+            if port < port_base or port >= port_base + num_ports:
+                self._send_error_body("Port out of location range", 400)
+                return
+            with state["lock"]:
+                ri = state.setdefault("rotation_intervals_by_port", {})
+                rc = state.setdefault("rotation_countries_by_port", {})
+                rl = state.setdefault("rotation_last_run_by_port", {})
+                if interval_minutes == 0:
+                    ri.pop(port, None)
+                    rc.pop(port, None)
+                    rl.pop(port, None)
+                else:
+                    ri[port] = interval_minutes
+                    if country_norm == "random":
+                        rc.pop(port, None)
+                    else:
+                        rc[port] = country_norm
+                    # Reset timer so the next rotation fires `interval` minutes from save.
+                    rl[port] = time.time()
+            persist_assignments_snapshot(state)
+            self._send_json(
+                {
+                    "ok": True,
+                    "port": port,
+                    "intervalMinutes": interval_minutes,
+                    "country": "" if country_norm == "random" else country_norm,
+                }
+            )
+
         def _handle_post_activate(self, query: str) -> None:
             params = urllib.parse.parse_qs(query)
             ports = params.get("port", [])
@@ -2415,6 +2866,10 @@ def _control_api_handler_factory(
                 state["active_ports"].add(port)
                 state["activation_state_by_port"][port] = "starting"
                 state["activation_error_by_port"].pop(port, None)
+                # Reset the rotation timer so a stale timestamp from a previous run does not trigger
+                # an immediate rotation right after the user reactivates this port.
+                if (state.get("rotation_intervals_by_port") or {}).get(port, 0) > 0:
+                    state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
 
             threading.Thread(
                 target=_activate_port_async,
@@ -2566,50 +3021,15 @@ def _control_api_handler_factory(
                     pool = others
             chosen = secrets.choice(pool)
 
-            port_to_slot = state["port_to_slot"]
-            use_docker = state["use_docker"]
-            with lock:
-                state["active_ports"].discard(port)
-                state["activation_cancelled_ports"].add(port)
-                state["activation_state_by_port"][port] = "inactive"
-                state["activation_error_by_port"].pop(port, None)
-                slot = port_to_slot.get(port)
-                if slot is not None:
-                    loc_slot = slot.get("location_index")
-                    if loc_slot is not None:
-                        port_to_slot.pop(port_base + loc_slot, None)
-                    teardown_slot(slot, use_docker)
-                    slot["external_port"] = None
-                    slot["location_index"] = None
-                state["port_ovpn_assignment"][port] = chosen
-            persist_assignments_snapshot(state)
-
-            err = validate_location_assets(
-                runtime_config,
-                config_path,
-                loc_idx,
-                bool(state.get("use_docker")),
-                chosen,
+            err = _perform_port_rotation_to(
+                state, port, chosen, runtime_config, config_path,
             )
             if err:
-                with lock:
-                    state["port_ovpn_assignment"].pop(port, None)
-                    state["activation_cancelled_ports"].discard(port)
-                persist_assignments_snapshot(state)
                 self._send_error_body(err, 400)
                 return
-
+            # Manual randomize counts as a rotation event — reset timer so auto-rotation starts fresh.
             with lock:
-                state["activation_cancelled_ports"].discard(port)
-                state["active_ports"].add(port)
-                state["activation_state_by_port"][port] = "starting"
-                state["activation_error_by_port"].pop(port, None)
-
-            threading.Thread(
-                target=_activate_port_async,
-                args=(port, runtime_config, state),
-                daemon=True,
-            ).start()
+                state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
             persist_assignments_snapshot(state)
             self._send_json(
                 {
@@ -2906,7 +3326,15 @@ def main() -> int:
     redis_key = _redis_state_key()
     if redis_url:
         _log(f"Assignment store: Redis key={redis_key!r}")
-    _loaded_assign, _loaded_active_ports, _loaded_launcher_ids, _loaded_proxy_types = load_gateway_assignments_state(
+    (
+        _loaded_assign,
+        _loaded_active_ports,
+        _loaded_launcher_ids,
+        _loaded_proxy_types,
+        _loaded_rot_intervals,
+        _loaded_rot_countries,
+        _loaded_rot_last_run,
+    ) = load_gateway_assignments_state(
         assignments_path,
         redis_url,
         redis_key,
@@ -2919,11 +3347,15 @@ def main() -> int:
     port_ovpn_assignment.update(_loaded_assign)
     launcher_ids_by_port: Dict[int, str] = dict(_loaded_launcher_ids)
     proxy_types_by_port: Dict[int, str] = dict(_loaded_proxy_types)
+    rotation_intervals_by_port: Dict[int, int] = dict(_loaded_rot_intervals)
+    rotation_countries_by_port: Dict[int, str] = dict(_loaded_rot_countries)
+    rotation_last_run_by_port: Dict[int, float] = dict(_loaded_rot_last_run)
     _log(
         f"Assignments ({assignments_path}): loaded {len(_loaded_assign)} OVPN pick(s), "
         f"{len(_loaded_active_ports)} persisted active port(s), "
         f"{len(launcher_ids_by_port)} launcher ID(s), "
-        f"{len(proxy_types_by_port)} SOCKS5 port override(s)"
+        f"{len(proxy_types_by_port)} SOCKS5 port override(s), "
+        f"{len(rotation_intervals_by_port)} rotation rule(s)"
     )
 
     activation_state_by_port: Dict[int, str] = {}
@@ -2942,6 +3374,9 @@ def main() -> int:
         "port_ovpn_assignment": port_ovpn_assignment,
         "launcher_ids_by_port": launcher_ids_by_port,
         "proxy_types_by_port": proxy_types_by_port,
+        "rotation_intervals_by_port": rotation_intervals_by_port,
+        "rotation_countries_by_port": rotation_countries_by_port,
+        "rotation_last_run_by_port": rotation_last_run_by_port,
         "activation_state_by_port": activation_state_by_port,
         "activation_error_by_port": activation_error_by_port,
         "activation_cancelled_ports": activation_cancelled_ports,
@@ -2970,6 +3405,13 @@ def main() -> int:
         daemon=True,
     )
     idle_thread.start()
+
+    rotation_thread = threading.Thread(
+        target=rotation_loop,
+        args=(gateway_state,),
+        daemon=True,
+    )
+    rotation_thread.start()
 
     if auto_activate_on_startup and _loaded_active_ports:
         _enforce_default_proxy_auth(config)

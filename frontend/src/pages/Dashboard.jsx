@@ -9,6 +9,7 @@ export default function Dashboard() {
   const [status, setStatus] = useState(null);
   const [ovpnFiles, setOvpnFiles] = useState([]);
   const [ovpnFilesHint, setOvpnFilesHint] = useState('');
+  const [ovpnCountries, setOvpnCountries] = useState([]);
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
   const [batchBusy, setBatchBusy] = useState(false);
@@ -23,6 +24,8 @@ export default function Dashboard() {
   const [newEntryId, setNewEntryId] = useState('');
   const [newEntryOvpn, setNewEntryOvpn] = useState('');
   const [newEntryProxyType, setNewEntryProxyType] = useState('http');
+  const [newEntryRotationMinutes, setNewEntryRotationMinutes] = useState('0');
+  const [newEntryRotationCountry, setNewEntryRotationCountry] = useState('');
   const [creatingEntry, setCreatingEntry] = useState(false);
 
   const [showEditEntry, setShowEditEntry] = useState(false);
@@ -31,6 +34,9 @@ export default function Dashboard() {
   const [editEntryOvpn, setEditEntryOvpn] = useState('');
   const [editEntryProxyType, setEditEntryProxyType] = useState('http');
   const [editProxyTypeInitial, setEditProxyTypeInitial] = useState('http');
+  const [editEntryRotationMinutes, setEditEntryRotationMinutes] = useState('0');
+  const [editEntryRotationCountry, setEditEntryRotationCountry] = useState('');
+  const [editRotationInitial, setEditRotationInitial] = useState({ minutes: 0, country: '' });
   const [isEditingEntry, setIsEditingEntry] = useState(false);
 
   useEffect(() => {
@@ -39,7 +45,7 @@ export default function Dashboard() {
         .then(res => res.json())
         .then(data => {
           setStatus(data);
-          // Server is source of truth (include every listener port, often ""). Do not merge prev on top — that
+          // Server is source of truth (include every listener port, often ""). Do not merge prev on top —” that
           // overwrote saved assignments with "" when the placeholder or stale state won.
           setSelectedByPort(data.assignedOvpnByPort || {});
         })
@@ -51,6 +57,7 @@ export default function Dashboard() {
         .then(data => {
           setOvpnFiles(Array.isArray(data.files) ? data.files : []);
           setOvpnFilesHint(typeof data.hint === 'string' ? data.hint : '');
+          setOvpnCountries(Array.isArray(data.countries) ? data.countries : []);
         })
         .catch(err => console.error("Error fetching ovpn files:", err));
     };
@@ -145,6 +152,29 @@ export default function Dashboard() {
       return true;
     } catch (err) {
       setError('Failed to save proxy type: ' + err.message);
+      return false;
+    }
+  };
+
+  /** Persist rotation settings for one port. Pass minutes=0 to disable rotation. */
+  const saveRotation = async (port, minutes, country) => {
+    const intervalMinutes = Math.max(0, Math.floor(Number(minutes) || 0));
+    const payload = { intervalMinutes, country: (country || '').toUpperCase() };
+    setError('');
+    try {
+      const res = await fetch(`/api/set-rotation?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to save rotation settings');
+        return false;
+      }
+      return true;
+    } catch (err) {
+      setError('Failed to save rotation settings: ' + err.message);
       return false;
     }
   };
@@ -275,11 +305,21 @@ export default function Dashboard() {
             throw new Error(`Assigned ID ${currentId} but failed to assign OVPN file.`);
           }
         }
+
+        const rotMins = Math.max(0, Math.floor(Number(newEntryRotationMinutes) || 0));
+        if (rotMins > 0) {
+          const rotOk = await saveRotation(targetPort, rotMins, newEntryRotationCountry);
+          if (!rotOk) {
+            throw new Error(`Failed to save rotation settings for ${currentId}`);
+          }
+        }
       }
 
       setNewEntryId('');
       setNewEntryOvpn('');
       setNewEntryProxyType('http');
+      setNewEntryRotationMinutes('0');
+      setNewEntryRotationCountry('');
       setShowCreateEntry(false);
       
       // Update ui immediately
@@ -293,13 +333,18 @@ export default function Dashboard() {
     }
   };
 
-  const openEditModal = (port, currentId, currentOvpn, currentProxyType) => {
+  const openEditModal = (port, currentId, currentOvpn, currentProxyType, currentRotation) => {
     setEditTargetPort(port);
     setEditEntryId(currentId || '');
     setEditEntryOvpn(currentOvpn || '');
     const pt = currentProxyType === 'socks5' ? 'socks5' : 'http';
     setEditEntryProxyType(pt);
     setEditProxyTypeInitial(pt);
+    const rotMins = Math.max(0, Math.floor(Number(currentRotation?.minutes) || 0));
+    const rotCountry = (currentRotation?.country || '').toUpperCase();
+    setEditEntryRotationMinutes(String(rotMins));
+    setEditEntryRotationCountry(rotCountry);
+    setEditRotationInitial({ minutes: rotMins, country: rotCountry });
     setShowEditEntry(true);
   };
 
@@ -326,6 +371,18 @@ export default function Dashboard() {
       const proxyOk = await saveProxyType(editTargetPort, editEntryProxyType, editProxyTypeInitial);
       if (!proxyOk) {
         throw new Error('Failed to update proxy type');
+      }
+
+      const nextRotMins = Math.max(0, Math.floor(Number(editEntryRotationMinutes) || 0));
+      const nextRotCountry = (editEntryRotationCountry || '').toUpperCase();
+      const rotChanged =
+        nextRotMins !== editRotationInitial.minutes ||
+        nextRotCountry !== editRotationInitial.country;
+      if (rotChanged) {
+        const rotOk = await saveRotation(editTargetPort, nextRotMins, nextRotCountry);
+        if (!rotOk) {
+          throw new Error('Failed to update rotation settings');
+        }
       }
 
       setShowEditEntry(false);
@@ -357,6 +414,11 @@ export default function Dashboard() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ proxyType: 'http' }),
+    });
+    await fetch(`/api/set-rotation?port=${encodeURIComponent(port)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ intervalMinutes: 0, country: '' }),
     });
   };
 
@@ -740,7 +802,7 @@ export default function Dashboard() {
               {effectiveSelectedPorts.length !== selectedTablePorts.length && (
                 <span className="text-muted font-normal">
                   {' '}
-                  ({effectiveSelectedPorts.length} apply — others are not in this list)
+                  ({effectiveSelectedPorts.length} apply —” others are not in this list)
                 </span>
               )}
             </span>
@@ -814,13 +876,20 @@ export default function Dashboard() {
                   />
                 </label>
                 <label className="dashboard-modal-field">
-                  <span className="dashboard-modal-label">Location Configuration (Optional)</span>
+                  <span className="dashboard-modal-label">
+                    Location Configuration{' '}
+                    {Number(newEntryRotationMinutes) > 0 ? '(picked at each rotation)' : '(Optional)'}
+                  </span>
                   <OvpnFileSelect
                     files={sortedOvpnFiles}
                     value={newEntryOvpn}
                     onChange={setNewEntryOvpn}
-                    disabled={creatingEntry}
-                    placeholder="Select location .ovpn…"
+                    disabled={creatingEntry || Number(newEntryRotationMinutes) > 0}
+                    placeholder={
+                      Number(newEntryRotationMinutes) > 0
+                        ? 'Auto-selected each rotation'
+                        : 'Select location .ovpn…'
+                    }
                   />
                 </label>
                 <label className="dashboard-modal-field">
@@ -836,6 +905,46 @@ export default function Dashboard() {
                     <option value="socks5">SOCKS5</option>
                   </select>
                 </label>
+                <fieldset className="dashboard-rotation-fieldset" disabled={creatingEntry}>
+                  <legend className="dashboard-modal-label">Rotation</legend>
+                  <div className="dashboard-rotation-grid">
+                    <label className="dashboard-modal-field dashboard-rotation-minutes">
+                      <span className="dashboard-modal-label">Interval (minutes, 0 = off)</span>
+                      <input
+                        type="number"
+                        className="dashboard-modal-input"
+                        min="0"
+                        step="1"
+                        value={newEntryRotationMinutes}
+                        onChange={(e) => setNewEntryRotationMinutes(e.target.value)}
+                        placeholder="0"
+                      />
+                    </label>
+                    <label className="dashboard-modal-field dashboard-rotation-country">
+                      <span className="dashboard-modal-label">Country pool</span>
+                      <select
+                        className="dashboard-modal-input"
+                        value={newEntryRotationCountry}
+                        onChange={(e) => setNewEntryRotationCountry(e.target.value)}
+                        disabled={creatingEntry || Number(newEntryRotationMinutes) <= 0}
+                        aria-label="Rotation country override"
+                      >
+                        <option value="">Use global default</option>
+                        {ovpnCountries.map((c) => (
+                          <option key={c.code} value={c.code}>
+                            {c.label}
+                            {typeof c.count === 'number' ? ` (${c.count})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <p className="dashboard-rotation-hint text-muted text-xs">
+                    {Number(newEntryRotationMinutes) > 0
+                      ? 'Active ports are rotated to a random .ovpn at this interval.'
+                      : 'Set a positive interval to enable automatic OVPN rotation while the port is active.'}
+                  </p>
+                </fieldset>
                 <div className="dashboard-modal-actions">
                   <button
                     type="submit"
@@ -882,13 +991,20 @@ export default function Dashboard() {
                   />
                 </label>
                 <label className="dashboard-modal-field">
-                  <span className="dashboard-modal-label">Location Configuration</span>
+                  <span className="dashboard-modal-label">
+                    Location Configuration
+                    {Number(editEntryRotationMinutes) > 0 ? ' (picked at each rotation)' : ''}
+                  </span>
                   <OvpnFileSelect
                     files={sortedOvpnFiles}
                     value={editEntryOvpn}
                     onChange={setEditEntryOvpn}
-                    disabled={isEditingEntry}
-                    placeholder="Select location .ovpn…"
+                    disabled={isEditingEntry || Number(editEntryRotationMinutes) > 0}
+                    placeholder={
+                      Number(editEntryRotationMinutes) > 0
+                        ? 'Auto-selected each rotation'
+                        : 'Select location .ovpn…'
+                    }
                   />
                 </label>
                 <label className="dashboard-modal-field">
@@ -904,6 +1020,46 @@ export default function Dashboard() {
                     <option value="socks5">SOCKS5</option>
                   </select>
                 </label>
+                <fieldset className="dashboard-rotation-fieldset" disabled={isEditingEntry}>
+                  <legend className="dashboard-modal-label">Rotation</legend>
+                  <div className="dashboard-rotation-grid">
+                    <label className="dashboard-modal-field dashboard-rotation-minutes">
+                      <span className="dashboard-modal-label">Interval (minutes, 0 = off)</span>
+                      <input
+                        type="number"
+                        className="dashboard-modal-input"
+                        min="0"
+                        step="1"
+                        value={editEntryRotationMinutes}
+                        onChange={(e) => setEditEntryRotationMinutes(e.target.value)}
+                        placeholder="0"
+                      />
+                    </label>
+                    <label className="dashboard-modal-field dashboard-rotation-country">
+                      <span className="dashboard-modal-label">Country pool</span>
+                      <select
+                        className="dashboard-modal-input"
+                        value={editEntryRotationCountry}
+                        onChange={(e) => setEditEntryRotationCountry(e.target.value)}
+                        disabled={isEditingEntry || Number(editEntryRotationMinutes) <= 0}
+                        aria-label="Rotation country override"
+                      >
+                        <option value="">Use global default</option>
+                        {ovpnCountries.map((c) => (
+                          <option key={c.code} value={c.code}>
+                            {c.label}
+                            {typeof c.count === 'number' ? ` (${c.count})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <p className="dashboard-rotation-hint text-muted text-xs">
+                    {Number(editEntryRotationMinutes) > 0
+                      ? 'Active ports are rotated to a random .ovpn at this interval.'
+                      : 'Set a positive interval to enable automatic OVPN rotation while the port is active.'}
+                  </p>
+                </fieldset>
                 <div className="dashboard-modal-actions">
                   <button
                     type="submit"
@@ -1023,6 +1179,10 @@ export default function Dashboard() {
                   const selected = selectedByPort[portKey] || '';
                   const launcherIdServer = typeof loc.launcherId === 'string' ? loc.launcherId : '';
                   const proxyTypeServer = loc.proxyType === 'socks5' ? 'socks5' : 'http';
+                  const rotationMinutes = Math.max(0, Math.floor(Number(loc.rotationIntervalMinutes) || 0));
+                  const rotationCountry = (loc.rotationCountry || '').toUpperCase();
+                  const isRotating = rotationMinutes > 0;
+                  const rotationInfo = { minutes: rotationMinutes, country: rotationCountry };
                   const activationState = activationStateByPort[portKey] || (enabledPorts.has(port) ? 'active' : 'inactive');
                   const isStarting = activationState === 'starting';
                   const isActive = activationState === 'active';
@@ -1060,7 +1220,7 @@ export default function Dashboard() {
                           }}
                         >
                           <span className="dashboard-copy-code" style={{ fontSize: '0.85rem' }}>
-                            {launcherIdServer || '—'}
+                            {launcherIdServer || '—”'}
                           </span>
                           {copiedToken === `id-${port}` && (
                             <span className="dashboard-copy-toast">Copied!</span>
@@ -1092,13 +1252,31 @@ export default function Dashboard() {
                         </div>
                       </td>
                       <td>
-                        <OvpnFileSelect
-                          files={sortedOvpnFiles}
-                          value={selected}
-                          onChange={(file) => onSelectRowFile(port, file)}
-                          disabled={true}
-                          placeholder="Select profile…"
-                        />
+                        <div className="dashboard-ovpn-cell">
+                          <OvpnFileSelect
+                            files={sortedOvpnFiles}
+                            value={selected}
+                            onChange={(file) => onSelectRowFile(port, file)}
+                            disabled={true}
+                            placeholder={isRotating ? 'Rotating…' : 'Select profile…'}
+                          />
+                          {isRotating && (
+                            <span
+                              className="dashboard-rotation-badge"
+                              title={`Rotates every ${rotationMinutes}m${
+                                rotationCountry ? ` from ${rotationCountry} pool` : ''
+                              }`}
+                            >
+                              <span className="material-symbols-outlined" aria-hidden>
+                                autorenew
+                              </span>
+                              <span>
+                                Rotating · {rotationMinutes}m
+                                {rotationCountry ? ` · ${rotationCountry}` : ''}
+                              </span>
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td>
                         <span className={isActive ? 'status-active' : isStarting ? 'status-starting' : isFailed ? 'status-failed' : 'status-inactive'}>
@@ -1125,7 +1303,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer)}
+                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer, rotationInfo)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
@@ -1183,7 +1361,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer)}
+                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer, rotationInfo)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
@@ -1214,3 +1392,4 @@ export default function Dashboard() {
     </div>
   );
 }
+
