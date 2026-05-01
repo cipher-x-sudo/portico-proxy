@@ -2754,7 +2754,20 @@ def _control_api_handler_factory(
                     results.append({"provider": provider, "ok": True, "authPath": str(auth_path)})
                 except OSError as e:
                     had_error = True
-                    results.append({"provider": provider, "ok": False, "error": str(e)})
+                    if getattr(e, "errno", None) == errno.EROFS or "read-only" in str(e).lower():
+                        results.append(
+                            {
+                                "provider": provider,
+                                "ok": False,
+                                "error": (
+                                    "OVPN mount is read-only. In Docker, change gateway volume "
+                                    "`ovpn_data:/ovpn:ro` to `ovpn_data:/ovpn`, then recreate "
+                                    "the stack (`docker compose down && docker compose up -d`)."
+                                ),
+                            }
+                        )
+                    else:
+                        results.append({"provider": provider, "ok": False, "error": str(e)})
 
             status_code = 200 if not had_error else 400
             self._send_json({"ok": not had_error, "results": results}, status=status_code)
