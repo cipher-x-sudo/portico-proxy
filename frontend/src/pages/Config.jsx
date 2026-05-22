@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { useConfirm, useToast } from '../components/ui/feedback-hooks.js';
 import './Config.css';
 
 function normalizeRandomizeCountrySelect(v) {
@@ -10,6 +11,8 @@ function normalizeRandomizeCountrySelect(v) {
 }
 
 export default function Config() {
+  const confirmAction = useConfirm();
+  const toast = useToast();
   const [config, setConfig] = useState(null);
   const [isDirty, setIsDirty] = useState(false);
   const [providerAuthRows, setProviderAuthRows] = useState([]);
@@ -154,9 +157,15 @@ export default function Config() {
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || 'Failed to save upstream proxy');
       await refreshUpstreamProxies();
+      toast({
+        title: upstreamForm.id ? 'Proxy updated' : 'Proxy added',
+        message: `${upstreamForm.label || upstreamForm.host} is ready to use.`,
+        variant: 'success',
+      });
       resetUpstreamForm();
     } catch (err) {
       setUpstreamError(err.message || 'Failed to save upstream proxy');
+      toast({ title: 'Proxy save failed', message: err.message || 'Failed to save upstream proxy.', variant: 'danger' });
     } finally {
       setUpstreamBusy(false);
     }
@@ -176,7 +185,13 @@ export default function Config() {
   };
 
   const deleteUpstreamProxy = async (proxy) => {
-    if (!window.confirm(`Delete upstream proxy ${proxy.label || proxy.host}?`)) return;
+    const accepted = await confirmAction({
+      title: 'Delete upstream proxy?',
+      message: `Delete ${proxy.label || proxy.host}? This removes the saved upstream profile.`,
+      confirmLabel: 'Delete proxy',
+      variant: 'danger',
+    });
+    if (!accepted) return;
     setUpstreamBusy(true);
     setUpstreamError('');
     try {
@@ -187,8 +202,10 @@ export default function Config() {
       if (!data.ok) throw new Error(data.error || 'Failed to delete upstream proxy');
       await refreshUpstreamProxies();
       if (upstreamForm.id === proxy.id) resetUpstreamForm();
+      toast({ title: 'Proxy deleted', message: `${proxy.label || proxy.host} was removed.`, variant: 'success' });
     } catch (err) {
       setUpstreamError(err.message || 'Failed to delete upstream proxy');
+      toast({ title: 'Delete failed', message: err.message || 'Failed to delete upstream proxy.', variant: 'danger' });
     } finally {
       setUpstreamBusy(false);
     }
@@ -208,9 +225,17 @@ export default function Config() {
       if (!res.ok) throw new Error(data.error || 'Failed to import upstream proxies');
       setUpstreamImportResults(Array.isArray(data.results) ? data.results : []);
       await refreshUpstreamProxies();
-      if ((data.imported || 0) > 0) setUpstreamImportLines('');
+      if ((data.imported || 0) > 0) {
+        setUpstreamImportLines('');
+        toast({
+          title: 'Import complete',
+          message: `${data.imported} upstream ${data.imported === 1 ? 'proxy' : 'proxies'} imported.`,
+          variant: 'success',
+        });
+      }
     } catch (err) {
       setUpstreamError(err.message || 'Failed to import upstream proxies');
+      toast({ title: 'Import failed', message: err.message || 'Failed to import upstream proxies.', variant: 'danger' });
     } finally {
       setUpstreamBusy(false);
     }
@@ -229,16 +254,24 @@ export default function Config() {
           await saveProviderAuth();
         } catch (authErr) {
           setProviderAuthError(authErr.message || 'Provider auth save failed');
-          alert('Configuration saved, but provider auth files failed: ' + (authErr.message || 'Unknown error'));
+          toast({
+            title: 'Config saved with auth error',
+            message: authErr.message || 'Provider auth files failed to save.',
+            variant: 'warning',
+          });
           return;
         }
         setIsDirty(false);
-        alert('Configuration and provider auth files saved! Please restart the gateway to apply changes.');
+        toast({
+          title: 'Configuration saved',
+          message: 'Restart the gateway to apply changes.',
+          variant: 'success',
+        });
       } else {
-        alert('Failed to save config: ' + data.error);
+        toast({ title: 'Save failed', message: data.error || 'The gateway rejected the config.', variant: 'danger' });
       }
     } catch (err) {
-      alert('Error saving config: ' + err.message);
+      toast({ title: 'Save failed', message: err.message, variant: 'danger' });
     }
   };
 
@@ -263,7 +296,7 @@ export default function Config() {
         setConfig(imported);
         setIsDirty(true);
       } catch {
-        alert("Invalid JSON file");
+        toast({ title: 'Invalid JSON file', message: 'The imported file could not be parsed.', variant: 'danger' });
       }
     };
     reader.readAsText(file);
@@ -628,13 +661,13 @@ export default function Config() {
               <tbody>
                 {providerAuthRows.map((row, idx) => (
                   <tr key={row.provider || idx}>
-                    <td>
+                    <td data-label="Provider">
                       <code>{row.provider || '—'}</code>
                     </td>
-                    <td>
+                    <td data-label="Auth file">
                       <code>{row.authPath || ''}</code>
                     </td>
-                    <td>
+                    <td data-label="Username">
                       <input
                         type="text"
                         className="premium-input seamless"
@@ -644,7 +677,7 @@ export default function Config() {
                         disabled={providerAuthBusy}
                       />
                     </td>
-                    <td>
+                    <td data-label="Password">
                       <input
                         type="password"
                         className="premium-input seamless"
@@ -812,13 +845,13 @@ export default function Config() {
               <tbody>
                 {upstreamProxies.map((proxy) => (
                   <tr key={proxy.id}>
-                    <td className="font-medium">{proxy.label}</td>
-                    <td className="text-mono">
+                    <td className="font-medium" data-label="Label">{proxy.label}</td>
+                    <td className="text-mono" data-label="Upstream">
                       {proxy.scheme}://{proxy.host}:{proxy.port}
                     </td>
-                    <td className="text-mono">{proxy.username || '—'}</td>
-                    <td>{proxy.hasPassword ? 'Saved' : '—'}</td>
-                    <td className="text-right">
+                    <td className="text-mono" data-label="Username">{proxy.username || '—'}</td>
+                    <td data-label="Password">{proxy.hasPassword ? 'Saved' : '—'}</td>
+                    <td className="text-right" data-label="Actions">
                       <div className="flex gap-2 justify-end">
                         <button className="btn-secondary" type="button" onClick={() => editUpstreamProxy(proxy)}>
                           Edit

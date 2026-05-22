@@ -1,8 +1,11 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { useConfirm, useToast } from '../components/ui/feedback-hooks.js';
 import { copyToClipboard } from '../utils/copyToClipboard';
 import './Actions.css';
 
 export default function Actions() {
+  const confirmAction = useConfirm();
+  const toast = useToast();
   const [gatewayLogs, setGatewayLogs] = useState([]);
   const [logsPaused, setLogsPaused] = useState(false);
   const [logFilter, setLogFilter] = useState('');
@@ -55,12 +58,30 @@ export default function Actions() {
   }, [gatewayLogs, logsPaused]);
 
   const handleStopGateway = async () => {
-    if (!window.confirm("Are you sure you want to stop the gateway? All active proxy sessions will be disconnected immediately.")) return;
+    const accepted = await confirmAction({
+      title: 'Stop gateway services?',
+      message: 'All active proxy sessions will be disconnected immediately.',
+      confirmLabel: 'Stop gateway',
+      variant: 'danger',
+    });
+    if (!accepted) return;
     try {
       const res = await fetch('/api/shutdown', { method: 'POST' });
-      if (res.ok) alert("Gateway shutdown initiated. The service will stop.");
+      if (res.ok) {
+        toast({
+          title: 'Gateway shutdown started',
+          message: 'The service will stop after the shutdown request completes.',
+          variant: 'success',
+        });
+      } else {
+        toast({
+          title: 'Shutdown failed',
+          message: 'The gateway rejected the shutdown request.',
+          variant: 'danger',
+        });
+      }
     } catch (e) {
-      alert("Error stopping gateway: " + e.message);
+      toast({ title: 'Shutdown failed', message: e.message, variant: 'danger' });
     }
   };
 
@@ -70,13 +91,21 @@ export default function Actions() {
       const res = await fetch(`/api/evict?port=${evictPort}`, { method: 'POST' });
       const data = await res.json();
       if (data.ok) {
-        alert(`Port ${evictPort} evicted successfully.`);
+        toast({
+          title: 'Port evicted',
+          message: `Port ${evictPort} was evicted successfully.`,
+          variant: 'success',
+        });
         setEvictPort('');
       } else {
-        alert("Failed to evict: " + data.error);
+        toast({
+          title: 'Evict failed',
+          message: data.error || 'The gateway rejected the evict request.',
+          variant: 'danger',
+        });
       }
     } catch (e) {
-      alert("Error evicting port: " + e.message);
+      toast({ title: 'Evict failed', message: e.message, variant: 'danger' });
     }
   };
 
@@ -99,9 +128,9 @@ export default function Actions() {
   const copyGatewayLogs = async () => {
     try {
       await copyToClipboard(gatewayLogs.join('\n'));
-      alert('Logs copied to clipboard.');
+      toast({ title: 'Logs copied', message: 'Gateway logs are on the clipboard.', variant: 'success' });
     } catch (e) {
-      alert(e?.message ? `Copy failed: ${e.message}` : 'Copy failed');
+      toast({ title: 'Copy failed', message: e?.message || 'Could not copy logs.', variant: 'danger' });
     }
   };
 

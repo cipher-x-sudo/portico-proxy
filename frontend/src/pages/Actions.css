@@ -1,11 +1,12 @@
 .actions-page {
   display: flex;
   flex-direction: column;
-  gap: 2rem;
+  gap: 1.25rem;
 }
 
 .action-section {
   display: flex;
+  min-width: 0;
   flex-direction: column;
 }
 
@@ -16,45 +17,28 @@
   gap: 1rem;
 }
 
-.split-card h3 {
-  font-size: 1rem;
+.split-card h3,
+.action-section .card > h3 {
+  margin: 0 0 0.25rem;
   color: var(--text-main);
-  margin-bottom: 0.25rem;
+  font-size: 1rem;
+  font-weight: 900;
 }
 
 .split-card p {
-  font-size: 0.8rem;
+  margin: 0;
   color: var(--text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
 }
-
-.btn-danger-solid {
-  background: var(--danger);
-  color: white;
-  padding: 0.6rem 1.2rem;
-  border-radius: var(--radius-sm);
-  font-weight: 600;
-  font-size: 0.875rem;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  box-shadow: 0 4px 6px -1px var(--danger-glow);
-}
-
-.btn-danger-solid:hover {
-  background: #dc2626; /* darker red */
-  transform: translateY(-1px);
-}
-
-.flex-1 { flex: 1; }
 
 .logs-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 1rem;
+  gap: 1rem;
+  margin-bottom: 0.7rem;
 }
-
-.m-0 { margin: 0; }
 
 .logs-controls {
   display: flex;
@@ -62,14 +46,15 @@
   gap: 0.5rem;
 }
 
-.search-box.small input {
-  padding: 0.4rem 0.5rem 0.4rem 2.2rem;
-  font-size: 0.75rem;
-  width: 200px;
+.search-box.small {
+  width: 15rem;
 }
 
-.search-box.small input:focus {
-  width: 250px;
+.search-box.small input {
+  min-height: 2.25rem;
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+  font-size: 0.78rem;
 }
 
 .search-box.small .material-symbols-outlined {
@@ -77,57 +62,80 @@
 }
 
 .active-warning {
+  border-color: rgba(244, 183, 64, 0.42) !important;
+  background: rgba(244, 183, 64, 0.12) !important;
   color: var(--warning) !important;
-  background: rgba(245, 158, 11, 0.1) !important;
-  border-color: var(--warning) !important;
+}
+
+.logs-viewer,
+.worker-logs-viewer {
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  background: #070a0e;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
 }
 
 .logs-viewer {
-  background: #000;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  height: 400px;
-  overflow-y: auto;
-  padding: 1rem;
-  font-family: monospace;
-  font-size: 0.75rem;
-  line-height: 1.5;
+  height: clamp(18rem, 44vh, 28rem);
+  padding: 0.85rem;
   color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.55;
 }
 
 .log-line {
+  padding: 0.12rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.025);
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
-  word-wrap: break-word;
-  padding: 2px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.02);
 }
 
 .log-line:hover {
-  background: rgba(255,255,255,0.02);
   color: var(--text-main);
+  background: rgba(255, 255, 255, 0.025);
 }
 
 .worker-logs-viewer {
-  background: #000;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  min-height: 150px;
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 1rem;
   display: flex;
+  min-height: 10rem;
+  max-height: 22rem;
+  padding: 0.9rem;
 }
 
 .worker-logs-viewer pre {
-  margin: 0;
-  font-family: monospace;
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  white-space: pre-wrap;
   width: 100%;
+  margin: 0;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
-.flex-col { flex-direction: column; }
 @media (min-width: 768px) {
-  .md-row { flex-direction: row; }
+  .md-row {
+    flex-direction: row;
+  }
+}
+
+@media (max-width: 720px) {
+  .split-card,
+  .logs-header,
+  .logs-controls,
+  .action-section .card .flex {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .search-box.small {
+    width: 100%;
+  }
+
+  .logs-controls {
+    display: grid;
+    grid-template-columns: 1fr repeat(3, 2.25rem);
+  }
 }

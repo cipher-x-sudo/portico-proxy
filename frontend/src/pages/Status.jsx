@@ -179,22 +179,22 @@ export default function Status() {
                   const hostPort = internalToPublishedPort(data, s.port);
                   return (
                   <tr key={s.port}>
-                    <td className="text-primary text-mono font-bold">
+                    <td className="text-primary text-mono font-bold" data-label={publishedRange ? 'Host port' : 'Port'}>
                       {hostPort}
                       {hostPort !== s.port && (
                         <div className="text-muted text-xs font-normal">Container: {s.port}</div>
                       )}
                     </td>
-                    <td>
+                    <td data-label="Location">
                       <div className="flex gap-2 items-center">
                         <span className="material-symbols-outlined text-sm text-muted">public</span>
                         {s.locationLabel || `#${s.locationIndex}`}
                       </div>
                     </td>
-                    <td><span className="badge-outline">{s.proxyType || 'HTTP'}</span></td>
-                    <td className="text-muted">{formatActivity(s.lastActivityAgeSeconds)}</td>
-                    <td className="text-xs text-mono">{s.containerName || `proxy-${s.port}`}</td>
-                    <td className="text-right">
+                    <td data-label="Type"><span className="badge-outline">{s.proxyType || 'HTTP'}</span></td>
+                    <td className="text-muted" data-label="Last Activity">{formatActivity(s.lastActivityAgeSeconds)}</td>
+                    <td className="text-xs text-mono" data-label="Backend">{s.containerName || `proxy-${s.port}`}</td>
+                    <td className="text-right" data-label="Actions">
                       <button className="btn-danger">Evict</button>
                     </td>
                   </tr>
@@ -229,16 +229,16 @@ export default function Status() {
                 const containerP = data.portBase + i;
                 return (
                 <tr key={i}>
-                  <td className="text-muted text-mono">{i}</td>
-                  <td className="font-medium">{loc.label}</td>
-                  <td className="text-xs text-muted text-mono">
+                  <td className="text-muted text-mono" data-label="Index">{i}</td>
+                  <td className="font-medium" data-label="Label">{loc.label}</td>
+                  <td className="text-xs text-muted text-mono" data-label="Egress">
                     {loc.egress?.type === 'upstream'
                       ? `upstream:${loc.egress.upstreamProxy?.label || loc.egress.upstreamProxyId || 'missing'}`
                       : loc.egress?.type === 'ovpn'
                         ? loc.egress.ovpn
                         : 'none'}
                   </td>
-                  <td className="text-primary text-mono font-bold">
+                  <td className="text-primary text-mono font-bold" data-label={publishedRange ? 'Host proxy port' : 'Proxy port'}>
                     {hostP}
                     {hostP !== containerP && (
                       <div className="text-muted text-xs font-normal">Container: {containerP}</div>

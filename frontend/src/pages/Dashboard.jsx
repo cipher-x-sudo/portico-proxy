@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { useConfirm, useToast } from '../components/ui/feedback-hooks.js';
 import './Dashboard.css';
 import OvpnFileSelect from '../components/OvpnFileSelect';
 import { formatOvpnDisplayLabel, sortOvpnFiles } from '../utils/ovpnFiles';
@@ -6,6 +7,8 @@ import { copyToClipboard } from '../utils/copyToClipboard';
 import { internalPortForIndex, internalToPublishedPort, publishedPortForIndex } from '../utils/portDisplay';
 
 export default function Dashboard() {
+  const confirmAction = useConfirm();
+  const toast = useToast();
   const [status, setStatus] = useState(null);
   const [ovpnFiles, setOvpnFiles] = useState([]);
   const [ovpnFilesHint, setOvpnFilesHint] = useState('');
@@ -53,7 +56,7 @@ export default function Dashboard() {
         .then(res => res.json())
         .then(data => {
           setStatus(data);
-          // Server is source of truth (include every listener port, often ""). Do not merge prev on top —” that
+          // Server is source of truth (include every listener port, often ""). Do not merge prev on top; that
           // overwrote saved assignments with "" when the placeholder or stale state won.
           setSelectedByPort(data.assignedOvpnByPort || {});
         })
@@ -500,7 +503,13 @@ export default function Dashboard() {
   };
 
   const deleteEntry = async (port) => {
-    if (!window.confirm('Are you sure you want to delete this entry?')) return;
+    const accepted = await confirmAction({
+      title: 'Delete this entry?',
+      message: 'The launcher ID, egress, proxy type, rotation, and active state for this port will be cleared.',
+      confirmLabel: 'Delete entry',
+      variant: 'danger',
+    });
+    if (!accepted) return;
     setBusyPort(port);
     setError('');
     try {
@@ -509,8 +518,10 @@ export default function Dashboard() {
       setStatus(refreshed);
       setSelectedByPort(refreshed.assignedOvpnByPort || {});
       setSelectedTablePorts((prev) => prev.filter((x) => x !== port));
+      toast({ title: 'Entry deleted', message: `Port ${port} has been cleared.`, variant: 'success' });
     } catch (err) {
       setError('Failed to delete entry: ' + err.message);
+      toast({ title: 'Delete failed', message: err.message, variant: 'danger' });
     } finally {
       setBusyPort(null);
     }
@@ -525,7 +536,13 @@ export default function Dashboard() {
   const batchDeleteSelected = async (validPorts) => {
     const targets = selectedTablePorts.filter((p) => validPorts.includes(p));
     if (targets.length === 0) return;
-    if (!window.confirm(`Delete ${targets.length} selected ${targets.length === 1 ? 'entry' : 'entries'}?`)) return;
+    const accepted = await confirmAction({
+      title: `Delete ${targets.length} selected ${targets.length === 1 ? 'entry' : 'entries'}?`,
+      message: 'Selected ports will be stopped and cleared from the launcher list.',
+      confirmLabel: 'Delete selected',
+      variant: 'danger',
+    });
+    if (!accepted) return;
     setBatchBusy(true);
     setError('');
     try {
@@ -534,8 +551,14 @@ export default function Dashboard() {
       }
       await refreshStatus();
       setSelectedTablePorts([]);
+      toast({
+        title: 'Entries deleted',
+        message: `${targets.length} ${targets.length === 1 ? 'entry was' : 'entries were'} cleared.`,
+        variant: 'success',
+      });
     } catch (err) {
       setError('Batch delete failed: ' + err.message);
+      toast({ title: 'Batch delete failed', message: err.message, variant: 'danger' });
     } finally {
       setBatchBusy(false);
     }
@@ -725,8 +748,10 @@ export default function Dashboard() {
       window.setTimeout(() => {
         setCopiedToken((t) => (t === token ? null : t));
       }, 2000);
+      toast({ title: 'Copied', message: 'Value copied to clipboard.', variant: 'success', duration: 1800 });
     } catch (err) {
       setError(err?.message ? `Copy failed: ${err.message}` : 'Copy failed');
+      toast({ title: 'Copy failed', message: err?.message || 'Could not copy value.', variant: 'danger' });
     }
   };
 
@@ -790,8 +815,8 @@ export default function Dashboard() {
                   const tokUrl = `url-${row.internalPort}`;
                   return (
                     <tr key={row.internalPort}>
-                      <td className="font-medium">{row.label}</td>
-                      <td>
+                      <td className="font-medium" data-label="Location">{row.label}</td>
+                      <td data-label="Host port">
                         <div className="flex flex-col gap-1 items-start">
                           <span className="badge-outline">
                             {row.proxyType === 'socks5' ? 'SOCKS5' : 'HTTP'}
@@ -799,7 +824,7 @@ export default function Dashboard() {
                           <span className="text-primary text-mono font-bold">{row.hostPort}</span>
                         </div>
                       </td>
-                      <td>
+                      <td data-label="Colon format">
                         <button
                           type="button"
                           className="dashboard-copy-line"
@@ -812,7 +837,7 @@ export default function Dashboard() {
                           )}
                         </button>
                       </td>
-                      <td>
+                      <td data-label="At format">
                         <button
                           type="button"
                           className="dashboard-copy-line"
@@ -825,7 +850,7 @@ export default function Dashboard() {
                           )}
                         </button>
                       </td>
-                      <td>
+                      <td data-label="URL">
                         <button
                           type="button"
                           className="dashboard-copy-line"
@@ -897,7 +922,7 @@ export default function Dashboard() {
               {effectiveSelectedPorts.length !== selectedTablePorts.length && (
                 <span className="text-muted font-normal">
                   {' '}
-                  ({effectiveSelectedPorts.length} apply —” others are not in this list)
+                  ({effectiveSelectedPorts.length} apply; others are not in this list)
                 </span>
               )}
             </span>
@@ -1388,7 +1413,7 @@ export default function Dashboard() {
                   const rowChecked = selectedTablePorts.includes(port);
                   return (
                     <tr key={port} className={hasEgress ? 'dashboard-row-ovpn-selected' : undefined}>
-                      <td className="text-center align-middle">
+                      <td className="text-center align-middle" data-label="Select">
                         <input
                           type="checkbox"
                           checked={rowChecked}
@@ -1401,30 +1426,28 @@ export default function Dashboard() {
                           aria-label={`Select row ${launcherIdServer || displayPort}`}
                         />
                       </td>
-                      <td className="text-muted text-sm font-bold text-center border-r border-[var(--border-color)]" style={{ opacity: 0.5 }}>
+                      <td className="text-muted text-sm font-bold text-center border-r border-[var(--border-color)]" style={{ opacity: 0.5 }} data-label="#">
                         {arrayIndex + 1}
                       </td>
-                      <td className="dashboard-launcher-id-cell">
+                      <td className="dashboard-launcher-id-cell" data-label="ID">
                         <div
                           className="dashboard-copy-line text-mono"
                           style={{ padding: '0.45rem 0.55rem', border: '1px solid var(--border-color)', background: 'rgba(0,0,0,0.2)' }}
                           title="Click to copy ID"
                           onClick={() => {
                             if (!launcherIdServer) return;
-                            copyToClipboard(launcherIdServer);
-                            setCopiedToken(`id-${port}`);
-                            setTimeout(() => setCopiedToken(null), 2000);
+                            copyProxyLine(launcherIdServer, `id-${port}`);
                           }}
                         >
                           <span className="dashboard-copy-code" style={{ fontSize: '0.85rem' }}>
-                            {launcherIdServer || '—”'}
+                            {launcherIdServer || '—'}
                           </span>
                           {copiedToken === `id-${port}` && (
                             <span className="dashboard-copy-toast">Copied!</span>
                           )}
                         </div>
                       </td>
-                      <td className="text-primary font-bold">
+                      <td className="text-primary font-bold" data-label={portColumnLabel}>
                         <div className="flex flex-col gap-1 items-start">
                           <span className="badge-outline">
                             {proxyTypeServer === 'socks5' ? 'SOCKS5' : 'HTTP'}
@@ -1434,11 +1457,7 @@ export default function Dashboard() {
                             className="dashboard-copy-line text-mono"
                             title="Click to copy host port"
                             onClick={() => {
-                              copyToClipboard(String(displayPort));
-                              setCopiedToken(`hostport-${port}`);
-                              window.setTimeout(() => {
-                                setCopiedToken((t) => (t === `hostport-${port}` ? null : t));
-                              }, 2000);
+                              copyProxyLine(String(displayPort), `hostport-${port}`);
                             }}
                           >
                             <span className="dashboard-copy-code">{displayPort}</span>
@@ -1448,7 +1467,7 @@ export default function Dashboard() {
                           </button>
                         </div>
                       </td>
-                      <td>
+                      <td data-label="Egress">
                         <div className="dashboard-ovpn-cell">
                           <span className="dashboard-egress-kind">
                             {egress.type === 'upstream'
@@ -1498,7 +1517,7 @@ export default function Dashboard() {
                           )}
                         </div>
                       </td>
-                      <td>
+                      <td data-label="Status">
                         <span className={isActive ? 'status-active' : isStarting ? 'status-starting' : isFailed ? 'status-failed' : 'status-inactive'}>
                           {isActive ? 'Active' : isStarting ? 'Starting...' : isFailed ? 'Failed' : 'Inactive'}
                         </span>
@@ -1506,7 +1525,7 @@ export default function Dashboard() {
                           <div className="status-error-text">{activationErrorByPort[portKey]}</div>
                         )}
                       </td>
-                      <td className="text-right">
+                      <td className="text-right" data-label="Actions">
                         <div className="dashboard-row-actions">
                           {!isActive ? (
                             <>

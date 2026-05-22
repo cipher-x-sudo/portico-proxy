@@ -13,7 +13,7 @@ export default function Sidebar({ activeTab, setActiveTab, isCollapsed }) {
     <aside className={`sidebar ${isCollapsed ? 'collapsed' : ''}`}>
       <div className="sidebar-header">
         <div className="logo-box">
-          <span className="material-symbols-outlined">vpn_lock</span>
+          <span className="material-symbols-outlined" aria-hidden>vpn_lock</span>
         </div>
         {!isCollapsed && (
           <div className="logo-text">
@@ -31,7 +31,7 @@ export default function Sidebar({ activeTab, setActiveTab, isCollapsed }) {
             onClick={() => setActiveTab(item.id)}
             title={isCollapsed ? item.label : ''}
           >
-            <span className="material-symbols-outlined">{item.icon}</span>
+            <span className="material-symbols-outlined" aria-hidden>{item.icon}</span>
             {!isCollapsed && <span>{item.label}</span>}
           </button>
         ))}
@@ -41,19 +41,19 @@ export default function Sidebar({ activeTab, setActiveTab, isCollapsed }) {
         {!isCollapsed ? (
           <div className="help-box glass-panel">
             <div className="help-header">
-              <span className="material-symbols-outlined">help</span>
+              <span className="material-symbols-outlined" aria-hidden>help</span>
               <span>HELP</span>
             </div>
             <p>Need help configuring your proxy gateway?</p>
             <a href="/README.md" target="_blank" rel="noopener noreferrer">
               Open Gateway Docs
-              <span className="material-symbols-outlined">open_in_new</span>
+              <span className="material-symbols-outlined" aria-hidden>open_in_new</span>
             </a>
           </div>
         ) : (
           <div className="help-box-collapsed" title="Help">
             <a href="/README.md" target="_blank" rel="noopener noreferrer">
-              <span className="material-symbols-outlined">help</span>
+              <span className="material-symbols-outlined" aria-hidden>help</span>
             </a>
           </div>
         )}
