@@ -16,6 +16,7 @@ env/
 # Local gateway state (copy from *.example.json; do not commit real picks or paths you care about)
 backend/openvpn-proxy-config.json
 backend/openvpn-proxy-assignments.json
+backend/upstream-proxy-catalog.json
 
 # Provider OpenVPN logins shipped with some .ovpn layouts — never commit real credentials
 **/auth.txt

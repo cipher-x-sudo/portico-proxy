@@ -129,6 +129,7 @@ After `usermod`, you may need to log out and back in instead of `newgrp docker` 
    ```bash
    cp backend/openvpn-proxy-config.example.json backend/openvpn-proxy-config.json
    cp backend/openvpn-proxy-assignments.example.json backend/openvpn-proxy-assignments.json
+   cp backend/upstream-proxy-catalog.example.json backend/upstream-proxy-catalog.json
    cp .env.example .env
    ```
 
@@ -137,6 +138,7 @@ After `usermod`, you may need to log out and back in instead of `newgrp docker` 
    ```powershell
    Copy-Item backend\openvpn-proxy-config.example.json backend\openvpn-proxy-config.json
    Copy-Item backend\openvpn-proxy-assignments.example.json backend\openvpn-proxy-assignments.json
+   Copy-Item backend\upstream-proxy-catalog.example.json backend\upstream-proxy-catalog.json
    Copy-Item .env.example .env
    ```
 
@@ -173,6 +175,8 @@ Runtime JSON is mounted at **`/config/openvpn-proxy-config.json`** inside the ga
 | **`autoActivateOnStartup`** | Whether persisted **`activePorts`** are started after gateway restart. |
 | **`useDocker`** / **`dockerImage`** / **`dockerNetwork`** / **`dockerOvpnVolume`** | Docker backend (`USE_DOCKER=1` in Compose). Defaults align with **`portico-worker`** and **`proxynet`**. |
 | **`randomizeCountry`** | Restricts random profile selection (`random` or ISO country code); see `backend/ovpn_filter.py`. |
+
+Saved generic upstream proxy profiles live in **`backend/upstream-proxy-catalog.json`** (copied from the example before Compose starts). The dashboard Config page can add one profile or bulk import common `host:port`, `host:port:user:pass`, and proxy URL lines. Ports Launcher entries can choose either an OVPN profile or an upstream profile; upstream refresh restarts the same assigned proxy and does not perform provider-specific country selection.
 
 Legacy keys (`openvpnPath`, `forceBindIPPath`, `pythonPath`, `maxLocations`) exist for **non-container** runs of `gateway.py` and are **out of scope** for this deployment guide.
 
@@ -233,7 +237,8 @@ docker compose up -d
 ### Backups
 
 - **`redis_data`** volume: AOF persistence for Redis state. Snapshot or replicate per your DR policy.  
-- **`backend/openvpn-proxy-assignments.json`**: file-based mirror of picks and `activePorts` when not using Redis, or when **`REDIS_ASSIGNMENTS_MIRROR_FILE=1`**.  
+- **`backend/openvpn-proxy-assignments.json`**: file-based mirror of typed egress picks and `activePorts` when not using Redis, or when **`REDIS_ASSIGNMENTS_MIRROR_FILE=1`**.
+- **`backend/upstream-proxy-catalog.json`**: saved generic upstream proxy profiles and their upstream credentials.
 - **Config**: keep `openvpn-proxy-config.json` and `.env` in a **secrets manager** or encrypted backup — not in Git.
 
 ### Observability
@@ -268,7 +273,7 @@ Gateway env **`OPENVPN_PROXY_ASSIGNMENTS_PATH`** overrides the default mount tar
 | **`KeyError: 'ContainerConfig'`** when running **`docker-compose up`** | Legacy Compose **v1** (`docker-compose` 1.29.x) vs modern Docker Engine. | Install **Compose v2** (see [Linux host: install Docker](#linux-host-install-docker-debian--ubuntu)), then use **`docker compose up -d`**. Optionally `sudo apt remove docker-compose` so the old binary is not used by mistake. |
 | **`Conflict. The container name "...portico-gateway" is already in use`** | A **leftover gateway container** from an earlier Compose run (often v1), with a name like **`<hex>_portico-gateway`**, was not removed before **`docker compose up`**. | From the repo root: **`docker compose down`**. Run **`docker ps -a`**, find any stray **`*portico-gateway*`** row, then **`docker rm -f <CONTAINER_ID>`** (use the full ID from the error if given). Bring the stack up again: **`docker compose up -d`**. |
 | **502** on every **`/api/*`** call | Nginx in **frontend** cannot reach **gateway:49999** because **portico-gateway** is down or **Restarting**. | **`docker compose logs portico-gateway --tail 120`**. Fix the first error (e.g. **`Failed to bind`**, **`Config path is a directory`**, **`Invalid JSON`**, **`Invalid locationSpec`**). Confirm **`docker compose ps`** shows gateway **Up**. Rebuild if needed: **`docker compose build gateway --no-cache && docker compose up -d`**. |
-| **`portico-gateway` restarting** | Bad config mount, bind error, or missing files. | Ensure **`backend/openvpn-proxy-config.json`** exists on the host **before** the first `up` (otherwise Docker creates a **directory** at the mount path and the gateway exits). Same for **`openvpn-proxy-assignments.json`**. Read logs for `Failed to bind` or `Config path is a directory`. |
+| **`portico-gateway` restarting** | Bad config mount, bind error, or missing files. | Ensure **`backend/openvpn-proxy-config.json`** exists on the host **before** the first `up` (otherwise Docker creates a **directory** at the mount path and the gateway exits). Same for **`openvpn-proxy-assignments.json`** and **`upstream-proxy-catalog.json`**. Read logs for `Failed to bind` or `Config path is a directory`. |
 | **Cannot open dashboard from public IP** | Firewall or bind address. | With default Compose, use **`http://PUBLIC_IP:8080`**. Allow **8080/tcp** (and proxy ports) in **ufw**/cloud security group. For local-only, set **`127.0.0.1:8080:80`** in **`docker-compose.yml`**. |
 | **`Rejecting connection on inactive port`** | Port not activated. | Assign `.ovpn`, activate in UI, wait for **active** state. |
 | **Wrong port from host** | Using container port instead of **published** port. | Use host map (e.g. **58000**), not **50000**, unless you intentionally publish 50000. |

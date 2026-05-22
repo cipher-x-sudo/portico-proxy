@@ -48,8 +48,17 @@ from ovpn_filter import (
     normalize_randomize_country,
     randomize_country_status_label,
 )
-from openvpn_proxy_runner import resolve_ovpn_path, start_one_location
+from openvpn_proxy_runner import resolve_ovpn_path, start_one_location, start_one_upstream_proxy
 from provider_auth import load_provider_auth
+from upstream_proxy import (
+    UpstreamProxyError,
+    import_proxy_lines,
+    load_catalog,
+    normalize_profile,
+    public_profile,
+    resolve_catalog_path,
+    save_catalog,
+)
 
 BUFFER_SIZE = 65536  # 64 KB max buffer while waiting for backend
 BACKEND_READY_TIMEOUT = 90  # seconds to wait for proxy (cap so client can retry if VPN is slow)
@@ -671,7 +680,8 @@ def load_disk_config_expanded(config_path: Path) -> Tuple[Optional[Dict[str, Any
     return cfg, None, 200
 
 
-ASSIGNMENTS_STATE_VERSION = 1
+ASSIGNMENTS_STATE_VERSION = 2
+UPSTREAM_CATALOG_ENV = "UPSTREAM_PROXY_CATALOG_PATH"
 
 
 def resolve_assignments_path(config_path: Path) -> Path:
@@ -679,6 +689,14 @@ def resolve_assignments_path(config_path: Path) -> Path:
     if override:
         return Path(override).expanduser().resolve()
     return (config_path.parent / "openvpn-proxy-assignments.json").resolve()
+
+
+def resolve_upstream_catalog_path(config_path: Path) -> Path:
+    return resolve_catalog_path(config_path, os.environ.get(UPSTREAM_CATALOG_ENV) or "")
+
+
+def _catalog_index(profiles: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(p.get("id")): dict(p) for p in profiles if (p.get("id") or "").strip()}
 
 
 def _redis_url_from_env_or_config(config: Optional[Dict[str, Any]] = None) -> str:
@@ -727,6 +745,9 @@ def assignments_state_payload(
     rotation_intervals: Optional[Dict[int, int]] = None,
     rotation_countries: Optional[Dict[int, str]] = None,
     rotation_last_run: Optional[Dict[int, float]] = None,
+    egress_by_port: Optional[Dict[int, Dict[str, str]]] = None,
+    upstream_refresh_intervals: Optional[Dict[int, int]] = None,
+    upstream_refresh_last_run: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     ap_list = sorted(set(active_ports)) if active_ports is not None else []
     lid = launcher_ids or {}
@@ -745,11 +766,31 @@ def assignments_state_payload(
         for p, v in sorted(rl.items())
         if isinstance(v, (int, float)) and v > 0 and ri.get(p, 0) > 0
     }
+    egress_out: Dict[str, Dict[str, str]] = {}
+    for port, egress in sorted((egress_by_port or {}).items()):
+        egress_type = (egress.get("type") or "").strip().lower()
+        if egress_type == "ovpn" and (egress.get("ovpn") or "").strip():
+            egress_out[str(port)] = {"type": "ovpn", "ovpn": egress["ovpn"].strip()}
+        elif egress_type == "upstream" and (egress.get("upstreamProxyId") or "").strip():
+            egress_out[str(port)] = {
+                "type": "upstream",
+                "upstreamProxyId": egress["upstreamProxyId"].strip(),
+            }
+    uri = upstream_refresh_intervals or {}
+    uri_out = {str(p): int(v) for p, v in sorted(uri.items()) if isinstance(v, int) and v > 0}
+    urlr = upstream_refresh_last_run or {}
+    urlr_out = {
+        str(p): float(v)
+        for p, v in sorted(urlr.items())
+        if isinstance(v, (int, float)) and v > 0 and uri.get(p, 0) > 0
+    }
     payload: Dict[str, Any] = {
         "version": ASSIGNMENTS_STATE_VERSION,
         "assignments": {str(p): name for p, name in sorted(assignments.items())},
         "activePorts": ap_list,
     }
+    if egress_out:
+        payload["egress"] = egress_out
     if lid_out:
         payload["launcherIds"] = lid_out
     if pt_out:
@@ -760,6 +801,10 @@ def assignments_state_payload(
         payload["rotationCountries"] = rc_out
     if rl_out:
         payload["rotationLastRun"] = rl_out
+    if uri_out:
+        payload["upstreamRefreshIntervals"] = uri_out
+    if urlr_out:
+        payload["upstreamRefreshLastRun"] = urlr_out
     return payload
 
 
@@ -797,6 +842,51 @@ def _parse_assignments_block(
         if not skip_allowed_check and name not in allowed:
             continue
         out[port] = name
+    return out
+
+
+def _egress_from_assignments(assignments: Dict[int, str]) -> Dict[int, Dict[str, str]]:
+    return {p: {"type": "ovpn", "ovpn": name} for p, name in assignments.items() if name}
+
+
+def _egress_ovpn_assignments(egress_by_port: Dict[int, Dict[str, str]]) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    for port, egress in egress_by_port.items():
+        if (egress.get("type") or "").lower() == "ovpn" and (egress.get("ovpn") or "").strip():
+            out[port] = egress["ovpn"].strip()
+    return out
+
+
+def _parse_egress_block(
+    raw: Any,
+    port_base: int,
+    num_ports: int,
+    allowed_ovpn: Set[str],
+) -> Dict[int, Dict[str, str]]:
+    out: Dict[int, Dict[str, str]] = {}
+    if not isinstance(raw, dict) or num_ports <= 0:
+        return out
+    port_max = port_base + num_ports - 1
+    for k, v in raw.items():
+        try:
+            port = int(str(k))
+        except (TypeError, ValueError):
+            continue
+        if port < port_base or port > port_max or not isinstance(v, dict):
+            continue
+        egress_type = (str(v.get("type") or "")).strip().lower()
+        if egress_type == "ovpn":
+            ovpn = (str(v.get("ovpn") or "")).strip()
+            parsed = _parse_assignments_block({str(port): ovpn}, port_base, num_ports, allowed_ovpn, relaxed=False)
+            if not parsed and ovpn:
+                parsed = _parse_assignments_block({str(port): ovpn}, port_base, num_ports, allowed_ovpn, relaxed=True)
+            if parsed.get(port):
+                out[port] = {"type": "ovpn", "ovpn": parsed[port]}
+        elif egress_type == "upstream":
+            profile_id = (str(v.get("upstreamProxyId") or "")).strip()
+            if not profile_id or len(profile_id) > 128 or any(c in profile_id for c in "\r\n\t\x00"):
+                continue
+            out[port] = {"type": "upstream", "upstreamProxyId": profile_id}
     return out
 
 
@@ -944,8 +1034,19 @@ def _ingest_assignments_raw(
     cfg_path: Path,
     use_docker: bool,
     source_label: str,
-) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str], Dict[int, int], Dict[int, str], Dict[int, float]]:
-    """Parse stored JSON blob into assignments + active ports + launcherIds + proxyTypes + rotation state."""
+) -> Tuple[
+    Dict[int, str],
+    List[int],
+    Dict[int, str],
+    Dict[int, str],
+    Dict[int, int],
+    Dict[int, str],
+    Dict[int, float],
+    Dict[int, Dict[str, str]],
+    Dict[int, int],
+    Dict[int, float],
+]:
+    """Parse stored JSON blob into compatible OVPN picks plus typed egress state."""
     assignments: Dict[int, str] = {}
     active_listener_ports: List[int] = []
     launcher_ids: Dict[int, str] = {}
@@ -953,6 +1054,9 @@ def _ingest_assignments_raw(
     rotation_intervals: Dict[int, int] = {}
     rotation_countries: Dict[int, str] = {}
     rotation_last_run: Dict[int, float] = {}
+    egress_by_port: Dict[int, Dict[str, str]] = {}
+    upstream_refresh_intervals: Dict[int, int] = {}
+    upstream_refresh_last_run: Dict[int, float] = {}
     if num_ports <= 0:
         return (
             assignments,
@@ -962,6 +1066,9 @@ def _ingest_assignments_raw(
             rotation_intervals,
             rotation_countries,
             rotation_last_run,
+            egress_by_port,
+            upstream_refresh_intervals,
+            upstream_refresh_last_run,
         )
     if isinstance(raw, dict) and isinstance(raw.get("assignments"), dict):
         data = raw["assignments"]
@@ -974,6 +1081,9 @@ def _ingest_assignments_raw(
             "rotationIntervals",
             "rotationCountries",
             "rotationLastRun",
+            "egress",
+            "upstreamRefreshIntervals",
+            "upstreamRefreshLastRun",
         )
         data = {k: v for k, v in raw.items() if str(k) not in skip}
     else:
@@ -985,6 +1095,9 @@ def _ingest_assignments_raw(
             rotation_intervals,
             rotation_countries,
             rotation_last_run,
+            egress_by_port,
+            upstream_refresh_intervals,
+            upstream_refresh_last_run,
         )
     nkeys = len(data) if isinstance(data, dict) else 0
     allowed = set(list_allowed_ovpn_files(runtime_config, cfg_path, use_docker))
@@ -1000,6 +1113,11 @@ def _ingest_assignments_raw(
                 f"Relaxed load restored {len(assignments)} assignment(s): saved filenames are not in the current "
                 "OVPN scan (case mismatch, renamed files, or scan path). They will still show in the UI; activation may fail until fixed."
             )
+    egress_by_port = _parse_egress_block(raw.get("egress"), port_base, num_ports, allowed)
+    if egress_by_port:
+        assignments = _egress_ovpn_assignments(egress_by_port)
+    else:
+        egress_by_port = _egress_from_assignments(assignments)
 
     port_max = port_base + num_ports - 1
     raw_active = raw.get("activePorts") if isinstance(raw, dict) else None
@@ -1019,6 +1137,19 @@ def _ingest_assignments_raw(
     # Last-run timestamps without a matching interval are useless; drop them so persistence stays clean.
     rotation_last_run = {p: ts for p, ts in rotation_last_run.items() if rotation_intervals.get(p, 0) > 0}
     rotation_countries = {p: c for p, c in rotation_countries.items() if rotation_intervals.get(p, 0) > 0}
+    upstream_refresh_intervals = _parse_rotation_intervals_block(
+        raw.get("upstreamRefreshIntervals"),
+        port_base,
+        num_ports,
+    )
+    upstream_refresh_last_run = _parse_rotation_last_run_block(
+        raw.get("upstreamRefreshLastRun"),
+        port_base,
+        num_ports,
+    )
+    upstream_refresh_last_run = {
+        p: ts for p, ts in upstream_refresh_last_run.items() if upstream_refresh_intervals.get(p, 0) > 0
+    }
     return (
         assignments,
         sorted(set(active_listener_ports)),
@@ -1027,6 +1158,9 @@ def _ingest_assignments_raw(
         rotation_intervals,
         rotation_countries,
         rotation_last_run,
+        egress_by_port,
+        upstream_refresh_intervals,
+        upstream_refresh_last_run,
     )
 
 
@@ -1039,10 +1173,21 @@ def load_gateway_assignments_state(
     runtime_config: Dict[str, Any],
     cfg_path: Path,
     use_docker: bool,
-) -> Tuple[Dict[int, str], List[int], Dict[int, str], Dict[int, str], Dict[int, int], Dict[int, str], Dict[int, float]]:
+) -> Tuple[
+    Dict[int, str],
+    List[int],
+    Dict[int, str],
+    Dict[int, str],
+    Dict[int, int],
+    Dict[int, str],
+    Dict[int, float],
+    Dict[int, Dict[str, str]],
+    Dict[int, int],
+    Dict[int, float],
+]:
     """Load OVPN picks + activePorts + launcherIds + proxyTypes + rotation state from Redis or JSON file; migrate file→Redis if needed."""
     if num_ports <= 0:
-        return {}, [], {}, {}, {}, {}, {}
+        return {}, [], {}, {}, {}, {}, {}, {}, {}, {}
     raw: Optional[Dict[str, Any]] = None
     source = ""
     loaded_from_redis = False
@@ -1110,6 +1255,9 @@ def save_port_assignments_file(
     rotation_intervals: Optional[Dict[int, int]] = None,
     rotation_countries: Optional[Dict[int, str]] = None,
     rotation_last_run: Optional[Dict[int, float]] = None,
+    egress_by_port: Optional[Dict[int, Dict[str, str]]] = None,
+    upstream_refresh_intervals: Optional[Dict[int, int]] = None,
+    upstream_refresh_last_run: Optional[Dict[int, float]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = assignments_state_payload(
@@ -1120,6 +1268,9 @@ def save_port_assignments_file(
         rotation_intervals,
         rotation_countries,
         rotation_last_run,
+        egress_by_port,
+        upstream_refresh_intervals,
+        upstream_refresh_last_run,
     )
     tmp = path.parent / (path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1177,13 +1328,18 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
         num_ports = int(state.get("num_ports") or len(state.get("locations") or []))
         with state["lock"]:
             snap_assign = dict(state["port_ovpn_assignment"])
+            snap_egress = dict(state.get("port_egress_by_port") or {})
             snap_active = set(state["active_ports"])
             snap_launcher_ids = dict(state.get("launcher_ids_by_port") or {})
             snap_proxy_types = dict(state.get("proxy_types_by_port") or {})
             snap_rot_intervals = dict(state.get("rotation_intervals_by_port") or {})
             snap_rot_countries = dict(state.get("rotation_countries_by_port") or {})
             snap_rot_last_run = dict(state.get("rotation_last_run_by_port") or {})
-        snap_assign = _anti_wipe_merge_assignments(state, snap_assign, port_base, num_ports)
+            snap_refresh_intervals = dict(state.get("upstream_refresh_intervals_by_port") or {})
+            snap_refresh_last_run = dict(state.get("upstream_refresh_last_run_by_port") or {})
+        if not snap_egress:
+            snap_assign = _anti_wipe_merge_assignments(state, snap_assign, port_base, num_ports)
+            snap_egress = _egress_from_assignments(snap_assign)
         payload = assignments_state_payload(
             snap_assign,
             snap_active,
@@ -1192,6 +1348,9 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             snap_rot_intervals,
             snap_rot_countries,
             snap_rot_last_run,
+            snap_egress,
+            snap_refresh_intervals,
+            snap_refresh_last_run,
         )
         if redis_url:
             try:
@@ -1211,6 +1370,9 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
                     snap_rot_intervals,
                     snap_rot_countries,
                     snap_rot_last_run,
+                    snap_egress,
+                    snap_refresh_intervals,
+                    snap_refresh_last_run,
                 )
         elif mirror_file:
             if p.exists() and not p.is_file():
@@ -1225,6 +1387,9 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
                     snap_rot_intervals,
                     snap_rot_countries,
                     snap_rot_last_run,
+                    snap_egress,
+                    snap_refresh_intervals,
+                    snap_refresh_last_run,
                 )
     except Exception as e:
         _log(f"Could not persist assignments: {e}")
@@ -1314,6 +1479,52 @@ def validate_location_assets(
     return None
 
 
+def validate_port_egress(
+    config: Dict[str, Any],
+    config_path: Path,
+    location_index: int,
+    use_docker: bool,
+    egress: Dict[str, str],
+    upstream_profiles_by_id: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    egress_type = (egress.get("type") or "").strip().lower()
+    if egress_type == "ovpn":
+        return validate_location_assets(
+            config,
+            config_path,
+            location_index,
+            use_docker,
+            (egress.get("ovpn") or "").strip(),
+        )
+    if egress_type == "upstream":
+        profile_id = (egress.get("upstreamProxyId") or "").strip()
+        if not profile_id:
+            return "Select an upstream proxy for this port before activation"
+        if profile_id not in upstream_profiles_by_id:
+            return f"Upstream proxy profile not found: {profile_id}"
+        return None
+    return "Select an OVPN profile or upstream proxy for this port before activation"
+
+
+def _public_egress(
+    egress: Optional[Dict[str, str]],
+    upstream_profiles_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not egress:
+        return {"type": "none"}
+    egress_type = (egress.get("type") or "").strip().lower()
+    if egress_type == "ovpn":
+        return {"type": "ovpn", "ovpn": (egress.get("ovpn") or "").strip()}
+    if egress_type == "upstream":
+        profile_id = (egress.get("upstreamProxyId") or "").strip()
+        public = {"type": "upstream", "upstreamProxyId": profile_id}
+        profile = upstream_profiles_by_id.get(profile_id)
+        if profile:
+            public["upstreamProxy"] = public_profile(profile)
+        return public
+    return {"type": "none"}
+
+
 def _request_admin_rerun() -> None:
     if sys.platform != "win32":
         return
@@ -1379,7 +1590,10 @@ def is_backend_running(slot: Dict[str, Any], use_docker: bool) -> bool:
     else:
         op = slot.get("openvpn_process")
         pp = slot.get("proxy_process")
-        return op is not None and op.poll() is None and pp is not None and pp.poll() is None
+        proxy_running = pp is not None and pp.poll() is None
+        if slot.get("egress_type") == "upstream":
+            return proxy_running
+        return op is not None and op.poll() is None and proxy_running
 
 
 def wait_for_backend(host: str, port: int, timeout_seconds: float = BACKEND_READY_TIMEOUT) -> bool:
@@ -1545,6 +1759,8 @@ def handle_connection(
     port_to_slot: Dict[int, Dict[str, Any]],
     active_ports: set,
     port_ovpn_assignment: Dict[int, str],
+    port_egress_by_port: Dict[int, Dict[str, str]],
+    upstream_profiles_by_id: Dict[str, Dict[str, Any]],
     activation_state_by_port: Dict[int, str],
     lock: threading.Lock,
     use_docker: bool = False,
@@ -1577,9 +1793,13 @@ def handle_connection(
             except Exception:
                 pass
             return
+        egress = dict(port_egress_by_port.get(external_port) or {})
         assigned_ovpn = (port_ovpn_assignment.get(external_port) or "").strip()
-        if not assigned_ovpn:
-            _log(f"Rejecting connection on port {external_port}: no assigned ovpn file")
+        upstream_profile = upstream_profiles_by_id.get((egress.get("upstreamProxyId") or "").strip())
+        if not egress or (egress.get("type") == "ovpn" and not assigned_ovpn) or (
+            egress.get("type") == "upstream" and not upstream_profile
+        ):
+            _log(f"Rejecting connection on port {external_port}: no usable egress assignment")
             try:
                 client_sock.close()
             except Exception:
@@ -1694,6 +1914,7 @@ def handle_connection(
                 "last_activity": time.monotonic(),
                 "external_port": None,
                 "proxy_type": None,
+                "egress_type": None,
             }
             slots.append(slot)
             _log(f"New slot allocated internal_port={slot['internal_port']}")
@@ -1708,7 +1929,7 @@ def handle_connection(
     first_port = port_base + location_index
     launch_config = dict(config)
     launch_locations = [dict(loc) for loc in (config.get("locations") or [])]
-    if 0 <= location_index < len(launch_locations):
+    if egress.get("type") == "ovpn" and 0 <= location_index < len(launch_locations):
         launch_locations[location_index]["ovpn"] = assigned_ovpn
     launch_config["locations"] = launch_locations
     if use_docker:
@@ -1719,6 +1940,7 @@ def handle_connection(
                 location_index, first_port, launch_config,
                 docker_image, docker_network, ovpn_volume_name,
                 proxy_listen_scheme=listen_scheme,
+                upstream_profile=upstream_profile if egress.get("type") == "upstream" else None,
             )
             _log(f"Docker worker started: {backend_host} ({listen_scheme.upper()}:{BACKEND_HTTP_PORT})")
         except Exception as e:
@@ -1738,6 +1960,7 @@ def handle_connection(
             slot["container_name"] = backend_host
             slot["last_activity"] = time.monotonic()
             slot["proxy_type"] = listen_scheme
+            slot["egress_type"] = egress.get("type")
         _log(f"Waiting for backend {backend_host}:{BACKEND_HTTP_PORT} (timeout={BACKEND_READY_TIMEOUT}s)")
         if not wait_for_backend(backend_host, BACKEND_HTTP_PORT):
             _log(f"Docker worker for location {location_index} did not become ready in time")
@@ -1771,10 +1994,20 @@ def handle_connection(
             f"internal_port={slot['internal_port']} scheme={listen_scheme}"
         )
         try:
-            openvpn_process, proxy_process, log_path, auth_path = start_one_location(
-                launch_config, location_index, slot["internal_port"], config_path,
-                listen_scheme=listen_scheme,
-            )
+            if egress.get("type") == "upstream" and upstream_profile:
+                openvpn_process = None
+                proxy_process = start_one_upstream_proxy(
+                    launch_config,
+                    slot["internal_port"],
+                    upstream_profile,
+                    listen_scheme=listen_scheme,
+                )
+                log_path = auth_path = ""
+            else:
+                openvpn_process, proxy_process, log_path, auth_path = start_one_location(
+                    launch_config, location_index, slot["internal_port"], config_path,
+                    listen_scheme=listen_scheme,
+                )
             _log(f"Local backend started for location {location_index}")
         except Exception as e:
             _log(f"Failed to start location {location_index}: {e}")
@@ -1797,6 +2030,7 @@ def handle_connection(
             slot["backend_port"] = slot["internal_port"]
             slot["last_activity"] = time.monotonic()
             slot["proxy_type"] = listen_scheme
+            slot["egress_type"] = egress.get("type")
 
         _log(f"Waiting for local backend 127.0.0.1:{slot['internal_port']}")
         if not wait_for_backend("127.0.0.1", slot["internal_port"]):
@@ -1863,6 +2097,8 @@ def _start_backend_for_port_now(
     slots: List[Dict[str, Any]],
     port_to_slot: Dict[int, Dict[str, Any]],
     port_ovpn_assignment: Dict[int, str],
+    port_egress_by_port: Dict[int, Dict[str, str]],
+    upstream_profiles_by_id: Dict[str, Dict[str, Any]],
     lock: threading.Lock,
     use_docker: bool = False,
     docker_image: str = "",
@@ -1876,8 +2112,14 @@ def _start_backend_for_port_now(
         return "Port out of location range"
 
     assigned_ovpn = (port_ovpn_assignment.get(port) or "").strip()
-    if not assigned_ovpn:
+    egress = dict(port_egress_by_port.get(port) or {})
+    upstream_profile = upstream_profiles_by_id.get((egress.get("upstreamProxyId") or "").strip())
+    if not egress:
+        return "Select an OVPN profile or upstream proxy for this port before activation"
+    if egress.get("type") == "ovpn" and not assigned_ovpn:
         return "Select an OVPN file for this port before activation"
+    if egress.get("type") == "upstream" and not upstream_profile:
+        return "Select a valid upstream proxy for this port before activation"
 
     with lock:
         existing = port_to_slot.get(port)
@@ -1921,6 +2163,7 @@ def _start_backend_for_port_now(
                 "last_activity": time.monotonic(),
                 "external_port": None,
                 "proxy_type": None,
+                "egress_type": None,
             }
             slots.append(slot)
         slot["location_index"] = location_index
@@ -1933,7 +2176,8 @@ def _start_backend_for_port_now(
 
     launch_config = dict(config)
     launch_locations = [dict(loc) for loc in (config.get("locations") or [])]
-    launch_locations[location_index]["ovpn"] = assigned_ovpn
+    if egress.get("type") == "ovpn":
+        launch_locations[location_index]["ovpn"] = assigned_ovpn
     launch_config["locations"] = launch_locations
 
     if use_docker:
@@ -1942,6 +2186,7 @@ def _start_backend_for_port_now(
             backend_host, _ = start_docker_backend(
                 location_index, port, launch_config, docker_image, docker_network, ovpn_volume_name,
                 proxy_listen_scheme=ls,
+                upstream_profile=upstream_profile if egress.get("type") == "upstream" else None,
             )
         except Exception as e:
             with lock:
@@ -1955,6 +2200,7 @@ def _start_backend_for_port_now(
             slot["container_name"] = backend_host
             slot["last_activity"] = time.monotonic()
             slot["proxy_type"] = ls
+            slot["egress_type"] = egress.get("type")
         if not wait_for_backend(backend_host, BACKEND_HTTP_PORT):
             teardown_slot(slot, use_docker)
             with lock:
@@ -1965,10 +2211,20 @@ def _start_backend_for_port_now(
         return None
 
     try:
-        openvpn_process, proxy_process, log_path, auth_path = start_one_location(
-            launch_config, location_index, slot["internal_port"], config_path,
-            listen_scheme=ls,
-        )
+        if egress.get("type") == "upstream" and upstream_profile:
+            openvpn_process = None
+            proxy_process = start_one_upstream_proxy(
+                launch_config,
+                slot["internal_port"],
+                upstream_profile,
+                listen_scheme=ls,
+            )
+            log_path = auth_path = ""
+        else:
+            openvpn_process, proxy_process, log_path, auth_path = start_one_location(
+                launch_config, location_index, slot["internal_port"], config_path,
+                listen_scheme=ls,
+            )
     except Exception as e:
         with lock:
             slot["external_port"] = None
@@ -1985,6 +2241,7 @@ def _start_backend_for_port_now(
         slot["backend_port"] = slot["internal_port"]
         slot["last_activity"] = time.monotonic()
         slot["proxy_type"] = ls
+        slot["egress_type"] = egress.get("type")
 
     if not wait_for_backend("127.0.0.1", slot["internal_port"]):
         teardown_slot(slot, use_docker)
@@ -2015,6 +2272,8 @@ def _activate_port_async(
         slots=state["slots"],
         port_to_slot=state["port_to_slot"],
         port_ovpn_assignment=state["port_ovpn_assignment"],
+        port_egress_by_port=state["port_egress_by_port"],
+        upstream_profiles_by_id=state["upstream_profiles_by_id"],
         lock=state["lock"],
         use_docker=bool(state.get("use_docker")),
         docker_image=runtime_config.get("dockerImage") or os.environ.get("DOCKER_IMAGE", "portico-worker"),
@@ -2120,6 +2379,7 @@ def _perform_port_rotation_to(
             slot["external_port"] = None
             slot["location_index"] = None
         state["port_ovpn_assignment"][port] = new_ovpn
+        state.setdefault("port_egress_by_port", {})[port] = {"type": "ovpn", "ovpn": new_ovpn}
     persist_assignments_snapshot(state)
 
     err = validate_location_assets(
@@ -2144,6 +2404,92 @@ def _perform_port_rotation_to(
         daemon=True,
     ).start()
     persist_assignments_snapshot(state)
+    return None
+
+
+def _perform_port_egress_change_to(
+    state: Dict[str, Any],
+    port: int,
+    new_egress: Dict[str, str],
+    runtime_config: Dict[str, Any],
+    config_path: Path,
+) -> Optional[str]:
+    """Set typed egress and restart an active port so the change applies immediately."""
+    port_base = state["port_base"]
+    loc_idx = port - port_base
+    locations = state["locations"]
+    if loc_idx < 0 or loc_idx >= len(locations):
+        return "Port out of location range"
+
+    egress_type = (new_egress.get("type") or "none").strip().lower()
+    normalized: Dict[str, str]
+    if egress_type == "ovpn":
+        normalized = {"type": "ovpn", "ovpn": (new_egress.get("ovpn") or "").strip()}
+    elif egress_type == "upstream":
+        normalized = {
+            "type": "upstream",
+            "upstreamProxyId": (new_egress.get("upstreamProxyId") or "").strip(),
+        }
+    elif egress_type == "none":
+        normalized = {"type": "none"}
+    else:
+        return 'type must be "ovpn", "upstream", or "none"'
+
+    use_docker = bool(state.get("use_docker"))
+    if normalized["type"] != "none":
+        err = validate_port_egress(
+            runtime_config,
+            config_path,
+            loc_idx,
+            use_docker,
+            normalized,
+            state.get("upstream_profiles_by_id") or {},
+        )
+        if err:
+            return err
+
+    lock = state["lock"]
+    with lock:
+        was_active = (
+            port in state["active_ports"]
+            or state["activation_state_by_port"].get(port) in ("starting", "active")
+        )
+        _deactivate_listener_port_unlocked(state, port)
+
+        egress_by_port = state.setdefault("port_egress_by_port", {})
+        if normalized["type"] == "none":
+            egress_by_port.pop(port, None)
+            state["port_ovpn_assignment"].pop(port, None)
+            state.setdefault("rotation_intervals_by_port", {}).pop(port, None)
+            state.setdefault("rotation_countries_by_port", {}).pop(port, None)
+            state.setdefault("rotation_last_run_by_port", {}).pop(port, None)
+            state.setdefault("upstream_refresh_intervals_by_port", {}).pop(port, None)
+            state.setdefault("upstream_refresh_last_run_by_port", {}).pop(port, None)
+        else:
+            egress_by_port[port] = normalized
+            if normalized["type"] == "ovpn":
+                state["port_ovpn_assignment"][port] = normalized["ovpn"]
+                state.setdefault("upstream_refresh_intervals_by_port", {}).pop(port, None)
+                state.setdefault("upstream_refresh_last_run_by_port", {}).pop(port, None)
+            else:
+                state["port_ovpn_assignment"].pop(port, None)
+                state.setdefault("rotation_intervals_by_port", {}).pop(port, None)
+                state.setdefault("rotation_countries_by_port", {}).pop(port, None)
+                state.setdefault("rotation_last_run_by_port", {}).pop(port, None)
+
+        if was_active and normalized["type"] != "none":
+            state["activation_cancelled_ports"].discard(port)
+            state["active_ports"].add(port)
+            state["activation_state_by_port"][port] = "starting"
+            state["activation_error_by_port"].pop(port, None)
+
+    persist_assignments_snapshot(state)
+    if was_active and normalized["type"] != "none":
+        threading.Thread(
+            target=_activate_port_async,
+            args=(port, runtime_config, state),
+            daemon=True,
+        ).start()
     return None
 
 
@@ -2234,6 +2580,70 @@ def rotation_loop(state: Dict[str, Any]) -> None:
             _log(f"Rotation loop error: {e}")
 
 
+def upstream_refresh_loop(state: Dict[str, Any]) -> None:
+    """Restart active upstream-proxy ports on their configured same-profile interval."""
+    global shutdown_flag
+    config_path = state["config_path"]
+    while not shutdown_flag:
+        time.sleep(ROTATION_TICK_SECONDS)
+        if shutdown_flag:
+            break
+        try:
+            now_wall = time.time()
+            due: List[int] = []
+            with state["lock"]:
+                intervals = dict(state.get("upstream_refresh_intervals_by_port") or {})
+                last_runs = dict(state.get("upstream_refresh_last_run_by_port") or {})
+                activation = dict(state.get("activation_state_by_port") or {})
+                egress = dict(state.get("port_egress_by_port") or {})
+            for port, mins in intervals.items():
+                if mins <= 0 or activation.get(port) != "active":
+                    continue
+                if (egress.get(port) or {}).get("type") != "upstream":
+                    continue
+                last = last_runs.get(port, 0.0)
+                if last <= 0:
+                    with state["lock"]:
+                        state.setdefault("upstream_refresh_last_run_by_port", {})[port] = now_wall
+                    continue
+                if (now_wall - last) >= (mins * 60.0):
+                    due.append(port)
+            if not due:
+                continue
+
+            runtime_config, load_err, _ = load_disk_config_expanded(config_path)
+            if load_err or runtime_config is None:
+                _log(f"Upstream refresh tick: could not load config: {load_err}")
+                continue
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config,
+                bool(state.get("use_docker")),
+            )
+            _enforce_default_proxy_auth(runtime_config)
+
+            for port in due:
+                with state["lock"]:
+                    if (state.get("activation_state_by_port") or {}).get(port) != "active":
+                        continue
+                    current = dict((state.get("port_egress_by_port") or {}).get(port) or {})
+                err = _perform_port_egress_change_to(
+                    state,
+                    port,
+                    current,
+                    runtime_config,
+                    config_path,
+                )
+                with state["lock"]:
+                    state.setdefault("upstream_refresh_last_run_by_port", {})[port] = time.time()
+                if err:
+                    _log(f"Upstream refresh port {port}: failed: {err}")
+                else:
+                    _log(f"Upstream refresh port {port}: restarted assigned proxy")
+            persist_assignments_snapshot(state)
+        except Exception as e:
+            _log(f"Upstream refresh loop error: {e}")
+
+
 def _control_api_handler_factory(
     gui_dir: Path,
     state: Dict[str, Any],
@@ -2285,6 +2695,8 @@ def _control_api_handler_factory(
                 self._handle_get_config()
             elif path == "/api/ovpn-files":
                 self._handle_get_ovpn_files()
+            elif path == "/api/upstream-proxies":
+                self._handle_get_upstream_proxies()
             elif path == "/api/provider-auth":
                 self._handle_get_provider_auth()
             elif path == "/api/logs":
@@ -2313,6 +2725,10 @@ def _control_api_handler_factory(
                 rotation_intervals = dict(state.get("rotation_intervals_by_port") or {})
                 rotation_countries = dict(state.get("rotation_countries_by_port") or {})
                 rotation_last_run = dict(state.get("rotation_last_run_by_port") or {})
+                egress_by_port = dict(state.get("port_egress_by_port") or {})
+                upstream_profiles = dict(state.get("upstream_profiles_by_id") or {})
+                upstream_refresh_intervals = dict(state.get("upstream_refresh_intervals_by_port") or {})
+                upstream_refresh_last_run = dict(state.get("upstream_refresh_last_run_by_port") or {})
                 active = []
                 for port, slot in list(port_to_slot.items()):
                     loc_idx = slot.get("location_index")
@@ -2330,6 +2746,7 @@ def _control_api_handler_factory(
                         "locationLabel": label,
                         "lastActivityAgeSeconds": round(age_seconds, 1),
                         "proxyType": ptype,
+                        "egress": _public_egress(egress_by_port.get(port), upstream_profiles),
                     }
                     if state.get("use_docker") and slot.get("container_name"):
                         entry["containerName"] = slot["container_name"]
@@ -2341,6 +2758,10 @@ def _control_api_handler_factory(
                 }
                 activation_state = {str(k): v for k, v in activation_state_by_port.items()}
                 activation_error = {str(k): v for k, v in activation_error_by_port.items()}
+                public_egress_by_port = {
+                    str(p): _public_egress(egress_by_port.get(p), upstream_profiles)
+                    for p in range(port_base, port_base + num_ports)
+                }
             port_max = port_base + num_ports - 1
             listen_h = state.get("listen_host", "127.0.0.1") or "127.0.0.1"
             randomize_country = "random"
@@ -2388,6 +2809,7 @@ def _control_api_handler_factory(
                 "portMax": port_max,
                 "enabledPorts": enabled_ports,
                 "assignedOvpnByPort": assigned_by_port,
+                "egressByPort": public_egress_by_port,
                 "activationStateByPort": activation_state,
                 "activationErrorByPort": activation_error,
                 "locations": [
@@ -2401,6 +2823,7 @@ def _control_api_handler_factory(
                             if proxy_types.get(port_base + i) == "socks5"
                             else "http"
                         ),
+                        "egress": public_egress_by_port.get(str(port_base + i), {"type": "none"}),
                         "rotationIntervalMinutes": int(rotation_intervals.get(port_base + i, 0)),
                         "rotationCountry": rotation_countries.get(port_base + i, ""),
                         "nextRotationAt": (
@@ -2408,6 +2831,14 @@ def _control_api_handler_factory(
                             + float(rotation_intervals.get(port_base + i, 0)) * 60.0
                             if rotation_intervals.get(port_base + i, 0) > 0
                             and rotation_last_run.get(port_base + i, 0.0) > 0
+                            else None
+                        ),
+                        "upstreamRefreshIntervalMinutes": int(upstream_refresh_intervals.get(port_base + i, 0)),
+                        "nextUpstreamRefreshAt": (
+                            float(upstream_refresh_last_run.get(port_base + i, 0.0))
+                            + float(upstream_refresh_intervals.get(port_base + i, 0)) * 60.0
+                            if upstream_refresh_intervals.get(port_base + i, 0) > 0
+                            and upstream_refresh_last_run.get(port_base + i, 0.0) > 0
                             else None
                         ),
                     }
@@ -2450,6 +2881,214 @@ def _control_api_handler_factory(
                 bool(state.get("use_docker")),
             )
             self._send_json(payload)
+
+        def _handle_get_upstream_proxies(self) -> None:
+            with state["lock"]:
+                profiles = list(state.get("upstream_profiles") or [])
+            self._send_json(
+                {
+                    "proxies": [public_profile(profile) for profile in profiles],
+                    "count": len(profiles),
+                }
+            )
+
+        def _read_json_body(self, max_bytes: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                return None, "Invalid Content-Length"
+            if content_length <= 0 or content_length > max_bytes:
+                return None, "Invalid Content-Length"
+            try:
+                body = self.rfile.read(content_length).decode("utf-8")
+                payload = json.loads(body)
+            except Exception as e:
+                return None, str(e)
+            if not isinstance(payload, dict):
+                return None, "Request body must be an object"
+            return payload, None
+
+        def _runtime_config_for_apply(self) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+            runtime_config, load_err, load_status = load_disk_config_expanded(state["config_path"])
+            if load_err or runtime_config is None:
+                return None, load_err or "Could not load config", load_status
+            runtime_config = merge_expanded_locations_from_disk(
+                runtime_config,
+                bool(state.get("use_docker")),
+            )
+            _enforce_default_proxy_auth(runtime_config)
+            apply_openvpn_auth_env(runtime_config)
+            return runtime_config, None, 200
+
+        def _restart_ports_using_upstream_profile(self, profile_id: str) -> List[Dict[str, Any]]:
+            runtime_config, load_err, _ = self._runtime_config_for_apply()
+            if load_err or runtime_config is None:
+                return [{"ok": False, "error": load_err or "Could not load config"}]
+            with state["lock"]:
+                targets = [
+                    (port, dict(egress))
+                    for port, egress in (state.get("port_egress_by_port") or {}).items()
+                    if egress.get("type") == "upstream"
+                    and egress.get("upstreamProxyId") == profile_id
+                    and state.get("activation_state_by_port", {}).get(port) in ("starting", "active")
+                ]
+            results: List[Dict[str, Any]] = []
+            for port, egress in targets:
+                err = _perform_port_egress_change_to(
+                    state,
+                    port,
+                    egress,
+                    runtime_config,
+                    state["config_path"],
+                )
+                results.append({"port": port, "ok": not bool(err), "error": err or ""})
+            return results
+
+        def _handle_post_upstream_proxy(self) -> None:
+            payload, body_err = self._read_json_body(64 * 1024)
+            if body_err or payload is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            raw_id = (str(payload.get("id") or "")).strip()
+            with state["lock"]:
+                current_profiles = list(state.get("upstream_profiles") or [])
+                existing = (state.get("upstream_profiles_by_id") or {}).get(raw_id) if raw_id else None
+            try:
+                profile = normalize_profile(payload, existing=existing)
+            except UpstreamProxyError as e:
+                self._send_error_body(str(e), 400)
+                return
+            if raw_id and existing is None:
+                self._send_error_body(f"Upstream proxy profile not found: {raw_id}", 404)
+                return
+
+            if existing:
+                next_profiles = [profile if row.get("id") == profile["id"] else row for row in current_profiles]
+            else:
+                next_profiles = current_profiles + [profile]
+            try:
+                save_catalog(state["upstream_catalog_path"], next_profiles)
+            except OSError as e:
+                self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
+                return
+            with state["lock"]:
+                state["upstream_profiles"] = next_profiles
+                state["upstream_profiles_by_id"] = _catalog_index(next_profiles)
+            restart_results = self._restart_ports_using_upstream_profile(profile["id"]) if existing else []
+            self._send_json(
+                {
+                    "ok": True,
+                    "proxy": public_profile(profile),
+                    "restartedPorts": [r["port"] for r in restart_results if r.get("ok")],
+                    "restartResults": restart_results,
+                }
+            )
+
+        def _handle_post_import_upstream_proxies(self) -> None:
+            payload, body_err = self._read_json_body(512 * 1024)
+            if body_err or payload is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            lines = str(payload.get("lines") or "")
+            profiles, results = import_proxy_lines(lines)
+            if not profiles and not results:
+                self._send_error_body("Paste at least one proxy line", 400)
+                return
+            with state["lock"]:
+                current_profiles = list(state.get("upstream_profiles") or [])
+            next_profiles = current_profiles + profiles
+            if profiles:
+                try:
+                    save_catalog(state["upstream_catalog_path"], next_profiles)
+                except OSError as e:
+                    self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
+                    return
+                with state["lock"]:
+                    state["upstream_profiles"] = next_profiles
+                    state["upstream_profiles_by_id"] = _catalog_index(next_profiles)
+            self._send_json(
+                {
+                    "ok": all(r.get("ok") for r in results),
+                    "imported": len(profiles),
+                    "results": results,
+                }
+            )
+
+        def _handle_post_delete_upstream_proxy(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            profile_id = (params.get("id", [""])[0] or "").strip()
+            if not profile_id:
+                self._send_error_body("Missing upstream proxy id", 400)
+                return
+            with state["lock"]:
+                profiles = list(state.get("upstream_profiles") or [])
+                existing = (state.get("upstream_profiles_by_id") or {}).get(profile_id)
+                referenced_ports = sorted(
+                    port
+                    for port, egress in (state.get("port_egress_by_port") or {}).items()
+                    if egress.get("type") == "upstream" and egress.get("upstreamProxyId") == profile_id
+                )
+            if not existing:
+                self._send_error_body("Upstream proxy profile not found", 404)
+                return
+            if referenced_ports:
+                self._send_error_body(
+                    "Upstream proxy is still assigned to port(s): " + ", ".join(str(p) for p in referenced_ports),
+                    409,
+                )
+                return
+            next_profiles = [row for row in profiles if row.get("id") != profile_id]
+            try:
+                save_catalog(state["upstream_catalog_path"], next_profiles)
+            except OSError as e:
+                self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
+                return
+            with state["lock"]:
+                state["upstream_profiles"] = next_profiles
+                state["upstream_profiles_by_id"] = _catalog_index(next_profiles)
+            self._send_json({"ok": True, "id": profile_id})
+
+        def _handle_post_set_egress(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            raw_port = params.get("port", [""])[0]
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError):
+                self._send_error_body("Invalid port", 400)
+                return
+            payload, body_err = self._read_json_body(16 * 1024)
+            if body_err or payload is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            egress_type = (str(payload.get("type") or "")).strip().lower()
+            egress: Dict[str, str] = {"type": egress_type}
+            if egress_type == "ovpn":
+                egress["ovpn"] = (str(payload.get("ovpn") or "")).strip()
+            elif egress_type == "upstream":
+                egress["upstreamProxyId"] = (str(payload.get("upstreamProxyId") or "")).strip()
+            elif egress_type != "none":
+                self._send_error_body('type must be "ovpn", "upstream", or "none"', 400)
+                return
+            runtime_config, load_err, load_status = self._runtime_config_for_apply()
+            if load_err or runtime_config is None:
+                self._send_error_body(load_err or "Could not load config", load_status)
+                return
+            err = _perform_port_egress_change_to(
+                state,
+                port,
+                egress,
+                runtime_config,
+                state["config_path"],
+            )
+            if err:
+                self._send_error_body(err, 400)
+                return
+            with state["lock"]:
+                public = _public_egress(
+                    (state.get("port_egress_by_port") or {}).get(port),
+                    state.get("upstream_profiles_by_id") or {},
+                )
+            self._send_json({"ok": True, "port": port, "egress": public})
 
         def _handle_get_provider_auth(self) -> None:
             config_path = state["config_path"]
@@ -2622,6 +3261,14 @@ def _control_api_handler_factory(
                 self._handle_post_provider_auth()
             elif path == "/api/assign-ovpn":
                 self._handle_post_assign_ovpn(parsed.query)
+            elif path == "/api/upstream-proxy":
+                self._handle_post_upstream_proxy()
+            elif path == "/api/import-upstream-proxies":
+                self._handle_post_import_upstream_proxies()
+            elif path == "/api/delete-upstream-proxy":
+                self._handle_post_delete_upstream_proxy(parsed.query)
+            elif path == "/api/set-egress":
+                self._handle_post_set_egress(parsed.query)
             elif path == "/api/activate":
                 self._handle_post_activate(parsed.query)
             elif path == "/api/deactivate":
@@ -2642,6 +3289,8 @@ def _control_api_handler_factory(
                 self._handle_post_set_proxy_type(parsed.query)
             elif path == "/api/set-rotation":
                 self._handle_post_set_rotation(parsed.query)
+            elif path == "/api/set-upstream-refresh":
+                self._handle_post_set_upstream_refresh(parsed.query)
             else:
                 self.send_error(404)
 
@@ -2808,6 +3457,8 @@ def _control_api_handler_factory(
             if not ovpn:
                 with state["lock"]:
                     state["port_ovpn_assignment"].pop(port, None)
+                    if (state.get("port_egress_by_port") or {}).get(port, {}).get("type") == "ovpn":
+                        state.setdefault("port_egress_by_port", {}).pop(port, None)
                     if (state.get("rotation_intervals_by_port") or {}).get(port, 0) > 0:
                         state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
                 persist_assignments_snapshot(state)
@@ -2837,6 +3488,7 @@ def _control_api_handler_factory(
 
             with state["lock"]:
                 state["port_ovpn_assignment"][port] = ovpn
+                state.setdefault("port_egress_by_port", {})[port] = {"type": "ovpn", "ovpn": ovpn}
                 if (state.get("rotation_intervals_by_port") or {}).get(port, 0) > 0:
                     state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
             persist_assignments_snapshot(state)
@@ -2973,6 +3625,10 @@ def _control_api_handler_factory(
                 self._send_error_body("Port out of location range", 400)
                 return
             with state["lock"]:
+                current_egress = dict((state.get("port_egress_by_port") or {}).get(port) or {})
+                if interval_minutes > 0 and current_egress.get("type") == "upstream":
+                    self._send_error_body("OVPN rotation is not available for upstream proxy egress", 400)
+                    return
                 ri = state.setdefault("rotation_intervals_by_port", {})
                 rc = state.setdefault("rotation_countries_by_port", {})
                 rl = state.setdefault("rotation_last_run_by_port", {})
@@ -2997,6 +3653,47 @@ def _control_api_handler_factory(
                     "country": "" if country_norm == "random" else country_norm,
                 }
             )
+
+        def _handle_post_set_upstream_refresh(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            try:
+                port = int(params.get("port", [""])[0])
+            except (TypeError, ValueError):
+                self._send_error_body("Invalid port", 400)
+                return
+            payload, body_err = self._read_json_body(4096)
+            if body_err or payload is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            try:
+                interval_minutes = int(payload.get("intervalMinutes") or 0)
+            except (TypeError, ValueError):
+                self._send_error_body("intervalMinutes must be a non-negative integer", 400)
+                return
+            if interval_minutes < 0:
+                self._send_error_body("intervalMinutes must be a non-negative integer", 400)
+                return
+            interval_minutes = min(interval_minutes, _ROTATION_INTERVAL_MAX_MINUTES)
+            port_base = state["port_base"]
+            num_ports = state.get("num_ports") or len(state["locations"])
+            if port < port_base or port >= port_base + num_ports:
+                self._send_error_body("Port out of location range", 400)
+                return
+            with state["lock"]:
+                egress = dict((state.get("port_egress_by_port") or {}).get(port) or {})
+                if interval_minutes > 0 and egress.get("type") != "upstream":
+                    self._send_error_body("Upstream refresh requires an upstream proxy egress", 400)
+                    return
+                ri = state.setdefault("upstream_refresh_intervals_by_port", {})
+                rl = state.setdefault("upstream_refresh_last_run_by_port", {})
+                if interval_minutes == 0:
+                    ri.pop(port, None)
+                    rl.pop(port, None)
+                else:
+                    ri[port] = interval_minutes
+                    rl[port] = time.time()
+            persist_assignments_snapshot(state)
+            self._send_json({"ok": True, "port": port, "intervalMinutes": interval_minutes})
 
         def _handle_post_activate(self, query: str) -> None:
             params = urllib.parse.parse_qs(query)
@@ -3028,13 +3725,15 @@ def _control_api_handler_factory(
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
             assigned_ovpn = ""
+            egress: Dict[str, str] = {}
             rotation_minutes = 0
             rotation_country = ""
             with state["lock"]:
                 assigned_ovpn = (state["port_ovpn_assignment"].get(port) or "").strip()
+                egress = dict((state.get("port_egress_by_port") or {}).get(port) or {})
                 rotation_minutes = int((state.get("rotation_intervals_by_port") or {}).get(port, 0) or 0)
                 rotation_country = (state.get("rotation_countries_by_port") or {}).get(port, "")
-            if not assigned_ovpn and rotation_minutes > 0:
+            if (not egress or egress.get("type") == "ovpn") and not assigned_ovpn and rotation_minutes > 0:
                 chosen, pick_err = _pick_rotation_ovpn(
                     runtime_config,
                     config_path,
@@ -3050,19 +3749,22 @@ def _control_api_handler_factory(
                     return
                 with state["lock"]:
                     state["port_ovpn_assignment"][port] = chosen
+                    state.setdefault("port_egress_by_port", {})[port] = {"type": "ovpn", "ovpn": chosen}
                     # Activation starts from now; do not trigger immediate rotation.
                     state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
                 persist_assignments_snapshot(state)
                 assigned_ovpn = chosen
-            if not assigned_ovpn:
-                self._send_error_body("Select an OVPN file for this port before activation", 400)
+                egress = {"type": "ovpn", "ovpn": chosen}
+            if not egress:
+                self._send_error_body("Select an OVPN profile or upstream proxy for this port before activation", 400)
                 return
-            err = validate_location_assets(
+            err = validate_port_egress(
                 runtime_config,
                 config_path,
                 loc_idx,
                 bool(state.get("use_docker")),
-                assigned_ovpn,
+                egress,
+                state.get("upstream_profiles_by_id") or {},
             )
             if err:
                 self._send_error_body(err, 400)
@@ -3084,6 +3786,8 @@ def _control_api_handler_factory(
                 # an immediate rotation right after the user reactivates this port.
                 if (state.get("rotation_intervals_by_port") or {}).get(port, 0) > 0:
                     state.setdefault("rotation_last_run_by_port", {})[port] = time.time()
+                if (state.get("upstream_refresh_intervals_by_port") or {}).get(port, 0) > 0:
+                    state.setdefault("upstream_refresh_last_run_by_port", {})[port] = time.time()
 
             threading.Thread(
                 target=_activate_port_async,
@@ -3535,7 +4239,15 @@ def main() -> int:
     port_to_slot: Dict[int, Dict[str, Any]] = {}
     active_ports: set = set()
     port_ovpn_assignment: Dict[int, str] = {}
+    port_egress_by_port: Dict[int, Dict[str, str]] = {}
     assignments_path = resolve_assignments_path(config_path)
+    upstream_catalog_path = resolve_upstream_catalog_path(config_path)
+    try:
+        upstream_profiles = load_catalog(upstream_catalog_path)
+    except UpstreamProxyError as e:
+        _log(f"Upstream proxy catalog load failed: {e}")
+        upstream_profiles = []
+    upstream_profiles_by_id = _catalog_index(upstream_profiles)
     redis_url = _redis_url_from_env_or_config(config)
     redis_key = _redis_state_key()
     if redis_url:
@@ -3548,6 +4260,9 @@ def main() -> int:
         _loaded_rot_intervals,
         _loaded_rot_countries,
         _loaded_rot_last_run,
+        _loaded_egress,
+        _loaded_upstream_refresh_intervals,
+        _loaded_upstream_refresh_last_run,
     ) = load_gateway_assignments_state(
         assignments_path,
         redis_url,
@@ -3559,17 +4274,22 @@ def main() -> int:
         use_docker,
     )
     port_ovpn_assignment.update(_loaded_assign)
+    port_egress_by_port.update(_loaded_egress)
     launcher_ids_by_port: Dict[int, str] = dict(_loaded_launcher_ids)
     proxy_types_by_port: Dict[int, str] = dict(_loaded_proxy_types)
     rotation_intervals_by_port: Dict[int, int] = dict(_loaded_rot_intervals)
     rotation_countries_by_port: Dict[int, str] = dict(_loaded_rot_countries)
     rotation_last_run_by_port: Dict[int, float] = dict(_loaded_rot_last_run)
+    upstream_refresh_intervals_by_port: Dict[int, int] = dict(_loaded_upstream_refresh_intervals)
+    upstream_refresh_last_run_by_port: Dict[int, float] = dict(_loaded_upstream_refresh_last_run)
     _log(
         f"Assignments ({assignments_path}): loaded {len(_loaded_assign)} OVPN pick(s), "
         f"{len(_loaded_active_ports)} persisted active port(s), "
         f"{len(launcher_ids_by_port)} launcher ID(s), "
         f"{len(proxy_types_by_port)} SOCKS5 port override(s), "
-        f"{len(rotation_intervals_by_port)} rotation rule(s)"
+        f"{len(rotation_intervals_by_port)} rotation rule(s), "
+        f"{len(upstream_profiles_by_id)} upstream proxy profile(s), "
+        f"{len(upstream_refresh_intervals_by_port)} upstream refresh rule(s)"
     )
 
     activation_state_by_port: Dict[int, str] = {}
@@ -3586,11 +4306,17 @@ def main() -> int:
         "port_to_slot": port_to_slot,
         "active_ports": active_ports,
         "port_ovpn_assignment": port_ovpn_assignment,
+        "port_egress_by_port": port_egress_by_port,
         "launcher_ids_by_port": launcher_ids_by_port,
         "proxy_types_by_port": proxy_types_by_port,
         "rotation_intervals_by_port": rotation_intervals_by_port,
         "rotation_countries_by_port": rotation_countries_by_port,
         "rotation_last_run_by_port": rotation_last_run_by_port,
+        "upstream_refresh_intervals_by_port": upstream_refresh_intervals_by_port,
+        "upstream_refresh_last_run_by_port": upstream_refresh_last_run_by_port,
+        "upstream_catalog_path": upstream_catalog_path,
+        "upstream_profiles": upstream_profiles,
+        "upstream_profiles_by_id": upstream_profiles_by_id,
         "activation_state_by_port": activation_state_by_port,
         "activation_error_by_port": activation_error_by_port,
         "activation_cancelled_ports": activation_cancelled_ports,
@@ -3627,6 +4353,13 @@ def main() -> int:
     )
     rotation_thread.start()
 
+    upstream_refresh_thread = threading.Thread(
+        target=upstream_refresh_loop,
+        args=(gateway_state,),
+        daemon=True,
+    )
+    upstream_refresh_thread.start()
+
     if auto_activate_on_startup and _loaded_active_ports:
         _enforce_default_proxy_auth(config)
         _log(
@@ -3636,16 +4369,17 @@ def main() -> int:
             loc_idx = port - port_base
             if loc_idx < 0 or loc_idx >= len(locations):
                 continue
-            assigned = (port_ovpn_assignment.get(port) or "").strip()
-            if not assigned:
-                _log(f"Auto-activate skip port {port}: no OVPN assigned")
+            egress = dict(port_egress_by_port.get(port) or {})
+            if not egress:
+                _log(f"Auto-activate skip port {port}: no egress assigned")
                 continue
-            err = validate_location_assets(
+            err = validate_port_egress(
                 config,
                 config_path,
                 loc_idx,
                 use_docker,
-                assigned,
+                egress,
+                gateway_state["upstream_profiles_by_id"],
             )
             if err:
                 _log(f"Auto-activate skip port {port}: {err}")
@@ -3712,6 +4446,8 @@ def main() -> int:
                 port_to_slot,
                 active_ports,
                 port_ovpn_assignment,
+                port_egress_by_port,
+                gateway_state["upstream_profiles_by_id"],
                 activation_state_by_port,
                 lock,
                 use_docker,

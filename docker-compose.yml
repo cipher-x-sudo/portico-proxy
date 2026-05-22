@@ -65,6 +65,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./backend/openvpn-proxy-config.json:/config/openvpn-proxy-config.json
       - ./backend/openvpn-proxy-assignments.json:/config/openvpn-proxy-assignments.json
+      - ./backend/upstream-proxy-catalog.json:/config/upstream-proxy-catalog.json
       # Same bind/volume as workers so gateway can list and validate real .ovpn files (fixes UI showing config-only names missing on disk).
       - ovpn_data:/ovpn
     ports:

@@ -4,6 +4,50 @@
   gap: 1.5rem;
 }
 
+.upstream-proxy-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(18rem, 0.8fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.upstream-proxy-form,
+.upstream-proxy-import {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.upstream-proxy-import textarea {
+  resize: vertical;
+  min-height: 10rem;
+}
+
+.upstream-import-results {
+  max-height: 9rem;
+  overflow: auto;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.upstream-import-results p {
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+}
+
+.upstream-import-results p:last-child {
+  margin-bottom: 0;
+}
+
+@media (max-width: 900px) {
+  .upstream-proxy-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 .title {
   font-size: 1.5rem;
   font-weight: 700;

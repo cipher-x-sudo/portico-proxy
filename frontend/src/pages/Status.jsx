@@ -54,7 +54,11 @@ export default function Status() {
   const locations = data.locations || [];
   const filteredLocations = locations.filter((loc, i) => {
     const pub = publishedPortForIndex(data, i);
-    const text = [i, loc.label, loc.ovpn, data.portBase + i, pub].join(' ').toLowerCase();
+    const egress = loc.egress || {};
+    const upstream = egress.upstreamProxy || {};
+    const text = [i, loc.label, loc.ovpn, egress.type, upstream.label, upstream.host, data.portBase + i, pub]
+      .join(' ')
+      .toLowerCase();
     return text.includes(search.toLowerCase());
   });
 
@@ -215,7 +219,7 @@ export default function Status() {
               <tr>
                 <th>Index</th>
                 <th>Label</th>
-                <th>OVPN Filename</th>
+                <th>Egress</th>
                 <th>{publishedRange ? 'Host proxy port' : 'Proxy port'}</th>
               </tr>
             </thead>
@@ -227,7 +231,13 @@ export default function Status() {
                 <tr key={i}>
                   <td className="text-muted text-mono">{i}</td>
                   <td className="font-medium">{loc.label}</td>
-                  <td className="text-xs text-muted text-mono">{loc.ovpn}</td>
+                  <td className="text-xs text-muted text-mono">
+                    {loc.egress?.type === 'upstream'
+                      ? `upstream:${loc.egress.upstreamProxy?.label || loc.egress.upstreamProxyId || 'missing'}`
+                      : loc.egress?.type === 'ovpn'
+                        ? loc.egress.ovpn
+                        : 'none'}
+                  </td>
                   <td className="text-primary text-mono font-bold">
                     {hostP}
                     {hostP !== containerP && (

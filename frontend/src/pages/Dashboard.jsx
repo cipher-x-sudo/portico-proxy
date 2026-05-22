@@ -10,6 +10,7 @@ export default function Dashboard() {
   const [ovpnFiles, setOvpnFiles] = useState([]);
   const [ovpnFilesHint, setOvpnFilesHint] = useState('');
   const [ovpnCountries, setOvpnCountries] = useState([]);
+  const [upstreamProxies, setUpstreamProxies] = useState([]);
   const [selectedByPort, setSelectedByPort] = useState({});
   const [busyPort, setBusyPort] = useState(null);
   const [batchBusy, setBatchBusy] = useState(false);
@@ -23,20 +24,27 @@ export default function Dashboard() {
   const [showCreateEntry, setShowCreateEntry] = useState(false);
   const [newEntryId, setNewEntryId] = useState('');
   const [newEntryOvpn, setNewEntryOvpn] = useState('');
+  const [newEntryEgressType, setNewEntryEgressType] = useState('ovpn');
+  const [newEntryUpstreamProxyId, setNewEntryUpstreamProxyId] = useState('');
   const [newEntryProxyType, setNewEntryProxyType] = useState('http');
   const [newEntryRotationMinutes, setNewEntryRotationMinutes] = useState('0');
   const [newEntryRotationCountry, setNewEntryRotationCountry] = useState('');
+  const [newEntryUpstreamRefreshMinutes, setNewEntryUpstreamRefreshMinutes] = useState('0');
   const [creatingEntry, setCreatingEntry] = useState(false);
 
   const [showEditEntry, setShowEditEntry] = useState(false);
   const [editTargetPort, setEditTargetPort] = useState(null);
   const [editEntryId, setEditEntryId] = useState('');
   const [editEntryOvpn, setEditEntryOvpn] = useState('');
+  const [editEntryEgressType, setEditEntryEgressType] = useState('ovpn');
+  const [editEntryUpstreamProxyId, setEditEntryUpstreamProxyId] = useState('');
   const [editEntryProxyType, setEditEntryProxyType] = useState('http');
   const [editProxyTypeInitial, setEditProxyTypeInitial] = useState('http');
   const [editEntryRotationMinutes, setEditEntryRotationMinutes] = useState('0');
   const [editEntryRotationCountry, setEditEntryRotationCountry] = useState('');
   const [editRotationInitial, setEditRotationInitial] = useState({ minutes: 0, country: '' });
+  const [editEntryUpstreamRefreshMinutes, setEditEntryUpstreamRefreshMinutes] = useState('0');
+  const [editUpstreamRefreshInitial, setEditUpstreamRefreshInitial] = useState(0);
   const [isEditingEntry, setIsEditingEntry] = useState(false);
 
   useEffect(() => {
@@ -61,8 +69,15 @@ export default function Dashboard() {
         })
         .catch(err => console.error("Error fetching ovpn files:", err));
     };
+    const loadUpstreamProxies = () => {
+      fetch('/api/upstream-proxies')
+        .then(res => res.json())
+        .then(data => setUpstreamProxies(Array.isArray(data.proxies) ? data.proxies : []))
+        .catch(err => console.error("Error fetching upstream proxies:", err));
+    };
     loadStatus();
     loadFiles();
+    loadUpstreamProxies();
     // Keep selected OVPN display in sync with auto-rotation quickly.
     const id = setInterval(loadStatus, 1000);
     return () => clearInterval(id);
@@ -82,18 +97,24 @@ export default function Dashboard() {
 
   const sortedOvpnFiles = useMemo(() => sortOvpnFiles(ovpnFiles), [ovpnFiles]);
 
-  const assignOvpn = async (port, ovpn) => {
+  const saveEgress = async (port, type, { ovpn = '', upstreamProxyId = '' } = {}) => {
     setBusyPort(port);
     setError('');
+    const payload =
+      type === 'upstream'
+        ? { type: 'upstream', upstreamProxyId }
+        : type === 'ovpn' && ovpn
+          ? { type: 'ovpn', ovpn }
+          : { type: 'none' };
     try {
-      const res = await fetch(`/api/assign-ovpn?port=${encodeURIComponent(port)}`, {
+      const res = await fetch(`/api/set-egress?port=${encodeURIComponent(port)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ovpn: ovpn || '' }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!data.ok) {
-        setError(data.error || 'Failed to assign ovpn file');
+        setError(data.error || 'Failed to save egress');
         return false;
       }
       const refreshed = await fetch('/api/status').then((r) => r.json());
@@ -101,7 +122,7 @@ export default function Dashboard() {
       setSelectedByPort(refreshed.assignedOvpnByPort || {});
       return true;
     } catch (err) {
-      setError('Failed to assign ovpn file: ' + err.message);
+      setError('Failed to save egress: ' + err.message);
       return false;
     } finally {
       setBusyPort(null);
@@ -180,6 +201,27 @@ export default function Dashboard() {
     }
   };
 
+  const saveUpstreamRefresh = async (port, minutes) => {
+    const intervalMinutes = Math.max(0, Math.floor(Number(minutes) || 0));
+    setError('');
+    try {
+      const res = await fetch(`/api/set-upstream-refresh?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ intervalMinutes }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to save upstream refresh');
+        return false;
+      }
+      return true;
+    } catch (err) {
+      setError('Failed to save upstream refresh: ' + err.message);
+      return false;
+    }
+  };
+
   const extendPort = async (port) => {
     setBusyPort(port);
     setError('');
@@ -200,35 +242,26 @@ export default function Dashboard() {
     }
   };
 
-  /** Reload worker / VPN for this port while keeping the same OVPN assignment. */
-  const restartPort = async (port, { randomAccess, hasOvpn }) => {
-    if (!hasOvpn) {
-      setError('Assign an OVPN profile before restart.');
+  /** Reload the backend while keeping the same egress assignment. */
+  const restartPort = async (port, { hasEgress }) => {
+    if (!hasEgress) {
+      setError('Assign egress before restart.');
       return;
     }
     setBusyPort(port);
     setError('');
     try {
-      if (randomAccess) {
-        const res = await fetch(`/api/refresh-port?port=${encodeURIComponent(port)}`, { method: 'POST' });
-        const data = await res.json();
-        if (!data.ok) {
-          setError(data.error || 'Restart failed');
-          return;
-        }
-      } else {
-        const stopRes = await fetch(`/api/deactivate?port=${encodeURIComponent(port)}`, { method: 'POST' });
-        const stopData = await stopRes.json();
-        if (!stopData.ok) {
-          setError(stopData.error || 'Failed to stop for restart');
-          return;
-        }
-        const startRes = await fetch(`/api/activate?port=${encodeURIComponent(port)}`, { method: 'POST' });
-        const startData = await startRes.json();
-        if (!startData.ok) {
-          setError(startData.error || 'Failed to start after restart');
-          return;
-        }
+      const stopRes = await fetch(`/api/deactivate?port=${encodeURIComponent(port)}`, { method: 'POST' });
+      const stopData = await stopRes.json();
+      if (!stopData.ok) {
+        setError(stopData.error || 'Failed to stop for restart');
+        return;
+      }
+      const startRes = await fetch(`/api/activate?port=${encodeURIComponent(port)}`, { method: 'POST' });
+      const startData = await startRes.json();
+      if (!startData.ok) {
+        setError(startData.error || 'Failed to start after restart');
+        return;
       }
       const refreshed = await fetch('/api/status').then((r) => r.json());
       setStatus(refreshed);
@@ -241,7 +274,7 @@ export default function Dashboard() {
   };
 
   const onSelectRowFile = async (port, ovpn) => {
-    await assignOvpn(port, ovpn);
+    await saveEgress(port, 'ovpn', { ovpn });
   };
 
   const handleCreateEntry = async (e) => {
@@ -259,6 +292,7 @@ export default function Dashboard() {
       const totalP = Math.max((status.locations || []).length, totalPortsFromApi);
       const enabledPortsSet = new Set(status.enabledPorts || []);
       const mySelectedByPort = status.assignedOvpnByPort || {};
+      const myEgressByPort = status.egressByPort || {};
 
       let unusedIdxs = [];
       for (let idx = 0; idx < totalP; idx++) {
@@ -266,9 +300,11 @@ export default function Dashboard() {
         const port = internalPortForIndex(status, idx);
         const portKey = String(port);
         const hasLauncherId = typeof loc.launcherId === 'string' && loc.launcherId.trim() !== '';
-        const hasOvpn = !!mySelectedByPort[portKey];
+        const hasEgress =
+          (myEgressByPort[portKey]?.type && myEgressByPort[portKey].type !== 'none') ||
+          !!mySelectedByPort[portKey];
         const isEnabled = enabledPortsSet.has(port);
-        if (!hasLauncherId && !hasOvpn && !isEnabled) {
+        if (!hasLauncherId && !hasEgress && !isEnabled) {
           unusedIdxs.push({ idx, port });
         }
       }
@@ -300,27 +336,39 @@ export default function Dashboard() {
           throw new Error(`Failed to set proxy type for ${currentId}`);
         }
 
-        if (newEntryOvpn) {
-          const assignSuccess = await assignOvpn(targetPort, newEntryOvpn);
-          if (!assignSuccess) {
-            throw new Error(`Assigned ID ${currentId} but failed to assign OVPN file.`);
-          }
+        const hasRequestedEgress =
+          (newEntryEgressType === 'ovpn' && newEntryOvpn) ||
+          (newEntryEgressType === 'upstream' && newEntryUpstreamProxyId);
+        if (hasRequestedEgress) {
+          const egressOk = await saveEgress(targetPort, newEntryEgressType, {
+            ovpn: newEntryOvpn,
+            upstreamProxyId: newEntryUpstreamProxyId,
+          });
+          if (!egressOk) throw new Error(`Assigned ID ${currentId} but failed to save egress.`);
         }
 
         const rotMins = Math.max(0, Math.floor(Number(newEntryRotationMinutes) || 0));
-        if (rotMins > 0) {
+        if (newEntryEgressType === 'ovpn' && rotMins > 0) {
           const rotOk = await saveRotation(targetPort, rotMins, newEntryRotationCountry);
           if (!rotOk) {
             throw new Error(`Failed to save rotation settings for ${currentId}`);
           }
         }
+        const refreshMins = Math.max(0, Math.floor(Number(newEntryUpstreamRefreshMinutes) || 0));
+        if (newEntryEgressType === 'upstream' && refreshMins > 0) {
+          const refreshOk = await saveUpstreamRefresh(targetPort, refreshMins);
+          if (!refreshOk) throw new Error(`Failed to save upstream refresh for ${currentId}`);
+        }
       }
 
       setNewEntryId('');
       setNewEntryOvpn('');
+      setNewEntryEgressType('ovpn');
+      setNewEntryUpstreamProxyId('');
       setNewEntryProxyType('http');
       setNewEntryRotationMinutes('0');
       setNewEntryRotationCountry('');
+      setNewEntryUpstreamRefreshMinutes('0');
       setShowCreateEntry(false);
       
       // Update ui immediately
@@ -334,10 +382,13 @@ export default function Dashboard() {
     }
   };
 
-  const openEditModal = (port, currentId, currentOvpn, currentProxyType, currentRotation) => {
+  const openEditModal = (port, currentId, currentEgress, currentProxyType, currentRotation, currentRefresh) => {
     setEditTargetPort(port);
     setEditEntryId(currentId || '');
-    setEditEntryOvpn(currentOvpn || '');
+    const egressType = currentEgress?.type === 'upstream' ? 'upstream' : 'ovpn';
+    setEditEntryEgressType(egressType);
+    setEditEntryOvpn(currentEgress?.type === 'ovpn' ? currentEgress.ovpn || '' : '');
+    setEditEntryUpstreamProxyId(currentEgress?.type === 'upstream' ? currentEgress.upstreamProxyId || '' : '');
     const pt = currentProxyType === 'socks5' ? 'socks5' : 'http';
     setEditEntryProxyType(pt);
     setEditProxyTypeInitial(pt);
@@ -346,6 +397,9 @@ export default function Dashboard() {
     setEditEntryRotationMinutes(String(rotMins));
     setEditEntryRotationCountry(rotCountry);
     setEditRotationInitial({ minutes: rotMins, country: rotCountry });
+    const refreshMins = Math.max(0, Math.floor(Number(currentRefresh) || 0));
+    setEditEntryUpstreamRefreshMinutes(String(refreshMins));
+    setEditUpstreamRefreshInitial(refreshMins);
     setShowEditEntry(true);
   };
 
@@ -367,7 +421,13 @@ export default function Dashboard() {
         throw new Error(errorData.error || 'Failed to update Launcher ID');
       }
 
-      await assignOvpn(editTargetPort, editEntryOvpn);
+      const egressOk = await saveEgress(editTargetPort, editEntryEgressType, {
+        ovpn: editEntryOvpn,
+        upstreamProxyId: editEntryUpstreamProxyId,
+      });
+      if (!egressOk) {
+        throw new Error('Failed to update egress');
+      }
 
       const proxyOk = await saveProxyType(editTargetPort, editEntryProxyType, editProxyTypeInitial);
       if (!proxyOk) {
@@ -379,11 +439,22 @@ export default function Dashboard() {
       const rotChanged =
         nextRotMins !== editRotationInitial.minutes ||
         nextRotCountry !== editRotationInitial.country;
-      if (rotChanged) {
+      if (editEntryEgressType === 'ovpn' && rotChanged) {
         const rotOk = await saveRotation(editTargetPort, nextRotMins, nextRotCountry);
         if (!rotOk) {
           throw new Error('Failed to update rotation settings');
         }
+      }
+      if (editEntryEgressType !== 'ovpn' && editRotationInitial.minutes > 0) {
+        await saveRotation(editTargetPort, 0, '');
+      }
+      const nextRefreshMins = Math.max(0, Math.floor(Number(editEntryUpstreamRefreshMinutes) || 0));
+      if (editEntryEgressType === 'upstream' && nextRefreshMins !== editUpstreamRefreshInitial) {
+        const refreshOk = await saveUpstreamRefresh(editTargetPort, nextRefreshMins);
+        if (!refreshOk) throw new Error('Failed to update upstream refresh');
+      }
+      if (editEntryEgressType !== 'upstream' && editUpstreamRefreshInitial > 0) {
+        await saveUpstreamRefresh(editTargetPort, 0);
       }
 
       setShowEditEntry(false);
@@ -406,10 +477,10 @@ export default function Dashboard() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ launcherId: '' }),
     });
-    await fetch(`/api/assign-ovpn?port=${encodeURIComponent(port)}`, {
+    await fetch(`/api/set-egress?port=${encodeURIComponent(port)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ovpn: '' }),
+      body: JSON.stringify({ type: 'none' }),
     });
     await fetch(`/api/set-proxy-type?port=${encodeURIComponent(port)}`, {
       method: 'POST',
@@ -420,6 +491,11 @@ export default function Dashboard() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ intervalMinutes: 0, country: '' }),
+    });
+    await fetch(`/api/set-upstream-refresh?port=${encodeURIComponent(port)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ intervalMinutes: 0 }),
     });
   };
 
@@ -505,6 +581,26 @@ export default function Dashboard() {
   const locations = status.locations || [];
   const activationStateByPort = status.activationStateByPort || {};
   const activationErrorByPort = status.activationErrorByPort || {};
+  const egressByPort = status.egressByPort || {};
+  const upstreamProxyById = Object.fromEntries(upstreamProxies.map((proxy) => [proxy.id, proxy]));
+
+  const egressForPort = (portKey) => {
+    const typed = egressByPort[portKey];
+    if (typed?.type && typed.type !== 'none') return typed;
+    const selectedOvpn = selectedByPort[portKey] || '';
+    return selectedOvpn ? { type: 'ovpn', ovpn: selectedOvpn } : { type: 'none' };
+  };
+
+  const egressDisplay = (egress) => {
+    if (egress?.type === 'upstream') {
+      const profile = egress.upstreamProxy || upstreamProxyById[egress.upstreamProxyId];
+      return profile?.label || profile?.host || egress.upstreamProxyId || 'Upstream proxy';
+    }
+    if (egress?.type === 'ovpn') {
+      return formatOvpnDisplayLabel(egress.ovpn || '') || egress.ovpn || 'OVPN';
+    }
+    return '';
+  };
 
   const proxyHost = status.clientProxyHost || '127.0.0.1';
   const proxyUser = status.proxyUsername ?? '';
@@ -525,8 +621,8 @@ export default function Dashboard() {
       proxyUser || proxyPass
         ? `${ptype}://${encUrl(proxyUser)}:${encUrl(proxyPass)}@${proxyHost}:${hostPort}`
         : `${ptype}://${proxyHost}:${hostPort}`;
-    const selected = selectedByPort[portKey] || '';
-    const fileLabel = selected ? formatOvpnDisplayLabel(selected) : '';
+    const egress = egressForPort(portKey);
+    const fileLabel = egressDisplay(egress);
     runningProxyRows.push({
       internalPort,
       hostPort,
@@ -534,7 +630,7 @@ export default function Dashboard() {
       atFormat,
       schemeUrl,
       proxyType: ptype,
-      label: fileLabel || loc.label || `Location #${idx}`,
+      label: fileLabel || loc.label || `Port #${idx}`,
     });
   });
 
@@ -552,9 +648,9 @@ export default function Dashboard() {
     const port = internalPortForIndex(status, idx);
     const portKey = String(port);
     const hasLauncherId = typeof loc.launcherId === 'string' && loc.launcherId.trim() !== '';
-    const hasOvpn = !!selectedByPort[portKey];
+    const hasEgress = egressForPort(portKey).type !== 'none';
     const isEnabled = enabledPorts.has(port);
-    return hasLauncherId || hasOvpn || isEnabled;
+    return hasLauncherId || hasEgress || isEnabled;
   });
 
   const configuredInternalPorts = configuredPortRows
@@ -596,14 +692,12 @@ export default function Dashboard() {
       }
 
       if (sortKey === 'ovpn') {
-        const oa = selectedByPort[keyA] || '';
-        const ob = selectedByPort[keyB] || '';
+        const oa = egressDisplay(egressForPort(keyA));
+        const ob = egressDisplay(egressForPort(keyB));
         const rankA = oa ? 0 : 1;
         const rankB = ob ? 0 : 1;
         if (rankA !== rankB) return (rankA - rankB) * mul;
-        const labelA = formatOvpnDisplayLabel(oa);
-        const labelB = formatOvpnDisplayLabel(ob);
-        const cmp = labelA.localeCompare(labelB, undefined, { sensitivity: 'base', numeric: true });
+        const cmp = oa.localeCompare(ob, undefined, { sensitivity: 'base', numeric: true });
         if (cmp !== 0) return cmp * mul;
         return (portA - portB) * mul;
       }
@@ -877,6 +971,37 @@ export default function Dashboard() {
                   />
                 </label>
                 <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Egress type</span>
+                  <select
+                    className="dashboard-modal-input"
+                    value={newEntryEgressType}
+                    onChange={(e) => setNewEntryEgressType(e.target.value === 'upstream' ? 'upstream' : 'ovpn')}
+                    disabled={creatingEntry}
+                  >
+                    <option value="ovpn">OpenVPN</option>
+                    <option value="upstream">Upstream Proxy</option>
+                  </select>
+                </label>
+                {newEntryEgressType === 'upstream' && (
+                  <label className="dashboard-modal-field">
+                    <span className="dashboard-modal-label">Saved upstream proxy</span>
+                    <select
+                      className="dashboard-modal-input"
+                      value={newEntryUpstreamProxyId}
+                      onChange={(e) => setNewEntryUpstreamProxyId(e.target.value)}
+                      disabled={creatingEntry}
+                    >
+                      <option value="">Select upstream proxy...</option>
+                      {upstreamProxies.map((proxy) => (
+                        <option key={proxy.id} value={proxy.id}>
+                          {proxy.label} ({proxy.scheme}://{proxy.host}:{proxy.port})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {newEntryEgressType === 'ovpn' && (
+                <label className="dashboard-modal-field">
                   <span className="dashboard-modal-label">
                     Location Configuration{' '}
                     {Number(newEntryRotationMinutes) > 0 ? '(picked at each rotation)' : '(Optional)'}
@@ -893,6 +1018,7 @@ export default function Dashboard() {
                     }
                   />
                 </label>
+                )}
                 <label className="dashboard-modal-field">
                   <span className="dashboard-modal-label">Proxy type</span>
                   <select
@@ -906,6 +1032,7 @@ export default function Dashboard() {
                     <option value="socks5">SOCKS5</option>
                   </select>
                 </label>
+                {newEntryEgressType === 'ovpn' ? (
                 <fieldset className="dashboard-rotation-fieldset" disabled={creatingEntry}>
                   <legend className="dashboard-modal-label">Rotation</legend>
                   <div className="dashboard-rotation-grid">
@@ -946,6 +1073,22 @@ export default function Dashboard() {
                       : 'Set a positive interval to enable automatic OVPN rotation while the port is active.'}
                   </p>
                 </fieldset>
+                ) : (
+                  <fieldset className="dashboard-rotation-fieldset" disabled={creatingEntry}>
+                    <legend className="dashboard-modal-label">Upstream Refresh</legend>
+                    <label className="dashboard-modal-field">
+                      <span className="dashboard-modal-label">Interval (minutes, 0 = off)</span>
+                      <input
+                        type="number"
+                        className="dashboard-modal-input"
+                        min="0"
+                        step="1"
+                        value={newEntryUpstreamRefreshMinutes}
+                        onChange={(e) => setNewEntryUpstreamRefreshMinutes(e.target.value)}
+                      />
+                    </label>
+                  </fieldset>
+                )}
                 <div className="dashboard-modal-actions">
                   <button
                     type="submit"
@@ -992,6 +1135,37 @@ export default function Dashboard() {
                   />
                 </label>
                 <label className="dashboard-modal-field">
+                  <span className="dashboard-modal-label">Egress type</span>
+                  <select
+                    className="dashboard-modal-input"
+                    value={editEntryEgressType}
+                    onChange={(e) => setEditEntryEgressType(e.target.value === 'upstream' ? 'upstream' : 'ovpn')}
+                    disabled={isEditingEntry}
+                  >
+                    <option value="ovpn">OpenVPN</option>
+                    <option value="upstream">Upstream Proxy</option>
+                  </select>
+                </label>
+                {editEntryEgressType === 'upstream' && (
+                  <label className="dashboard-modal-field">
+                    <span className="dashboard-modal-label">Saved upstream proxy</span>
+                    <select
+                      className="dashboard-modal-input"
+                      value={editEntryUpstreamProxyId}
+                      onChange={(e) => setEditEntryUpstreamProxyId(e.target.value)}
+                      disabled={isEditingEntry}
+                    >
+                      <option value="">Select upstream proxy...</option>
+                      {upstreamProxies.map((proxy) => (
+                        <option key={proxy.id} value={proxy.id}>
+                          {proxy.label} ({proxy.scheme}://{proxy.host}:{proxy.port})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {editEntryEgressType === 'ovpn' && (
+                <label className="dashboard-modal-field">
                   <span className="dashboard-modal-label">
                     Location Configuration
                     {Number(editEntryRotationMinutes) > 0 ? ' (picked at each rotation)' : ''}
@@ -1008,6 +1182,7 @@ export default function Dashboard() {
                     }
                   />
                 </label>
+                )}
                 <label className="dashboard-modal-field">
                   <span className="dashboard-modal-label">Proxy type</span>
                   <select
@@ -1021,6 +1196,7 @@ export default function Dashboard() {
                     <option value="socks5">SOCKS5</option>
                   </select>
                 </label>
+                {editEntryEgressType === 'ovpn' ? (
                 <fieldset className="dashboard-rotation-fieldset" disabled={isEditingEntry}>
                   <legend className="dashboard-modal-label">Rotation</legend>
                   <div className="dashboard-rotation-grid">
@@ -1061,6 +1237,22 @@ export default function Dashboard() {
                       : 'Set a positive interval to enable automatic OVPN rotation while the port is active.'}
                   </p>
                 </fieldset>
+                ) : (
+                  <fieldset className="dashboard-rotation-fieldset" disabled={isEditingEntry}>
+                    <legend className="dashboard-modal-label">Upstream Refresh</legend>
+                    <label className="dashboard-modal-field">
+                      <span className="dashboard-modal-label">Interval (minutes, 0 = off)</span>
+                      <input
+                        type="number"
+                        className="dashboard-modal-input"
+                        min="0"
+                        step="1"
+                        value={editEntryUpstreamRefreshMinutes}
+                        onChange={(e) => setEditEntryUpstreamRefreshMinutes(e.target.value)}
+                      />
+                    </label>
+                  </fieldset>
+                )}
                 <div className="dashboard-modal-actions">
                   <button
                     type="submit"
@@ -1149,7 +1341,7 @@ export default function Dashboard() {
                       )
                     }
                   >
-                    <span>Selected OVPN File</span>
+                    <span>Egress</span>
                     {launcherTableSort.key === 'ovpn' && (
                       <span className="material-symbols-outlined dashboard-sort-header-icon" aria-hidden>
                         {launcherTableSort.dir === 'asc' ? 'arrow_upward' : 'arrow_downward'}
@@ -1178,20 +1370,24 @@ export default function Dashboard() {
                   const displayPort = publishedPortForIndex(status, idx);
                   const portKey = String(port);
                   const selected = selectedByPort[portKey] || '';
+                  const egress = egressForPort(portKey);
+                  const hasEgress = egress.type !== 'none';
+                  const egressLabel = egressDisplay(egress);
                   const launcherIdServer = typeof loc.launcherId === 'string' ? loc.launcherId : '';
                   const proxyTypeServer = loc.proxyType === 'socks5' ? 'socks5' : 'http';
                   const rotationMinutes = Math.max(0, Math.floor(Number(loc.rotationIntervalMinutes) || 0));
                   const rotationCountry = (loc.rotationCountry || '').toUpperCase();
                   const isRotating = rotationMinutes > 0;
                   const rotationInfo = { minutes: rotationMinutes, country: rotationCountry };
+                  const refreshMinutes = Math.max(0, Math.floor(Number(loc.upstreamRefreshIntervalMinutes) || 0));
                   const activationState = activationStateByPort[portKey] || (enabledPorts.has(port) ? 'active' : 'inactive');
                   const isStarting = activationState === 'starting';
                   const isActive = activationState === 'active';
                   const isFailed = activationState === 'failed';
-                  const canStart = !isStarting && (!!selected || isRotating);
+                  const canStart = !isStarting && (hasEgress || isRotating);
                   const rowChecked = selectedTablePorts.includes(port);
                   return (
-                    <tr key={port} className={selected ? 'dashboard-row-ovpn-selected' : undefined}>
+                    <tr key={port} className={hasEgress ? 'dashboard-row-ovpn-selected' : undefined}>
                       <td className="text-center align-middle">
                         <input
                           type="checkbox"
@@ -1254,13 +1450,25 @@ export default function Dashboard() {
                       </td>
                       <td>
                         <div className="dashboard-ovpn-cell">
-                          <OvpnFileSelect
-                            files={sortedOvpnFiles}
-                            value={selected}
-                            onChange={(file) => onSelectRowFile(port, file)}
-                            disabled={true}
+                          <span className="dashboard-egress-kind">
+                            {egress.type === 'upstream'
+                              ? 'Upstream Proxy'
+                              : egress.type === 'ovpn'
+                                ? 'OpenVPN'
+                                : 'No egress'}
+                          </span>
+                          {egress.type === 'upstream' && (
+                            <span className="text-mono text-sm">{egressLabel || 'Missing upstream profile'}</span>
+                          )}
+                          {egress.type !== 'upstream' && (
+                            <OvpnFileSelect
+                              files={sortedOvpnFiles}
+                              value={selected}
+                              onChange={(file) => onSelectRowFile(port, file)}
+                              disabled={true}
                             placeholder={isRotating ? 'Rotating…' : 'Select profile…'}
-                          />
+                            />
+                          )}
                           {isRotating && (
                             <span
                               className="dashboard-rotation-badge"
@@ -1275,6 +1483,17 @@ export default function Dashboard() {
                                 Rotating · {rotationMinutes}m
                                 {rotationCountry ? ` · ${rotationCountry}` : ''}
                               </span>
+                            </span>
+                          )}
+                          {egress.type === 'upstream' && refreshMinutes > 0 && (
+                            <span
+                              className="dashboard-rotation-badge"
+                              title={`Refreshes the same upstream proxy every ${refreshMinutes}m`}
+                            >
+                              <span className="material-symbols-outlined" aria-hidden>
+                                restart_alt
+                              </span>
+                              <span>Refresh {refreshMinutes}m</span>
                             </span>
                           )}
                         </div>
@@ -1304,7 +1523,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer, rotationInfo)}
+                                onClick={() => openEditModal(port, launcherIdServer, egress, proxyTypeServer, rotationInfo, refreshMinutes)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
@@ -1336,12 +1555,9 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Restart proxy (reload VPN / worker)"
                                 aria-label="Restart proxy"
-                                disabled={busyPort === port || isStarting || !selected}
+                                disabled={busyPort === port || isStarting || !hasEgress}
                                 onClick={() =>
-                                  restartPort(port, {
-                                    randomAccess: !!loc.randomAccess,
-                                    hasOvpn: !!selected,
-                                  })
+                                  restartPort(port, { hasEgress })
                                 }
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
@@ -1362,7 +1578,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, selected, proxyTypeServer, rotationInfo)}
+                                onClick={() => openEditModal(port, launcherIdServer, egress, proxyTypeServer, rotationInfo, refreshMinutes)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
@@ -1393,4 +1609,3 @@ export default function Dashboard() {
     </div>
   );
 }
-

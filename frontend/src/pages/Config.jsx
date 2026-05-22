@@ -1,5 +1,4 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { publishedPortForIndex } from '../utils/portDisplay';
 import './Config.css';
 
 function normalizeRandomizeCountrySelect(v) {
@@ -16,21 +15,22 @@ export default function Config() {
   const [providerAuthRows, setProviderAuthRows] = useState([]);
   const [providerAuthBusy, setProviderAuthBusy] = useState(false);
   const [providerAuthError, setProviderAuthError] = useState('');
-  const [enabledPorts, setEnabledPorts] = useState(new Set());
-  const [busyPort, setBusyPort] = useState(null);
   const [ovpnCountries, setOvpnCountries] = useState([]);
-  const [ovpnScanMeta, setOvpnScanMeta] = useState({ count: 0, unclassified: 0 });
-  /** Fields from /api/status for host port display and Docker publish alignment hints */
-  const [statusPorts, setStatusPorts] = useState({
-    portBase: null,
-    publishedPortBase: null,
-    dockerPublishedHostPortFirst: null,
-    dockerPublishedHostPortLast: null,
-    dockerPublishedPortSpan: null,
-    gatewayListenerCount: null,
-    publishMismatch: false,
-    publishMismatchHint: '',
+  const [upstreamProxies, setUpstreamProxies] = useState([]);
+  const [upstreamBusy, setUpstreamBusy] = useState(false);
+  const [upstreamError, setUpstreamError] = useState('');
+  const [upstreamImportLines, setUpstreamImportLines] = useState('');
+  const [upstreamImportResults, setUpstreamImportResults] = useState([]);
+  const [upstreamForm, setUpstreamForm] = useState({
+    id: '',
+    label: '',
+    scheme: 'http',
+    host: '',
+    port: '',
+    username: '',
+    password: '',
   });
+  const [ovpnScanMeta, setOvpnScanMeta] = useState({ count: 0, unclassified: 0 });
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -42,8 +42,11 @@ export default function Config() {
       fetch('/api/provider-auth')
         .then((res) => res.json())
         .catch(() => ({ providers: [] })),
+      fetch('/api/upstream-proxies')
+        .then((res) => res.json())
+        .catch(() => ({ proxies: [] })),
     ])
-      .then(([data, ovpnPayload, providerAuthPayload]) => {
+      .then(([data, ovpnPayload, providerAuthPayload, upstreamPayload]) => {
         if (!data.locations) data.locations = [];
         if (data.randomizeCountry == null || data.randomizeCountry === '') {
           data.randomizeCountry = 'random';
@@ -60,53 +63,15 @@ export default function Config() {
         setProviderAuthRows(
           Array.isArray(providerAuthPayload.providers) ? providerAuthPayload.providers : [],
         );
+        setUpstreamProxies(Array.isArray(upstreamPayload.proxies) ? upstreamPayload.proxies : []);
         setProviderAuthError('');
         setIsDirty(false);
       })
       .catch((err) => console.error('Error fetching config:', err));
   }, []);
 
-  useEffect(() => {
-    const loadStatus = () => {
-      fetch('/api/status')
-        .then(res => res.json())
-        .then(data => {
-          const ports = Array.isArray(data.enabledPorts) ? data.enabledPorts : [];
-          setEnabledPorts(new Set(ports));
-          setStatusPorts({
-            portBase: typeof data.portBase === 'number' ? data.portBase : null,
-            publishedPortBase: typeof data.publishedPortBase === 'number' ? data.publishedPortBase : null,
-            dockerPublishedHostPortFirst:
-              typeof data.dockerPublishedHostPortFirst === 'number' ? data.dockerPublishedHostPortFirst : null,
-            dockerPublishedHostPortLast:
-              typeof data.dockerPublishedHostPortLast === 'number' ? data.dockerPublishedHostPortLast : null,
-            dockerPublishedPortSpan:
-              typeof data.dockerPublishedPortSpan === 'number' ? data.dockerPublishedPortSpan : null,
-            gatewayListenerCount: typeof data.totalPorts === 'number' ? data.totalPorts : null,
-            publishMismatch: !!data.publishMismatch,
-            publishMismatchHint: typeof data.publishMismatchHint === 'string' ? data.publishMismatchHint : '',
-          });
-        })
-        .catch(() => {
-          // Status endpoint may be unavailable briefly during startup.
-        });
-    };
-    loadStatus();
-    const id = setInterval(loadStatus, 5000);
-    return () => clearInterval(id);
-  }, []);
-
   const handleChange = (field, value) => {
     setConfig(prev => ({ ...prev, [field]: value }));
-    setIsDirty(true);
-  };
-
-  const handleLocationChange = (index, field, value) => {
-    setConfig(prev => {
-      const newLocs = [...prev.locations];
-      newLocs[index] = { ...newLocs[index], [field]: value };
-      return { ...prev, locations: newLocs };
-    });
     setIsDirty(true);
   };
 
@@ -150,21 +115,105 @@ export default function Config() {
     }
   };
 
-  const addLocation = () => {
-    setConfig(prev => ({
-      ...prev,
-      locations: [...(prev.locations || []), { label: '', ovpn: '', username: '', password: '', randomAccess: false }]
-    }));
-    setIsDirty(true);
+  const resetUpstreamForm = () => {
+    setUpstreamForm({
+      id: '',
+      label: '',
+      scheme: 'http',
+      host: '',
+      port: '',
+      username: '',
+      password: '',
+    });
   };
 
-  const removeLocation = (index) => {
-    setConfig(prev => {
-      const newLocs = [...prev.locations];
-      newLocs.splice(index, 1);
-      return { ...prev, locations: newLocs };
+  const refreshUpstreamProxies = async () => {
+    const data = await fetch('/api/upstream-proxies').then((res) => res.json());
+    setUpstreamProxies(Array.isArray(data.proxies) ? data.proxies : []);
+  };
+
+  const saveUpstreamProxy = async (e) => {
+    e.preventDefault();
+    setUpstreamBusy(true);
+    setUpstreamError('');
+    try {
+      const payload = {
+        label: upstreamForm.label,
+        scheme: upstreamForm.scheme,
+        host: upstreamForm.host,
+        port: Number(upstreamForm.port),
+        username: upstreamForm.username,
+      };
+      if (upstreamForm.id) payload.id = upstreamForm.id;
+      if (upstreamForm.password) payload.password = upstreamForm.password;
+      const res = await fetch('/api/upstream-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Failed to save upstream proxy');
+      await refreshUpstreamProxies();
+      resetUpstreamForm();
+    } catch (err) {
+      setUpstreamError(err.message || 'Failed to save upstream proxy');
+    } finally {
+      setUpstreamBusy(false);
+    }
+  };
+
+  const editUpstreamProxy = (proxy) => {
+    setUpstreamError('');
+    setUpstreamForm({
+      id: proxy.id || '',
+      label: proxy.label || '',
+      scheme: proxy.scheme === 'socks5' ? 'socks5' : 'http',
+      host: proxy.host || '',
+      port: proxy.port == null ? '' : String(proxy.port),
+      username: proxy.username || '',
+      password: '',
     });
-    setIsDirty(true);
+  };
+
+  const deleteUpstreamProxy = async (proxy) => {
+    if (!window.confirm(`Delete upstream proxy ${proxy.label || proxy.host}?`)) return;
+    setUpstreamBusy(true);
+    setUpstreamError('');
+    try {
+      const res = await fetch(`/api/delete-upstream-proxy?id=${encodeURIComponent(proxy.id)}`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Failed to delete upstream proxy');
+      await refreshUpstreamProxies();
+      if (upstreamForm.id === proxy.id) resetUpstreamForm();
+    } catch (err) {
+      setUpstreamError(err.message || 'Failed to delete upstream proxy');
+    } finally {
+      setUpstreamBusy(false);
+    }
+  };
+
+  const importUpstreamProxies = async () => {
+    setUpstreamBusy(true);
+    setUpstreamError('');
+    setUpstreamImportResults([]);
+    try {
+      const res = await fetch('/api/import-upstream-proxies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines: upstreamImportLines }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to import upstream proxies');
+      setUpstreamImportResults(Array.isArray(data.results) ? data.results : []);
+      await refreshUpstreamProxies();
+      if ((data.imported || 0) > 0) setUpstreamImportLines('');
+    } catch (err) {
+      setUpstreamError(err.message || 'Failed to import upstream proxies');
+    } finally {
+      setUpstreamBusy(false);
+    }
   };
 
   const saveConfig = async () => {
@@ -193,34 +242,6 @@ export default function Config() {
     }
   };
 
-  const setPortActivation = async (port, enable) => {
-    setBusyPort(port);
-    try {
-      const endpoint = enable ? '/api/activate' : '/api/deactivate';
-      const res = await fetch(`${endpoint}?port=${encodeURIComponent(port)}`, {
-        method: 'POST'
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        alert((enable ? 'Activation failed: ' : 'Deactivation failed: ') + (data.error || 'Unknown error'));
-        return;
-      }
-      setEnabledPorts(prev => {
-        const next = new Set(prev);
-        if (enable) {
-          next.add(port);
-        } else {
-          next.delete(port);
-        }
-        return next;
-      });
-    } catch (err) {
-      alert('Port activation request failed: ' + err.message);
-    } finally {
-      setBusyPort(null);
-    }
-  };
-
   const exportConfig = () => {
     const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -241,7 +262,7 @@ export default function Config() {
         if (!imported.locations) imported.locations = [];
         setConfig(imported);
         setIsDirty(true);
-      } catch (err) {
+      } catch {
         alert("Invalid JSON file");
       }
     };
@@ -257,20 +278,6 @@ export default function Config() {
       </div>
     );
   }
-
-  const portDisplayStatus = {
-    portBase: statusPorts.portBase ?? config.portBase ?? 0,
-    publishedPortBase: statusPorts.publishedPortBase,
-  };
-  const showHostPortCol =
-    statusPorts.publishedPortBase != null && typeof statusPorts.publishedPortBase === 'number';
-  const hostRangeSummary =
-    statusPorts.dockerPublishedHostPortFirst != null && statusPorts.dockerPublishedHostPortLast != null
-      ? `Docker publishes host TCP ${statusPorts.dockerPublishedHostPortFirst}–${statusPorts.dockerPublishedHostPortLast}` +
-        (statusPorts.dockerPublishedPortSpan != null
-          ? ` (${statusPorts.dockerPublishedPortSpan} slots). Align location count and portBase with compose/.env.`
-          : '.')
-      : null;
 
   return (
     <div className="config-page">
@@ -653,6 +660,180 @@ export default function Config() {
                   <tr>
                     <td colSpan={4} className="text-center p-6 text-muted">
                       No provider folders detected under current OVPN root.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card config-card col-span-2">
+          <div className="card-header">
+            <span className="material-symbols-outlined text-primary">hub</span>
+            <h3 className="card-title">Upstream Proxies</h3>
+          </div>
+          {upstreamError && (
+            <div className="config-publish-mismatch-banner" role="alert">
+              <strong>Upstream proxy action failed.</strong> {upstreamError}
+            </div>
+          )}
+          <div className="upstream-proxy-layout">
+            <form className="upstream-proxy-form" onSubmit={saveUpstreamProxy}>
+              <div className="grid-2-col gap-4">
+                <div className="form-group">
+                  <label>Label</label>
+                  <input
+                    type="text"
+                    className="premium-input"
+                    value={upstreamForm.label}
+                    onChange={(e) => setUpstreamForm((prev) => ({ ...prev, label: e.target.value }))}
+                    placeholder="US residential 1"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Protocol</label>
+                  <select
+                    className="premium-input"
+                    value={upstreamForm.scheme}
+                    onChange={(e) =>
+                      setUpstreamForm((prev) => ({
+                        ...prev,
+                        scheme: e.target.value === 'socks5' ? 'socks5' : 'http',
+                      }))
+                    }
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid-2-col gap-4">
+                <div className="form-group">
+                  <label>Host</label>
+                  <input
+                    type="text"
+                    className="premium-input"
+                    value={upstreamForm.host}
+                    onChange={(e) => setUpstreamForm((prev) => ({ ...prev, host: e.target.value }))}
+                    placeholder="proxy.example.com"
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Port</label>
+                  <input
+                    type="number"
+                    className="premium-input"
+                    min="1"
+                    max="65535"
+                    value={upstreamForm.port}
+                    onChange={(e) => setUpstreamForm((prev) => ({ ...prev, port: e.target.value }))}
+                    required
+                  />
+                </div>
+              </div>
+              <div className="grid-2-col gap-4">
+                <div className="form-group">
+                  <label>Username</label>
+                  <input
+                    type="text"
+                    className="premium-input"
+                    value={upstreamForm.username}
+                    onChange={(e) => setUpstreamForm((prev) => ({ ...prev, username: e.target.value }))}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Password</label>
+                  <input
+                    type="password"
+                    className="premium-input"
+                    value={upstreamForm.password}
+                    onChange={(e) => setUpstreamForm((prev) => ({ ...prev, password: e.target.value }))}
+                    placeholder={upstreamForm.id ? 'Leave blank to keep saved password' : ''}
+                  />
+                </div>
+              </div>
+              <div className="flex gap-3">
+                <button className="btn-primary" type="submit" disabled={upstreamBusy}>
+                  <span className="material-symbols-outlined">save</span>
+                  {upstreamForm.id ? 'Update Proxy' : 'Add Proxy'}
+                </button>
+                {upstreamForm.id && (
+                  <button className="btn-outline" type="button" onClick={resetUpstreamForm}>
+                    Cancel Edit
+                  </button>
+                )}
+              </div>
+            </form>
+
+            <div className="upstream-proxy-import">
+              <label className="form-group">
+                <span>Bulk Paste</span>
+                <textarea
+                  className="premium-input"
+                  rows={7}
+                  value={upstreamImportLines}
+                  onChange={(e) => setUpstreamImportLines(e.target.value)}
+                  placeholder={'host:port\nhost:port:user:pass\nhttp://user:pass@host:port'}
+                />
+              </label>
+              <button
+                className="btn-outline"
+                type="button"
+                onClick={importUpstreamProxies}
+                disabled={upstreamBusy || !upstreamImportLines.trim()}
+              >
+                <span className="material-symbols-outlined">playlist_add</span>
+                Import Lines
+              </button>
+              {upstreamImportResults.length > 0 && (
+                <div className="upstream-import-results">
+                  {upstreamImportResults.map((row) => (
+                    <p key={`${row.line}-${row.ok ? 'ok' : 'err'}`} className={row.ok ? 'text-success' : 'text-muted'}>
+                      Line {row.line}: {row.ok ? row.proxy?.label || 'Imported' : row.error}
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="table-container mt-4">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Label</th>
+                  <th>Upstream</th>
+                  <th>Username</th>
+                  <th>Password</th>
+                  <th className="text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {upstreamProxies.map((proxy) => (
+                  <tr key={proxy.id}>
+                    <td className="font-medium">{proxy.label}</td>
+                    <td className="text-mono">
+                      {proxy.scheme}://{proxy.host}:{proxy.port}
+                    </td>
+                    <td className="text-mono">{proxy.username || '—'}</td>
+                    <td>{proxy.hasPassword ? 'Saved' : '—'}</td>
+                    <td className="text-right">
+                      <div className="flex gap-2 justify-end">
+                        <button className="btn-secondary" type="button" onClick={() => editUpstreamProxy(proxy)}>
+                          Edit
+                        </button>
+                        <button className="btn-danger" type="button" onClick={() => deleteUpstreamProxy(proxy)}>
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+                {upstreamProxies.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="text-center p-6 text-muted">
+                      No upstream proxies saved yet.
                     </td>
                   </tr>
                 )}

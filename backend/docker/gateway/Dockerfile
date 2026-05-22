@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir docker redis PySocks
 
 WORKDIR /app
 # Context is backend/ when built via docker-compose
-COPY gateway.py openvpn_proxy_runner.py backend_docker.py ovpn_filter.py provider_auth.py ./
+COPY gateway.py openvpn_proxy_runner.py backend_docker.py ovpn_filter.py provider_auth.py upstream_proxy.py ./
 
 ENV CONFIG_PATH=/config/openvpn-proxy-config.json
 ENV USE_DOCKER=1

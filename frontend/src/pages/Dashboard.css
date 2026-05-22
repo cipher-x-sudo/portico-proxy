@@ -520,6 +520,14 @@
   min-width: 0;
 }
 
+.dashboard-egress-kind {
+  align-self: flex-start;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
 .dashboard-rotation-badge {
   display: inline-flex;
   align-items: center;

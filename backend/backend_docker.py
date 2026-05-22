@@ -9,6 +9,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from provider_auth import load_provider_auth
+from upstream_proxy import profile_remote_uri
 
 WORKER_PROXY_PORT = 8080
 # Compose does not manage dynamically started workers; label them for teardown (compose down scripts / gateway exit).
@@ -64,6 +65,7 @@ def start_docker_backend(
     docker_network: str,
     ovpn_volume_name: str,
     proxy_listen_scheme: str = "http",
+    upstream_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, int]:
     """
     Start a worker container for the given location. Returns (backend_host, backend_port).
@@ -83,9 +85,11 @@ def start_docker_backend(
     ovpn_file = loc.get("ovpn", "")
     auth_user = ""
     auth_pass = ""
-    provider_auth = load_provider_auth(ovpn_file, Path("/ovpn"))
-    auth_user = provider_auth.username
-    auth_pass = provider_auth.password
+    egress_type = "upstream" if upstream_profile else "ovpn"
+    if egress_type == "ovpn":
+        provider_auth = load_provider_auth(ovpn_file, Path("/ovpn"))
+        auth_user = provider_auth.username
+        auth_pass = provider_auth.password
 
     proxy_user = (config.get("proxyUsername") or "").strip()
     proxy_pass = (config.get("proxyPassword") or "")
@@ -113,6 +117,7 @@ def start_docker_backend(
     if scheme not in ("http", "socks5"):
         scheme = "http"
     env = [
+        f"EGRESS_TYPE={egress_type}",
         f"OVPN_FILE={ovpn_file}",
         f"AUTH_USER={auth_user}",
         f"AUTH_PASS={auth_pass}",
@@ -120,7 +125,12 @@ def start_docker_backend(
         f"PROXY_PASS={proxy_pass}",
         f"PROXY_LISTEN_SCHEME={scheme}",
     ]
-    _log(f"Creating container name={container_name} image={docker_image} network={resolved_network} volume={ovpn_volume_name}:/ovpn:ro ovpn_file={ovpn_file}")
+    if upstream_profile:
+        env.append(f"UPSTREAM_URI={profile_remote_uri(upstream_profile)}")
+    _log(
+        f"Creating container name={container_name} image={docker_image} network={resolved_network} "
+        f"volume={ovpn_volume_name}:/ovpn:ro egress={egress_type} ovpn_file={ovpn_file if egress_type == 'ovpn' else ''}"
+    )
     try:
         # OpenVPN needs /dev/net/tun; pass host TUN device and volume via run() kwargs
         container = client.containers.run(

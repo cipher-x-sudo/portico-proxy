@@ -1,10 +1,13 @@
 {
-  "version": 1,
+  "version": 2,
   "assignments": {},
+  "egress": {},
   "activePorts": [],
   "launcherIds": {},
   "proxyTypes": {},
   "rotationIntervals": {},
   "rotationCountries": {},
-  "rotationLastRun": {}
+  "rotationLastRun": {},
+  "upstreamRefreshIntervals": {},
+  "upstreamRefreshLastRun": {}
 }

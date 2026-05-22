@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 from provider_auth import load_provider_auth
+from upstream_proxy import profile_remote_uri
 
 MARKER = "Initialization Sequence Completed"
 DEFAULT_PROXY_USERNAME = "huzaifa"
@@ -198,3 +199,28 @@ def start_one_location(
             proxy_process = subprocess.Popen([sys.executable] + pproxy_args)
 
     return (openvpn_process, proxy_process, log_file, auth_file or "")
+
+
+def start_one_upstream_proxy(
+    config: dict,
+    internal_port: int,
+    upstream_profile: dict,
+    listen_scheme: str = "http",
+) -> subprocess.Popen:
+    """Start one local pproxy listener relayed through a stored upstream proxy."""
+    python_path = config.get("pythonPath") or "python"
+    proxy_user = (config.get("proxyUsername") or "").strip()
+    proxy_pass = config.get("proxyPassword") or ""
+    if not proxy_user or not proxy_pass:
+        proxy_user = DEFAULT_PROXY_USERNAME
+        proxy_pass = DEFAULT_PROXY_PASSWORD
+
+    scheme = (listen_scheme or "http").strip().lower()
+    if scheme not in ("http", "socks5"):
+        scheme = "http"
+    listen_uri = f"{scheme}://127.0.0.1:{internal_port}#{proxy_user}:{proxy_pass}"
+    args = ["-m", "pproxy", "-l", listen_uri, "-r", profile_remote_uri(upstream_profile)]
+    try:
+        return subprocess.Popen([python_path] + args)
+    except FileNotFoundError:
+        return subprocess.Popen([sys.executable] + args)
