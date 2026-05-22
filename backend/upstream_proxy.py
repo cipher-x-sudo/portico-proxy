@@ -144,7 +144,14 @@ def load_catalog(path: Path) -> List[Dict[str, Any]]:
 
 def save_catalog(path: Path, profiles: Iterable[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not path.is_file():
+        raise UpstreamProxyError(
+            f"upstream proxy catalog path is a directory, not a file: {path}. "
+            "Create the host JSON file before starting Docker, then recreate the gateway container."
+        )
     tmp = path.parent / (path.name + ".tmp")
+    if tmp.exists() and not tmp.is_file():
+        raise UpstreamProxyError(f"upstream proxy catalog temp path is a directory, not a file: {tmp}")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(catalog_payload(profiles), f, indent=2)
         f.write("\n")

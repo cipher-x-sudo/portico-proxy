@@ -2968,7 +2968,7 @@ def _control_api_handler_factory(
                 next_profiles = current_profiles + [profile]
             try:
                 save_catalog(state["upstream_catalog_path"], next_profiles)
-            except OSError as e:
+            except (OSError, UpstreamProxyError) as e:
                 self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
                 return
             with state["lock"]:
@@ -3000,7 +3000,7 @@ def _control_api_handler_factory(
             if profiles:
                 try:
                     save_catalog(state["upstream_catalog_path"], next_profiles)
-                except OSError as e:
+                except (OSError, UpstreamProxyError) as e:
                     self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
                     return
                 with state["lock"]:
@@ -3040,7 +3040,7 @@ def _control_api_handler_factory(
             next_profiles = [row for row in profiles if row.get("id") != profile_id]
             try:
                 save_catalog(state["upstream_catalog_path"], next_profiles)
-            except OSError as e:
+            except (OSError, UpstreamProxyError) as e:
                 self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
                 return
             with state["lock"]:
