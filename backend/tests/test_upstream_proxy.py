@@ -1,8 +1,10 @@
 import sys
+import errno
 import threading
 import time
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -17,6 +19,7 @@ from upstream_proxy import (  # noqa: E402
     normalize_profile,
     parse_proxy_line,
     public_profile,
+    save_catalog,
 )
 
 
@@ -68,6 +71,28 @@ class UpstreamProxyCatalogTests(unittest.TestCase):
         updated = normalize_profile({"id": "proxy-1", "label": "Renamed"}, existing=original)
         self.assertEqual(updated["password"], "secret")
         self.assertEqual(updated["label"], "Renamed")
+
+    def test_save_catalog_falls_back_when_bind_mount_rejects_replace(self):
+        profile = normalize_profile(
+            {"id": "proxy-1", "scheme": "http", "host": "proxy.example.com", "port": 9000},
+            allow_new_id=False,
+        )
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "upstream-proxy-catalog.json"
+            path.write_text('{"version":1,"proxies":[]}\n', encoding="utf-8")
+            original_replace = Path.replace
+
+            def busy_replace(self, target):
+                if self == path.parent / (path.name + ".tmp") and target == path:
+                    raise OSError(errno.EBUSY, "Device or resource busy")
+                return original_replace(self, target)
+
+            with patch.object(Path, "replace", busy_replace):
+                save_catalog(path, [profile])
+
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('"id": "proxy-1"', text)
+            self.assertFalse((path.parent / (path.name + ".tmp")).exists())
 
 
 class TypedEgressStateTests(unittest.TestCase):

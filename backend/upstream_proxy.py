@@ -8,6 +8,7 @@ can reference stable profile IDs without copying secrets into status payloads.
 from __future__ import annotations
 
 import json
+import errno
 import re
 import secrets
 import urllib.parse
@@ -152,10 +153,23 @@ def save_catalog(path: Path, profiles: Iterable[Dict[str, Any]]) -> None:
     tmp = path.parent / (path.name + ".tmp")
     if tmp.exists() and not tmp.is_file():
         raise UpstreamProxyError(f"upstream proxy catalog temp path is a directory, not a file: {tmp}")
+    text = json.dumps(catalog_payload(profiles), indent=2) + "\n"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(catalog_payload(profiles), f, indent=2)
-        f.write("\n")
-    tmp.replace(path)
+        f.write(text)
+    try:
+        tmp.replace(path)
+    except OSError as e:
+        # Docker bind-mounted single files can reject atomic replacement with EBUSY
+        # because the target path is a mount point. Fall back to updating the file
+        # contents in place while preserving the same mounted inode.
+        if e.errno not in (errno.EBUSY, errno.EXDEV):
+            raise
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _decoded_url_value(value: Optional[str]) -> str:
