@@ -63,13 +63,13 @@
 .ovpn-file-select-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 1040;
+  z-index: 11490;
   background: transparent;
 }
 
 .ovpn-file-select-panel {
   position: fixed;
-  z-index: 1050;
+  z-index: 11500;
   display: flex;
   flex-direction: column;
   max-height: min(22rem, 55vh);
