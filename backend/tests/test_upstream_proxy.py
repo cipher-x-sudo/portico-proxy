@@ -129,6 +129,167 @@ class TypedEgressStateTests(unittest.TestCase):
         self.assertEqual(payload["upstreamRefreshIntervals"]["50001"], 15)
 
 
+class OvpnUploadTests(unittest.TestCase):
+    def test_upload_rejects_unsafe_provider_and_filename(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaisesRegex(gateway.OvpnUploadError, "provider"):
+                gateway.save_ovpn_upload_batch(
+                    root,
+                    "../bad",
+                    "user",
+                    "pass",
+                    [{"filename": "ok.ovpn", "data": b"client\n"}],
+                )
+            with self.assertRaisesRegex(gateway.OvpnUploadError, "filename"):
+                gateway.save_ovpn_upload_batch(
+                    root,
+                    "NC",
+                    "user",
+                    "pass",
+                    [{"filename": "../bad.ovpn", "data": b"client\n"}],
+                )
+
+    def test_upload_accepts_loose_files_and_writes_provider_auth(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = gateway.save_ovpn_upload_batch(
+                root,
+                "NC",
+                "vpn-user",
+                "vpn-pass",
+                [
+                    {"filename": "United_States_California_Los_Angeles.ovpn", "data": b"client\nca ca.crt\n"},
+                    {"filename": "ca.crt", "data": b"certificate\n"},
+                ],
+            )
+
+            self.assertEqual(result["uploaded"], 2)
+            self.assertEqual(result["ovpnUploaded"], 1)
+            self.assertTrue((root / "NC" / "United_States_California_Los_Angeles.ovpn").is_file())
+            self.assertEqual((root / "NC" / "auth.txt").read_text(encoding="utf-8"), "vpn-user\nvpn-pass\n")
+            files = gateway.list_allowed_ovpn_files(
+                {"ovpnRoot": str(root)},
+                root / "openvpn-proxy-config.json",
+                False,
+            )
+            self.assertEqual(files, ["NC/United_States_California_Los_Angeles.ovpn"])
+
+    def test_upload_preserves_existing_files_unless_overwrite_is_enabled(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            gateway.save_ovpn_upload_batch(
+                root,
+                "NC",
+                "user",
+                "pass",
+                [{"filename": "profile.ovpn", "data": b"old\n"}],
+            )
+
+            with self.assertRaisesRegex(gateway.OvpnUploadError, "already exists"):
+                gateway.save_ovpn_upload_batch(
+                    root,
+                    "NC",
+                    "user",
+                    "pass",
+                    [{"filename": "profile.ovpn", "data": b"new\n"}],
+                )
+
+            gateway.save_ovpn_upload_batch(
+                root,
+                "NC",
+                "user",
+                "new-pass",
+                [{"filename": "profile.ovpn", "data": b"new\n"}],
+                overwrite=True,
+            )
+            self.assertEqual((root / "NC" / "profile.ovpn").read_bytes(), b"new\n")
+            self.assertEqual((root / "NC" / "auth.txt").read_text(encoding="utf-8"), "user\nnew-pass\n")
+
+
+class OVPNLocationChangeTests(unittest.TestCase):
+    @staticmethod
+    def _state(port: int, active: bool = False):
+        return {
+            "port_base": port,
+            "locations": [{}],
+            "use_docker": False,
+            "lock": threading.Lock(),
+            "active_ports": {port} if active else set(),
+            "activation_state_by_port": {port: "active"} if active else {},
+            "activation_error_by_port": {},
+            "activation_cancelled_ports": set(),
+            "port_to_slot": {},
+            "port_ovpn_assignment": {},
+            "port_egress_by_port": {},
+            "upstream_profiles_by_id": {},
+        }
+
+    @staticmethod
+    def _runtime_root(tmpdir: str):
+        root = Path(tmpdir)
+        provider = root / "NC"
+        provider.mkdir()
+        (provider / "auth.txt").write_text("vpn-user\nvpn-pass\n", encoding="utf-8")
+        (provider / "United_States_California_Los_Angeles.ovpn").write_text("client\n", encoding="utf-8")
+        (provider / "Germany_Berlin.ovpn").write_text("client\n", encoding="utf-8")
+        return root, {"ovpnRoot": str(root), "locations": [{}]}, root / "config.json"
+
+    def test_country_location_change_saves_inactive_port_without_starting(self):
+        port = 50000
+        with TemporaryDirectory() as tmpdir:
+            root, runtime_config, config_path = self._runtime_root(tmpdir)
+            state = self._state(port, active=False)
+            with patch.object(gateway, "persist_assignments_snapshot"):
+                result, err = gateway._perform_port_location_change(
+                    state,
+                    port,
+                    runtime_config,
+                    config_path,
+                    requested_country="US",
+                )
+
+            self.assertIsNone(err)
+            self.assertEqual(result["activationState"], "inactive")
+            self.assertEqual(
+                state["port_ovpn_assignment"][port],
+                "NC/United_States_California_Los_Angeles.ovpn",
+            )
+            self.assertEqual(root.name, Path(tmpdir).name)
+
+    def test_active_exact_location_change_marks_port_starting(self):
+        port = 50000
+        with TemporaryDirectory() as tmpdir:
+            _root, runtime_config, config_path = self._runtime_root(tmpdir)
+            state = self._state(port, active=True)
+            started_threads = []
+
+            class FakeThread:
+                def __init__(self, target=None, args=(), daemon=None):
+                    started_threads.append({"target": target, "args": args, "daemon": daemon, "started": False})
+
+                def start(self):
+                    started_threads[-1]["started"] = True
+
+            with (
+                patch.object(gateway.threading, "Thread", FakeThread),
+                patch.object(gateway, "persist_assignments_snapshot"),
+            ):
+                result, err = gateway._perform_port_location_change(
+                    state,
+                    port,
+                    runtime_config,
+                    config_path,
+                    requested_ovpn="NC/Germany_Berlin.ovpn",
+                )
+
+            self.assertIsNone(err)
+            self.assertEqual(result["activationState"], "starting")
+            self.assertEqual(state["port_egress_by_port"][port], {"type": "ovpn", "ovpn": "NC/Germany_Berlin.ovpn"})
+            self.assertEqual(state["activation_state_by_port"][port], "starting")
+            self.assertTrue(started_threads[0]["started"])
+
+
 class UpstreamLifecycleTests(unittest.TestCase):
     @staticmethod
     def _profile(profile_id):

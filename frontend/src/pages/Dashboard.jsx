@@ -225,6 +225,40 @@ export default function Dashboard() {
     }
   };
 
+  const changePortLocation = async (port, { ovpn = '', country = '' } = {}) => {
+    setBusyPort(port);
+    setError('');
+    try {
+      const payload = ovpn ? { ovpn } : { country };
+      const res = await fetch(`/api/change-port-location?port=${encodeURIComponent(port)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to change location');
+        return false;
+      }
+      const refreshed = await fetch('/api/status').then((r) => r.json());
+      setStatus(refreshed);
+      setSelectedByPort(refreshed.assignedOvpnByPort || {});
+      toast({
+        title: 'Location changed',
+        message: data.activationState === 'starting'
+          ? 'The proxy is restarting on the same port.'
+          : 'The new location is saved for this port.',
+        variant: 'success',
+      });
+      return true;
+    } catch (err) {
+      setError('Failed to change location: ' + err.message);
+      return false;
+    } finally {
+      setBusyPort(null);
+    }
+  };
+
   const extendPort = async (port) => {
     setBusyPort(port);
     setError('');
@@ -277,7 +311,11 @@ export default function Dashboard() {
   };
 
   const onSelectRowFile = async (port, ovpn) => {
-    await saveEgress(port, 'ovpn', { ovpn });
+    if (ovpn) {
+      await changePortLocation(port, { ovpn });
+    } else {
+      await saveEgress(port, 'none');
+    }
   };
 
   const handleCreateEntry = async (e) => {
@@ -1484,9 +1522,35 @@ export default function Dashboard() {
                               files={sortedOvpnFiles}
                               value={selected}
                               onChange={(file) => onSelectRowFile(port, file)}
-                              disabled={true}
-                            placeholder={isRotating ? 'Rotating…' : 'Select profile…'}
+                              disabled={busyPort === port || isStarting}
+                              placeholder={isRotating ? 'Rotating…' : 'Select profile…'}
                             />
+                          )}
+                          {egress.type !== 'upstream' && (
+                            <select
+                              className="dashboard-location-country-select"
+                              value=""
+                              onChange={(e) => {
+                                const country = e.target.value;
+                                if (country) changePortLocation(port, { country });
+                              }}
+                              disabled={busyPort === port || isStarting || ovpnFiles.length === 0}
+                              title={
+                                isActive
+                                  ? 'Change country and restart this proxy on the same port'
+                                  : 'Save a random profile from this country'
+                              }
+                              aria-label="Change port country"
+                            >
+                              <option value="">Change country...</option>
+                              <option value="random">Random any country</option>
+                              {ovpnCountries.map((c) => (
+                                <option key={c.code} value={c.code} disabled={!c.count}>
+                                  {c.label}
+                                  {typeof c.count === 'number' ? ` (${c.count})` : ''}
+                                </option>
+                              ))}
+                            </select>
                           )}
                           {isRotating && (
                             <span

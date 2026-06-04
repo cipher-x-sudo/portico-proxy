@@ -13,11 +13,14 @@ if str(_sys_path) not in __import__("sys").path:
 
 import argparse
 import errno
+from email.parser import BytesParser
+from email.policy import default as email_policy
 import http.server
 import json
 import os
 import secrets
 import re
+import shutil
 import select
 import selectors
 import signal
@@ -26,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -162,6 +166,12 @@ ALLOWED_ASSET_EXTENSIONS = {
     ".auth",
     ".txt",
 }
+OVPN_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+MAX_UPLOAD_FILE_NAME_LENGTH = 180
+
+
+class OvpnUploadError(ValueError):
+    """Raised when an OVPN upload batch is invalid or cannot be committed."""
 
 
 def _log(msg: str) -> None:
@@ -581,7 +591,173 @@ def _is_safe_provider_name(name: str) -> bool:
         return False
     if s in (".", ".."):
         return False
+    if ":" in s or len(s) > 120:
+        return False
     return not any(c in s for c in "\r\n\t\x00")
+
+
+def _is_safe_upload_filename(name: str) -> bool:
+    s = (name or "").strip()
+    if not s or len(s) > MAX_UPLOAD_FILE_NAME_LENGTH:
+        return False
+    if "/" in s or "\\" in s or ":" in s:
+        return False
+    if s in (".", "..") or Path(s).is_absolute():
+        return False
+    if any(c in s for c in "\r\n\t\x00"):
+        return False
+    if len(Path(s).parts) != 1:
+        return False
+    return Path(s).suffix.lower() in ALLOWED_ASSET_EXTENSIONS
+
+
+def _provider_file_summary(ovpn_root: Path) -> List[Dict[str, Any]]:
+    if not ovpn_root.exists() or not ovpn_root.is_dir():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for child in sorted((p for p in ovpn_root.iterdir() if p.is_dir()), key=lambda p: p.name.casefold()):
+        ovpn_count = 0
+        asset_count = 0
+        for p in child.iterdir():
+            if not p.is_file():
+                continue
+            suffix = p.suffix.lower()
+            if suffix == ".ovpn":
+                ovpn_count += 1
+            elif suffix in ALLOWED_ASSET_EXTENSIONS:
+                asset_count += 1
+        if ovpn_count or asset_count or (child / "auth.txt").is_file():
+            rows.append(
+                {
+                    "provider": child.name,
+                    "ovpnCount": ovpn_count,
+                    "assetCount": asset_count,
+                    "hasAuthFile": (child / "auth.txt").is_file(),
+                }
+            )
+    return rows
+
+
+def save_ovpn_upload_batch(
+    ovpn_root: Path,
+    provider: str,
+    username: str,
+    password: str,
+    files: List[Dict[str, Any]],
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """
+    Validate and commit a loose-file OVPN upload batch into one provider folder.
+
+    files entries are {"filename": str, "data": bytes}. The provider auth.txt is
+    always derived from username/password, so uploaded auth.txt is reserved.
+    """
+    provider_name = (provider or "").strip()
+    if not _is_safe_provider_name(provider_name):
+        raise OvpnUploadError("provider must be a safe single folder name")
+    if any(c in str(username or "") for c in "\r\n\x00"):
+        raise OvpnUploadError("username contains invalid characters")
+    if any(c in str(password or "") for c in "\r\n\x00"):
+        raise OvpnUploadError("password contains invalid characters")
+    username = str(username or "").strip()
+    password = str(password or "")
+    if not username or not password:
+        raise OvpnUploadError("username and password are required")
+    if not files:
+        raise OvpnUploadError("at least one upload file is required")
+    root = ovpn_root.resolve()
+    if not root.exists() or not root.is_dir():
+        raise OvpnUploadError(f"ovpnRoot does not exist or is not a directory: {root}")
+
+    normalized: List[Tuple[str, bytes]] = []
+    seen_names: Set[str] = set()
+    for item in files:
+        filename = str(item.get("filename") or "").strip()
+        data = item.get("data")
+        if not isinstance(data, (bytes, bytearray)):
+            raise OvpnUploadError(f"{filename or 'upload'} is not a file upload")
+        if not _is_safe_upload_filename(filename):
+            raise OvpnUploadError(f"unsafe or unsupported upload filename: {filename}")
+        if filename.casefold() == "auth.txt":
+            raise OvpnUploadError("auth.txt is managed from the upload username/password fields")
+        if len(data) == 0:
+            raise OvpnUploadError(f"upload file is empty: {filename}")
+        key = filename.casefold()
+        if key in seen_names:
+            raise OvpnUploadError(f"duplicate filename in upload batch: {filename}")
+        seen_names.add(key)
+        normalized.append((filename, bytes(data)))
+
+    provider_dir = (root / provider_name).resolve()
+    if not _is_safe_under_root(provider_dir, root):
+        raise OvpnUploadError("provider path escapes ovpnRoot")
+    conflicts: List[str] = []
+    for filename, _data in normalized:
+        target = (provider_dir / filename).resolve()
+        if not _is_safe_under_root(target, root):
+            raise OvpnUploadError(f"upload path escapes ovpnRoot: {filename}")
+        if target.exists() and not overwrite:
+            conflicts.append(filename)
+    if conflicts:
+        raise OvpnUploadError(
+            "file already exists: " + ", ".join(conflicts[:5]) + ("..." if len(conflicts) > 5 else "")
+        )
+
+    stage_dir = Path(tempfile.mkdtemp(prefix=f".{provider_name}.upload-", dir=str(root)))
+    try:
+        staged_files: List[Tuple[Path, Path, str]] = []
+        for filename, data in normalized:
+            stage_path = stage_dir / filename
+            stage_path.write_bytes(data)
+            staged_files.append((stage_path, (provider_dir / filename).resolve(), filename))
+        staged_names = {filename.casefold() for _stage_path, _target_path, filename in staged_files}
+        for stage_path, _target_path, filename in staged_files:
+            if Path(filename).suffix.lower() != ".ovpn":
+                continue
+            try:
+                refs = _extract_referenced_assets(stage_path)
+            except OSError as exc:
+                raise OvpnUploadError(f"Failed to read OVPN file {filename}: {exc}") from exc
+            for ref in refs:
+                ref_path = Path(ref)
+                if ref_path.suffix.lower() not in ALLOWED_ASSET_EXTENSIONS:
+                    raise OvpnUploadError(f"Referenced file extension not allowed in {filename}: {ref}")
+                stage_ref = (stage_path.parent / ref).resolve()
+                target_ref = (provider_dir / ref).resolve()
+                if not _is_safe_under_root(stage_ref, stage_dir) or not _is_safe_under_root(target_ref, root):
+                    raise OvpnUploadError(f"Referenced file escapes provider folder in {filename}: {ref}")
+                if len(ref_path.parts) == 1 and ref_path.name.casefold() in staged_names:
+                    continue
+                if not target_ref.exists():
+                    raise OvpnUploadError(f"Referenced OpenVPN asset missing for {filename}: {ref}")
+        auth_stage = stage_dir / "auth.txt"
+        auth_stage.write_text(f"{username}\n{password}\n", encoding="utf-8")
+        staged_files.append((auth_stage, (provider_dir / "auth.txt").resolve(), "auth.txt"))
+
+        provider_dir.mkdir(parents=True, exist_ok=True)
+        for _stage_path, target_path, filename in staged_files:
+            if filename != "auth.txt" and target_path.exists() and not overwrite:
+                raise OvpnUploadError(f"file already exists: {filename}")
+        for stage_path, target_path, _filename in staged_files:
+            os.replace(stage_path, target_path)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.EROFS or "read-only" in str(exc).lower():
+            raise OvpnUploadError(
+                "OVPN root is read-only. Ensure the gateway mounts ovpn_data as writable."
+            ) from exc
+        raise OvpnUploadError(str(exc)) from exc
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+    uploaded_files = [name for name, _data in normalized]
+    return {
+        "ok": True,
+        "provider": provider_name,
+        "uploaded": len(uploaded_files),
+        "ovpnUploaded": sum(1 for name in uploaded_files if Path(name).suffix.lower() == ".ovpn"),
+        "files": uploaded_files,
+        "authPath": str((provider_dir / "auth.txt").resolve()),
+    }
 
 
 def list_allowed_ovpn_files(config: Dict[str, Any], config_path: Path, use_docker: bool = False) -> List[str]:
@@ -634,6 +810,7 @@ def build_ovpn_files_payload(
         payload["scanPath"] = str(mount)
         payload["pathExists"] = path_exists
         payload["isDirectory"] = is_dir
+        payload["providers"] = _provider_file_summary(mount)
         if not path_exists or not is_dir:
             payload["hint"] = (
                 f"OVPN mount missing or not a directory at {mount}. "
@@ -654,6 +831,7 @@ def build_ovpn_files_payload(
         payload["scanPath"] = str(ovpn_root)
         payload["pathExists"] = path_exists
         payload["isDirectory"] = is_dir
+        payload["providers"] = _provider_file_summary(ovpn_root)
         if not path_exists or not is_dir:
             payload["hint"] = (
                 f"ovpnRoot does not exist or is not a directory: {ovpn_root}. "
@@ -2493,6 +2671,79 @@ def _perform_port_egress_change_to(
     return None
 
 
+def _perform_port_location_change(
+    state: Dict[str, Any],
+    port: int,
+    runtime_config: Dict[str, Any],
+    config_path: Path,
+    requested_ovpn: str = "",
+    requested_country: str = "",
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Change a listener to an exact OVPN or random country pick; active ports restart."""
+    port_base = state["port_base"]
+    locations = state["locations"]
+    loc_idx = port - port_base
+    if loc_idx < 0 or loc_idx >= len(locations):
+        return None, "Port out of location range"
+
+    selected = (requested_ovpn or "").strip()
+    country_raw = (requested_country or "").strip()
+    if selected and country_raw:
+        return None, "Provide either ovpn or country, not both"
+    if not selected and not country_raw:
+        return None, "Provide ovpn or country"
+
+    use_docker = bool(state.get("use_docker"))
+    current = ""
+    with state["lock"]:
+        current = (state.get("port_ovpn_assignment") or {}).get(port, "") or ""
+
+    if selected:
+        if Path(selected).suffix.lower() != ".ovpn":
+            return None, "Only .ovpn files are allowed"
+        if not _is_safe_relative_ovpn_name(selected):
+            return None, "ovpn must be a safe relative path"
+    else:
+        country_norm = normalize_randomize_country(country_raw)
+        if country_norm == "random" and country_raw.lower() not in ("random", ""):
+            return None, 'country must be a 2-letter ISO code or "random"'
+        allowed = list_allowed_ovpn_files(runtime_config, config_path, use_docker)
+        if not allowed:
+            return None, "No .ovpn files available"
+        pool = allowed
+        if country_norm != "random":
+            pool = filter_ovpn_files_by_country(allowed, country_norm)
+            if not pool:
+                return None, f"No .ovpn files for country {country_norm}"
+        if len(pool) > 1 and current:
+            others = [name for name in pool if name != current]
+            if others:
+                pool = others
+        selected = secrets.choice(list(pool))
+
+    err = _perform_port_egress_change_to(
+        state,
+        port,
+        {"type": "ovpn", "ovpn": selected},
+        runtime_config,
+        config_path,
+    )
+    if err:
+        return None, err
+    with state["lock"]:
+        activation_state = state["activation_state_by_port"].get(port, "inactive")
+    return (
+        {
+            "ok": True,
+            "port": port,
+            "ovpn": selected,
+            "locationIndex": loc_idx,
+            "activationState": activation_state,
+        },
+        None,
+    )
+
+
 # Tick interval for the rotation worker thread. Smaller than the smallest sane rotation interval.
 ROTATION_TICK_SECONDS = 5.0
 
@@ -2908,6 +3159,59 @@ def _control_api_handler_factory(
                 return None, "Request body must be an object"
             return payload, None
 
+        def _read_ovpn_upload_form(self) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                return None, "Invalid Content-Length", 400
+            if content_length <= 0:
+                return None, "Invalid Content-Length", 400
+            if content_length > OVPN_UPLOAD_MAX_BYTES:
+                return None, "Upload is too large (max 64 MB)", 413
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("multipart/form-data"):
+                return None, "Content-Type must be multipart/form-data", 400
+            try:
+                body = self.rfile.read(content_length)
+                raw_message = (
+                    f"Content-Type: {content_type}\r\n"
+                    "MIME-Version: 1.0\r\n\r\n"
+                ).encode("utf-8") + body
+                message = BytesParser(policy=email_policy).parsebytes(raw_message)
+            except Exception as e:
+                return None, str(e), 400
+            if not message.is_multipart():
+                return None, "Invalid multipart body", 400
+
+            text_fields: Dict[str, str] = {}
+            files: List[Dict[str, Any]] = []
+            for part in message.iter_parts():
+                if part.get_content_disposition() != "form-data":
+                    continue
+                name = str(part.get_param("name", header="content-disposition") or "")
+                if not name:
+                    continue
+                filename = part.get_filename()
+                payload_bytes = part.get_payload(decode=True) or b""
+                if filename is None:
+                    if name not in text_fields:
+                        charset = part.get_content_charset() or "utf-8"
+                        text_fields[name] = payload_bytes.decode(charset, errors="replace")
+                    continue
+                if name not in ("files", "files[]"):
+                    continue
+                files.append({"filename": str(filename), "data": payload_bytes})
+
+            overwrite_raw = text_fields.get("overwrite", "").strip().lower()
+            payload = {
+                "provider": text_fields.get("provider", "").strip(),
+                "username": text_fields.get("username", ""),
+                "password": text_fields.get("password", ""),
+                "overwrite": overwrite_raw in ("1", "true", "yes", "on"),
+                "files": files,
+            }
+            return payload, None, 200
+
         def _runtime_config_for_apply(self) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
             runtime_config, load_err, load_status = load_disk_config_expanded(state["config_path"])
             if load_err or runtime_config is None:
@@ -3259,6 +3563,8 @@ def _control_api_handler_factory(
                 self._handle_post_config()
             elif path == "/api/provider-auth":
                 self._handle_post_provider_auth()
+            elif path == "/api/ovpn-upload":
+                self._handle_post_ovpn_upload()
             elif path == "/api/assign-ovpn":
                 self._handle_post_assign_ovpn(parsed.query)
             elif path == "/api/upstream-proxy":
@@ -3269,6 +3575,8 @@ def _control_api_handler_factory(
                 self._handle_post_delete_upstream_proxy(parsed.query)
             elif path == "/api/set-egress":
                 self._handle_post_set_egress(parsed.query)
+            elif path == "/api/change-port-location":
+                self._handle_post_change_port_location(parsed.query)
             elif path == "/api/activate":
                 self._handle_post_activate(parsed.query)
             elif path == "/api/deactivate":
@@ -3420,6 +3728,70 @@ def _control_api_handler_factory(
 
             status_code = 200 if not had_error else 400
             self._send_json({"ok": not had_error, "results": results}, status=status_code)
+
+        def _handle_post_ovpn_upload(self) -> None:
+            payload, form_err, status_code = self._read_ovpn_upload_form()
+            if form_err or payload is None:
+                self._send_error_body(form_err or "Invalid upload", status_code)
+                return
+            runtime_config, load_err, load_status = self._runtime_config_for_apply()
+            if load_err or runtime_config is None:
+                self._send_error_body(load_err or "Could not load config", load_status)
+                return
+            ovpn_root = _resolve_provider_auth_root(
+                runtime_config,
+                state["config_path"],
+                bool(state.get("use_docker")),
+            )
+            try:
+                result = save_ovpn_upload_batch(
+                    ovpn_root,
+                    str(payload.get("provider") or ""),
+                    str(payload.get("username") or ""),
+                    str(payload.get("password") or ""),
+                    list(payload.get("files") or []),
+                    bool(payload.get("overwrite")),
+                )
+            except OvpnUploadError as e:
+                self._send_error_body(str(e), 400)
+                return
+            files_payload = build_ovpn_files_payload(
+                runtime_config,
+                state["config_path"],
+                bool(state.get("use_docker")),
+            )
+            result["ovpnCount"] = files_payload.get("ovpnCount", 0)
+            result["providers"] = files_payload.get("providers", [])
+            self._send_json(result)
+
+        def _handle_post_change_port_location(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query)
+            raw_port = params.get("port", [""])[0]
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError):
+                self._send_error_body("Invalid port", 400)
+                return
+            payload, body_err = self._read_json_body(16 * 1024)
+            if body_err or payload is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            runtime_config, load_err, load_status = self._runtime_config_for_apply()
+            if load_err or runtime_config is None:
+                self._send_error_body(load_err or "Could not load config", load_status)
+                return
+            result, err = _perform_port_location_change(
+                state,
+                port,
+                runtime_config,
+                state["config_path"],
+                requested_ovpn=str(payload.get("ovpn") or ""),
+                requested_country=str(payload.get("country") or ""),
+            )
+            if err or result is None:
+                self._send_error_body(err or "Failed to change location", 400)
+                return
+            self._send_json(result)
 
         def _handle_post_shutdown(self) -> None:
             global shutdown_flag

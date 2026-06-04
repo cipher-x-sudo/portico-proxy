@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useState, useRef } from 'react';
 import { useConfirm, useToast } from '../components/ui/feedback-hooks.js';
 import './Config.css';
 
@@ -19,6 +19,15 @@ export default function Config() {
   const [providerAuthBusy, setProviderAuthBusy] = useState(false);
   const [providerAuthError, setProviderAuthError] = useState('');
   const [ovpnCountries, setOvpnCountries] = useState([]);
+  const [ovpnProviderSummaries, setOvpnProviderSummaries] = useState([]);
+  const [uploadProvider, setUploadProvider] = useState('');
+  const [uploadUsername, setUploadUsername] = useState('');
+  const [uploadPassword, setUploadPassword] = useState('');
+  const [uploadOverwrite, setUploadOverwrite] = useState(false);
+  const [uploadFiles, setUploadFiles] = useState([]);
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadError, setUploadError] = useState('');
+  const [uploadResult, setUploadResult] = useState(null);
   const [upstreamProxies, setUpstreamProxies] = useState([]);
   const [upstreamBusy, setUpstreamBusy] = useState(false);
   const [upstreamError, setUpstreamError] = useState('');
@@ -35,6 +44,31 @@ export default function Config() {
   });
   const [ovpnScanMeta, setOvpnScanMeta] = useState({ count: 0, unclassified: 0 });
   const fileInputRef = useRef(null);
+  const ovpnUploadInputRef = useRef(null);
+
+  const applyOvpnPayload = useCallback((ovpnPayload) => {
+    setOvpnCountries(Array.isArray(ovpnPayload.countries) ? ovpnPayload.countries : []);
+    setOvpnProviderSummaries(Array.isArray(ovpnPayload.providers) ? ovpnPayload.providers : []);
+    setOvpnScanMeta({
+      count: typeof ovpnPayload.ovpnCount === 'number' ? ovpnPayload.ovpnCount : 0,
+      unclassified:
+        typeof ovpnPayload.unclassifiedOvpnCount === 'number'
+          ? ovpnPayload.unclassifiedOvpnCount
+          : 0,
+    });
+  }, []);
+
+  const refreshOvpnMetadata = useCallback(async () => {
+    const payload = await fetch('/api/ovpn-files').then((res) => res.json());
+    applyOvpnPayload(payload || {});
+    return payload;
+  }, [applyOvpnPayload]);
+
+  const refreshProviderAuth = useCallback(async () => {
+    const payload = await fetch('/api/provider-auth').then((res) => res.json());
+    setProviderAuthRows(Array.isArray(payload.providers) ? payload.providers : []);
+    return payload;
+  }, []);
 
   useEffect(() => {
     Promise.all([
@@ -55,14 +89,7 @@ export default function Config() {
           data.randomizeCountry = 'random';
         }
         setConfig(data);
-        setOvpnCountries(Array.isArray(ovpnPayload.countries) ? ovpnPayload.countries : []);
-        setOvpnScanMeta({
-          count: typeof ovpnPayload.ovpnCount === 'number' ? ovpnPayload.ovpnCount : 0,
-          unclassified:
-            typeof ovpnPayload.unclassifiedOvpnCount === 'number'
-              ? ovpnPayload.unclassifiedOvpnCount
-              : 0,
-        });
+        applyOvpnPayload(ovpnPayload || {});
         setProviderAuthRows(
           Array.isArray(providerAuthPayload.providers) ? providerAuthPayload.providers : [],
         );
@@ -71,7 +98,7 @@ export default function Config() {
         setIsDirty(false);
       })
       .catch((err) => console.error('Error fetching config:', err));
-  }, []);
+  }, [applyOvpnPayload]);
 
   const handleChange = (field, value) => {
     setConfig(prev => ({ ...prev, [field]: value }));
@@ -111,10 +138,62 @@ export default function Config() {
           : '';
         throw new Error(firstErr || data.error || 'Failed to save provider auth files');
       }
-      const refreshed = await fetch('/api/provider-auth').then((r) => r.json());
-      setProviderAuthRows(Array.isArray(refreshed.providers) ? refreshed.providers : []);
+      await refreshProviderAuth();
     } finally {
       setProviderAuthBusy(false);
+    }
+  };
+
+  const uploadOvpnFiles = async (e) => {
+    e.preventDefault();
+    setUploadError('');
+    setUploadResult(null);
+    const provider = uploadProvider.trim();
+    if (!provider) {
+      setUploadError('Provider folder is required.');
+      return;
+    }
+    if (!uploadUsername.trim() || !uploadPassword) {
+      setUploadError('Username and password are required for this upload batch.');
+      return;
+    }
+    if (!uploadFiles.length) {
+      setUploadError('Choose at least one OVPN or related asset file.');
+      return;
+    }
+    const form = new FormData();
+    form.append('provider', provider);
+    form.append('username', uploadUsername);
+    form.append('password', uploadPassword);
+    form.append('overwrite', uploadOverwrite ? 'true' : 'false');
+    uploadFiles.forEach((file) => form.append('files', file, file.name));
+
+    setUploadBusy(true);
+    try {
+      const res = await fetch('/api/ovpn-upload', {
+        method: 'POST',
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || 'Upload failed');
+      }
+      setUploadResult(data);
+      setUploadFiles([]);
+      setUploadPassword('');
+      if (ovpnUploadInputRef.current) ovpnUploadInputRef.current.value = '';
+      await Promise.all([refreshOvpnMetadata(), refreshProviderAuth()]);
+      toast({
+        title: 'OVPN files uploaded',
+        message: `${data.uploaded || 0} file${data.uploaded === 1 ? '' : 's'} saved to ${data.provider}.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      const message = err.message || 'Upload failed';
+      setUploadError(message);
+      toast({ title: 'Upload failed', message, variant: 'danger' });
+    } finally {
+      setUploadBusy(false);
     }
   };
 
@@ -311,6 +390,13 @@ export default function Config() {
       </div>
     );
   }
+
+  const uploadProviderOptions = Array.from(
+    new Set([
+      ...providerAuthRows.map((row) => row.provider).filter(Boolean),
+      ...ovpnProviderSummaries.map((row) => row.provider).filter(Boolean),
+    ]),
+  ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 
   return (
     <div className="config-page">
@@ -631,6 +717,125 @@ export default function Config() {
               </div>
             </div>
           )}
+        </section>
+
+        <section className="card config-card col-span-2">
+          <div className="card-header">
+            <span className="material-symbols-outlined text-primary">upload_file</span>
+            <h3 className="card-title">Upload OVPN Files</h3>
+          </div>
+          <form className="ovpn-upload-form" onSubmit={uploadOvpnFiles}>
+            <div className="grid-2-col gap-4">
+              <div className="form-group">
+                <label htmlFor="ovpn-upload-provider">Provider folder</label>
+                <input
+                  id="ovpn-upload-provider"
+                  type="text"
+                  className="premium-input"
+                  value={uploadProvider}
+                  onChange={(e) => setUploadProvider(e.target.value)}
+                  list="ovpn-upload-provider-options"
+                  placeholder="NC, EX, surfshark..."
+                  disabled={uploadBusy}
+                />
+                <datalist id="ovpn-upload-provider-options">
+                  {uploadProviderOptions.map((provider) => (
+                    <option key={provider} value={provider} />
+                  ))}
+                </datalist>
+              </div>
+              <div className="form-group">
+                <label htmlFor="ovpn-upload-files">Loose OVPN files</label>
+                <input
+                  id="ovpn-upload-files"
+                  ref={ovpnUploadInputRef}
+                  type="file"
+                  className="premium-input ovpn-upload-file-input"
+                  multiple
+                  accept=".ovpn,.crt,.key,.pem,.p12,.auth,.txt"
+                  onChange={(e) => setUploadFiles(Array.from(e.target.files || []))}
+                  disabled={uploadBusy}
+                />
+              </div>
+            </div>
+            <div className="grid-2-col gap-4">
+              <div className="form-group">
+                <label htmlFor="ovpn-upload-username">Batch username</label>
+                <input
+                  id="ovpn-upload-username"
+                  type="text"
+                  className="premium-input"
+                  value={uploadUsername}
+                  onChange={(e) => setUploadUsername(e.target.value)}
+                  placeholder="Provider username"
+                  disabled={uploadBusy}
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="ovpn-upload-password">Batch password</label>
+                <input
+                  id="ovpn-upload-password"
+                  type="password"
+                  className="premium-input"
+                  value={uploadPassword}
+                  onChange={(e) => setUploadPassword(e.target.value)}
+                  placeholder="Provider password"
+                  disabled={uploadBusy}
+                />
+              </div>
+            </div>
+            <div className="ovpn-upload-footer">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={uploadOverwrite}
+                  onChange={(e) => setUploadOverwrite(e.target.checked)}
+                  disabled={uploadBusy}
+                />
+                <span className="checkbox-custom"></span>
+                Replace files with the same name
+              </label>
+              <button
+                type="submit"
+                className="btn-primary"
+                disabled={
+                  uploadBusy ||
+                  !uploadProvider.trim() ||
+                  !uploadUsername.trim() ||
+                  !uploadPassword ||
+                  uploadFiles.length === 0
+                }
+              >
+                <span className="material-symbols-outlined">cloud_upload</span>
+                {uploadBusy ? 'Uploading...' : 'Upload Files'}
+              </button>
+            </div>
+            <div className="ovpn-upload-meta">
+              <span>{uploadFiles.length} selected</span>
+              {uploadFiles.length > 0 && (
+                <span>
+                  {uploadFiles
+                    .slice(0, 3)
+                    .map((file) => file.name)
+                    .join(', ')}
+                  {uploadFiles.length > 3 ? ` +${uploadFiles.length - 3} more` : ''}
+                </span>
+              )}
+            </div>
+            {uploadError ? (
+              <div className="config-publish-mismatch-banner" role="alert">
+                <strong>OVPN upload failed.</strong> {uploadError}
+              </div>
+            ) : null}
+            {uploadResult ? (
+              <div className="ovpn-upload-success" role="status">
+                Uploaded <strong>{uploadResult.uploaded}</strong> file
+                {uploadResult.uploaded === 1 ? '' : 's'} to <code>{uploadResult.provider}</code>;
+                detected <strong>{uploadResult.ovpnUploaded}</strong> new OVPN profile
+                {uploadResult.ovpnUploaded === 1 ? '' : 's'} in this batch.
+              </div>
+            ) : null}
+          </form>
         </section>
 
         <section className="card config-card col-span-2">
