@@ -1,4 +1,5 @@
 import sys
+import base64
 import errno
 import threading
 import time
@@ -127,6 +128,75 @@ class TypedEgressStateTests(unittest.TestCase):
             {"type": "upstream", "upstreamProxyId": "proxy-abc"},
         )
         self.assertEqual(payload["upstreamRefreshIntervals"]["50001"], 15)
+
+
+class AuthRoutingTests(unittest.TestCase):
+    def test_http_basic_auth_parses_username_and_password(self):
+        token = base64.b64encode(b"us_chicago:secret").decode("ascii")
+        raw = (
+            f"CONNECT example.com:443 HTTP/1.1\r\n"
+            f"Host: example.com:443\r\n"
+            f"Proxy-Authorization: Basic {token}\r\n\r\n"
+        ).encode("ascii")
+
+        username, password, err = gateway.parse_http_proxy_basic_auth(raw)
+
+        self.assertIsNone(err)
+        self.assertEqual(username, "us_chicago")
+        self.assertEqual(password, "secret")
+
+    def test_http_basic_auth_rejects_missing_header(self):
+        username, password, err = gateway.parse_http_proxy_basic_auth(b"GET http://example.com/ HTTP/1.1\r\n\r\n")
+
+        self.assertEqual(username, "")
+        self.assertEqual(password, "")
+        self.assertIn("Missing", err)
+
+    def test_proxy_authorization_header_is_stripped_before_internal_forward(self):
+        token = base64.b64encode(b"route:pass").decode("ascii")
+        raw = (
+            f"GET http://example.com/ HTTP/1.1\r\n"
+            f"Host: example.com\r\n"
+            f"Proxy-Authorization: Basic {token}\r\n"
+            f"User-Agent: test\r\n\r\n"
+        ).encode("ascii")
+
+        stripped = gateway.strip_proxy_authorization_header(raw)
+
+        self.assertNotIn(b"Proxy-Authorization", stripped)
+        self.assertIn(b"User-Agent: test", stripped)
+
+    def test_username_selects_enabled_route_with_global_password(self):
+        config = {
+            "authRouting": {
+                "enabled": True,
+                "routes": [
+                    {
+                        "username": "us_chicago",
+                        "label": "US Chicago",
+                        "enabled": True,
+                        "egress": {"type": "ovpn", "ovpn": "NC/example.ovpn"},
+                    },
+                    {
+                        "username": "disabled",
+                        "enabled": False,
+                        "egress": {"type": "upstream", "upstreamProxyId": "proxy-a"},
+                    },
+                ],
+            }
+        }
+        state = {"auth_routes": gateway.normalize_auth_routes(config), "auth_global_password": "secret"}
+
+        idx, route, err = gateway._auth_route_for_credentials(state, "us_chicago", "secret")
+        self.assertIsNone(err)
+        self.assertEqual(idx, 0)
+        self.assertEqual(route["egress"], {"type": "ovpn", "ovpn": "NC/example.ovpn"})
+
+        _idx, _route, err = gateway._auth_route_for_credentials(state, "us_chicago", "wrong")
+        self.assertIn("Invalid", err)
+
+        _idx, _route, err = gateway._auth_route_for_credentials(state, "disabled", "secret")
+        self.assertIn("disabled", err)
 
 
 class OvpnUploadTests(unittest.TestCase):

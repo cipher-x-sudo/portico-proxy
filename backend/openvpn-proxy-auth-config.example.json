@@ -1,0 +1,49 @@
+{
+  "ovpnRoot": "../ovpn",
+  "portBase": 50000,
+  "internalPortBase": 51000,
+  "maxSlots": 50,
+  "idleTimeoutMinutes": 45,
+  "autoDetectClientProxyHost": true,
+  "clientProxyHost": "",
+  "proxyListenHost": "0.0.0.0",
+  "controlPort": 49999,
+  "useDocker": true,
+  "dockerImage": "portico-worker",
+  "dockerNetwork": "proxynet",
+  "dockerOvpnVolume": "ovpn_data",
+  "authRouting": {
+    "enabled": true,
+    "httpPort": 58080,
+    "socksPort": 58081,
+    "routes": [
+      {
+        "username": "us_chicago",
+        "label": "US Chicago",
+        "enabled": true,
+        "egress": {
+          "type": "ovpn",
+          "ovpn": "NC/NCVPN-US-Chicago-UDP.ovpn"
+        }
+      },
+      {
+        "username": "uk_london",
+        "label": "UK London",
+        "enabled": true,
+        "egress": {
+          "type": "ovpn",
+          "ovpn": "NC/NCVPN-UK-London-UDP.ovpn"
+        }
+      },
+      {
+        "username": "backup_proxy",
+        "label": "Backup upstream proxy",
+        "enabled": false,
+        "egress": {
+          "type": "upstream",
+          "upstreamProxyId": ""
+        }
+      }
+    ]
+  }
+}

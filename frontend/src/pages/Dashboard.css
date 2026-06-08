@@ -85,6 +85,43 @@
   gap: 0.45rem;
 }
 
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.form-field > span {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.form-field.flex-row {
+  flex-direction: row;
+}
+
+.input {
+  width: 100%;
+  min-height: 40px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-main);
+  padding: 0.55rem 0.75rem;
+}
+
+.opacity-60 {
+  opacity: 0.6;
+}
+
 .data-table tr.dashboard-row-ovpn-selected td,
 .data-table tr.dashboard-row-ovpn-selected:hover td {
   background: rgba(79, 140, 255, 0.055);

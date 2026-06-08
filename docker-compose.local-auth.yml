@@ -1,0 +1,93 @@
+# Portico local auth-routing deployment.
+# This keeps the legacy docker-compose.yml untouched and exposes only one HTTP
+# proxy port plus one SOCKS5 proxy port. Username selects the route.
+
+services:
+  worker:
+    build:
+      context: ./backend
+      dockerfile: docker/worker/Dockerfile
+    image: portico-worker
+    entrypoint: ["/usr/bin/true"]
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    container_name: portico-auth-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_auth_data:/data
+    networks:
+      - proxynet
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ./backend
+      dockerfile: docker/local-auth/Dockerfile
+    image: portico-gateway-local-auth
+    container_name: portico-auth-gateway
+    depends_on:
+      - worker
+      - redis
+    environment:
+      - USE_DOCKER=1
+      - AUTH_ROUTING_ENABLED=1
+      - AUTH_HTTP_PORT=58080
+      - AUTH_SOCKS_PORT=58081
+      - PROXY_GLOBAL_PASSWORD=${PROXY_GLOBAL_PASSWORD:-huzaifa}
+      - DOCKER_IMAGE=portico-worker
+      - DOCKER_NETWORK=proxynet
+      - DOCKER_OVPN_VOLUME=ovpn_data
+      - DOCKER_OVPN_MOUNT=/ovpn
+      - OPENVPN_USERNAME=${OPENVPN_USERNAME:-}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_STATE_KEY=portico:auth-routing-state
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./backend/openvpn-proxy-auth-config.json:/config/openvpn-proxy-config.json
+      - ./backend/openvpn-proxy-assignments.json:/config/openvpn-proxy-assignments.json
+      - ./backend/upstream-proxy-catalog.json:/config/upstream-proxy-catalog.json
+      - ovpn_data:/ovpn
+    ports:
+      - "127.0.0.1:49999:49999"
+      - "0.0.0.0:58080:58080"
+      - "0.0.0.0:58081:58081"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    init: true
+    stop_grace_period: 60s
+    networks:
+      - proxynet
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: portico-frontend
+    container_name: portico-auth-frontend
+    depends_on:
+      - gateway
+    ports:
+      - "0.0.0.0:8080:80"
+    networks:
+      - proxynet
+    restart: unless-stopped
+
+networks:
+  proxynet:
+    driver: bridge
+
+volumes:
+  redis_auth_data:
+  ovpn_data:
+    name: ovpn_data
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${OVPN_HOST_PATH:-./ovpn}

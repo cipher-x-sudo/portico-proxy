@@ -93,9 +93,13 @@ def start_docker_backend(
 
     proxy_user = (config.get("proxyUsername") or "").strip()
     proxy_pass = (config.get("proxyPassword") or "")
-    if not proxy_user or not proxy_pass:
+    proxy_auth_enabled = config.get("internalProxyAuthEnabled", True) is not False
+    if proxy_auth_enabled and (not proxy_user or not proxy_pass):
         proxy_user = DEFAULT_PROXY_USERNAME
         proxy_pass = DEFAULT_PROXY_PASSWORD
+    if not proxy_auth_enabled:
+        proxy_user = ""
+        proxy_pass = ""
 
     container_name = f"proxy-{external_port}"
     _log(f"Connecting to Docker daemon")

@@ -20,6 +20,7 @@
     - [Linux host: install Docker (Debian / Ubuntu)](#linux-host-install-docker-debian--ubuntu)
   - [Repository layout](#repository-layout)
   - [Quick start](#quick-start)
+  - [Local auth-routing mode](#local-auth-routing-mode)
   - [Configuration](#configuration)
   - [Networking and endpoints](#networking-and-endpoints)
     - [Remote / VPS](#remote--vps)
@@ -154,6 +155,41 @@ After `usermod`, you may need to log out and back in instead of `newgrp docker` 
    ```
 
 5. **Verify** — open the [dashboard](http://127.0.0.1:8080) and confirm **Status** loads without HTTP 502. Inspect services: `docker compose ps` and `docker compose logs -f gateway`.
+
+---
+
+## Local auth-routing mode
+
+For a local/VPS deployment with only one HTTP proxy port and one SOCKS5 proxy port, use the separate auth-routing compose file. This keeps the legacy per-location port range in `docker-compose.yml` unchanged.
+
+1. Copy the auth-routing config template:
+
+   ```bash
+   cp backend/openvpn-proxy-auth-config.example.json backend/openvpn-proxy-auth-config.json
+   ```
+
+   **Windows (PowerShell):**
+
+   ```powershell
+   Copy-Item backend\openvpn-proxy-auth-config.example.json backend\openvpn-proxy-auth-config.json
+   ```
+
+2. Set `PROXY_GLOBAL_PASSWORD` in `.env`. Usernames in `authRouting.routes[]` choose the route; this one password authenticates all routes.
+
+3. Start the local auth-routing stack:
+
+   ```bash
+   docker compose -f docker-compose.local-auth.yml up -d --build
+   ```
+
+4. Use the dashboard at `http://127.0.0.1:8080` or connect directly:
+
+   ```bash
+   curl -x http://us_chicago:YOUR_PASSWORD@127.0.0.1:58080 https://api.ipify.org?format=json
+   curl --socks5 us_chicago:YOUR_PASSWORD@127.0.0.1:58081 https://api.ipify.org?format=json
+   ```
+
+Auth-routing mode still supports OpenVPN routes through the existing worker containers, so local Docker must be able to provide the Docker socket, `/dev/net/tun`, and `NET_ADMIN`.
 
 ---
 

@@ -99,11 +99,15 @@ def start_one_location(
     proxy_listen_host = "127.0.0.1"
     proxy_user = (config.get("proxyUsername") or "").strip()
     proxy_pass = config.get("proxyPassword") or ""
+    proxy_auth_enabled = config.get("internalProxyAuthEnabled", True) is not False
     # Enforce required proxy auth. If config omits either field, fall back to
     # temporary defaults selected by the user.
-    if not proxy_user or not proxy_pass:
+    if proxy_auth_enabled and (not proxy_user or not proxy_pass):
         proxy_user = DEFAULT_PROXY_USERNAME
         proxy_pass = DEFAULT_PROXY_PASSWORD
+    if not proxy_auth_enabled:
+        proxy_user = ""
+        proxy_pass = ""
 
     ovpn_full = resolve_ovpn_path(loc["ovpn"], ovpn_root, script_dir_path)
     if not ovpn_full.exists():
@@ -182,7 +186,9 @@ def start_one_location(
     if scheme not in ("http", "socks5"):
         scheme = "http"
     # Gateway internal proxies; listen on 127.0.0.1:internal_port (http or socks5, mutually exclusive)
-    listen_uri = f"{scheme}://{proxy_listen_host}:{internal_port}#{proxy_user}:{proxy_pass}"
+    listen_uri = f"{scheme}://{proxy_listen_host}:{internal_port}"
+    if proxy_user and proxy_pass:
+        listen_uri += f"#{proxy_user}:{proxy_pass}"
     pproxy_args = ["-m", "pproxy", "-l", listen_uri]
 
     if force_bind_ip and Path(force_bind_ip).exists():
@@ -211,14 +217,20 @@ def start_one_upstream_proxy(
     python_path = config.get("pythonPath") or "python"
     proxy_user = (config.get("proxyUsername") or "").strip()
     proxy_pass = config.get("proxyPassword") or ""
-    if not proxy_user or not proxy_pass:
+    proxy_auth_enabled = config.get("internalProxyAuthEnabled", True) is not False
+    if proxy_auth_enabled and (not proxy_user or not proxy_pass):
         proxy_user = DEFAULT_PROXY_USERNAME
         proxy_pass = DEFAULT_PROXY_PASSWORD
+    if not proxy_auth_enabled:
+        proxy_user = ""
+        proxy_pass = ""
 
     scheme = (listen_scheme or "http").strip().lower()
     if scheme not in ("http", "socks5"):
         scheme = "http"
-    listen_uri = f"{scheme}://127.0.0.1:{internal_port}#{proxy_user}:{proxy_pass}"
+    listen_uri = f"{scheme}://127.0.0.1:{internal_port}"
+    if proxy_user and proxy_pass:
+        listen_uri += f"#{proxy_user}:{proxy_pass}"
     args = ["-m", "pproxy", "-l", listen_uri, "-r", profile_remote_uri(upstream_profile)]
     try:
         return subprocess.Popen([python_path] + args)

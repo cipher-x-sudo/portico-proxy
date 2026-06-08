@@ -23,6 +23,15 @@ export default function Dashboard() {
   const [launcherTableSort, setLauncherTableSort] = useState({ key: null, dir: 'asc' });
   const [error, setError] = useState('');
   const [copiedToken, setCopiedToken] = useState(null);
+  const [authRouteBusy, setAuthRouteBusy] = useState(null);
+  const [authRouteForm, setAuthRouteForm] = useState({
+    username: '',
+    label: '',
+    enabled: true,
+    egressType: 'ovpn',
+    ovpn: '',
+    upstreamProxyId: '',
+  });
 
   const [showCreateEntry, setShowCreateEntry] = useState(false);
   const [newEntryId, setNewEntryId] = useState('');
@@ -792,6 +801,329 @@ export default function Dashboard() {
       toast({ title: 'Copy failed', message: err?.message || 'Could not copy value.', variant: 'danger' });
     }
   };
+
+  const authRouting = status.authRouting?.enabled ? status.authRouting : null;
+
+  const resetAuthRouteForm = () => {
+    setAuthRouteForm({
+      username: '',
+      label: '',
+      enabled: true,
+      egressType: 'ovpn',
+      ovpn: '',
+      upstreamProxyId: '',
+    });
+  };
+
+  const loadAuthRouteForEdit = (route) => {
+    const egress = route.egress || {};
+    setAuthRouteForm({
+      username: route.username || '',
+      label: route.label || route.username || '',
+      enabled: route.enabled !== false,
+      egressType: egress.type === 'upstream' ? 'upstream' : 'ovpn',
+      ovpn: egress.type === 'ovpn' ? egress.ovpn || '' : '',
+      upstreamProxyId: egress.type === 'upstream' ? egress.upstreamProxyId || '' : '',
+    });
+  };
+
+  const saveAuthRoute = async (event) => {
+    event.preventDefault();
+    const username = authRouteForm.username.trim();
+    if (!username) {
+      setError('Username is required.');
+      return;
+    }
+    const payload = {
+      username,
+      label: authRouteForm.label.trim() || username,
+      enabled: authRouteForm.enabled,
+      egress:
+        authRouteForm.egressType === 'upstream'
+          ? { type: 'upstream', upstreamProxyId: authRouteForm.upstreamProxyId }
+          : { type: 'ovpn', ovpn: authRouteForm.ovpn },
+    };
+    setAuthRouteBusy(`save:${username}`);
+    setError('');
+    try {
+      const res = await fetch('/api/auth-route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to save route');
+        return;
+      }
+      await refreshStatus();
+      resetAuthRouteForm();
+      toast({ title: 'Route saved', message: username, variant: 'success' });
+    } catch (err) {
+      setError('Failed to save route: ' + err.message);
+    } finally {
+      setAuthRouteBusy(null);
+    }
+  };
+
+  const runAuthRouteAction = async (username, action) => {
+    const endpoint =
+      action === 'delete'
+        ? '/api/auth-route-delete'
+        : action === 'restart'
+          ? '/api/auth-route-restart'
+          : action === 'stop'
+            ? '/api/auth-route-stop'
+            : '/api/auth-route-start';
+    if (action === 'delete') {
+      const ok = await confirmAction({
+        title: 'Delete Route',
+        message: `Delete ${username}? Running workers for this route will be stopped.`,
+        confirmText: 'Delete',
+        variant: 'danger',
+      });
+      if (!ok) return;
+    }
+    setAuthRouteBusy(`${action}:${username}`);
+    setError('');
+    try {
+      const res = await fetch(`${endpoint}?username=${encodeURIComponent(username)}`, { method: 'POST' });
+      const data = await res.json();
+      if (!data.ok) {
+        const detail = Array.isArray(data.results)
+          ? data.results.filter((r) => !r.ok).map((r) => `${r.scheme}: ${r.error}`).join('; ')
+          : '';
+        setError(data.error || detail || `Failed to ${action} route`);
+        return;
+      }
+      await refreshStatus();
+      toast({ title: 'Route updated', message: `${action}: ${username}`, variant: 'success' });
+    } catch (err) {
+      setError(`Failed to ${action} route: ` + err.message);
+    } finally {
+      setAuthRouteBusy(null);
+    }
+  };
+
+  if (authRouting) {
+    const authHost = authRouting.clientProxyHost || status.clientProxyHost || '127.0.0.1';
+    const authPassword = authRouting.globalPassword || '';
+    const httpPort = authRouting.httpPort || 58080;
+    const socksPort = authRouting.socksPort || 58081;
+    const routes = Array.isArray(authRouting.routes) ? authRouting.routes : [];
+    const routeProxyUrl = (scheme, username, port) =>
+      `${scheme}://${encUrl(username)}:${encUrl(authPassword)}@${authHost}:${port}`;
+
+    return (
+      <div className="dashboard">
+        {error && <div className="dashboard-error dashboard-error-global">{error}</div>}
+        {ovpnFiles.length === 0 && ovpnFilesHint && (
+          <div className="dashboard-ovpn-hint dashboard-ovpn-hint-global" role="status">
+            <span className="material-symbols-outlined">folder_off</span>
+            <div>
+              <strong>No .ovpn files listed</strong>
+              <p className="text-muted text-sm mt-1 mb-0">{ovpnFilesHint}</p>
+            </div>
+          </div>
+        )}
+
+        <section className="card p-0 overflow-hidden dashboard-running-proxies">
+          <div className="table-header">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-primary">route</span>
+              <h3 className="font-bold">Auth routes</h3>
+            </div>
+            <span className="badge-primary">{routes.length} ROUTES</span>
+          </div>
+          <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
+            HTTP listens on <code className="text-mono">{httpPort}</code> and SOCKS5 listens on{' '}
+            <code className="text-mono">{socksPort}</code>. Username selects the route.
+          </p>
+          <div className="table-container">
+            <table className="data-table dashboard-copy-table">
+              <thead>
+                <tr>
+                  <th>Route</th>
+                  <th>Egress</th>
+                  <th>Status</th>
+                  <th>HTTP URL</th>
+                  <th>SOCKS5 URL</th>
+                  <th className="text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {routes.length === 0 ? (
+                  <tr>
+                    <td colSpan="6" className="text-center p-6 text-muted">No auth routes configured.</td>
+                  </tr>
+                ) : (
+                  routes.map((route) => {
+                    const httpState = route.protocols?.http?.status || 'inactive';
+                    const socksState = route.protocols?.socks5?.status || 'inactive';
+                    const httpUrl = routeProxyUrl('http', route.username, httpPort);
+                    const socksUrl = routeProxyUrl('socks5', route.username, socksPort);
+                    const busy = authRouteBusy && authRouteBusy.endsWith(`:${route.username}`);
+                    return (
+                      <tr key={route.username} className={route.enabled ? undefined : 'opacity-60'}>
+                        <td data-label="Route">
+                          <div className="flex flex-col gap-1">
+                            <span className="font-bold">{route.label || route.username}</span>
+                            <button
+                              type="button"
+                              className="dashboard-copy-line text-mono"
+                              onClick={() => copyProxyLine(route.username, `auth-user-${route.username}`)}
+                            >
+                              <span className="dashboard-copy-code">{route.username}</span>
+                              {copiedToken === `auth-user-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                            </button>
+                            {!route.enabled && <span className="status-inactive">Disabled</span>}
+                          </div>
+                        </td>
+                        <td data-label="Egress">
+                          <div className="dashboard-ovpn-cell">
+                            <span className="dashboard-egress-kind">
+                              {route.egress?.type === 'upstream' ? 'Upstream Proxy' : route.egress?.type === 'ovpn' ? 'OpenVPN' : 'No egress'}
+                            </span>
+                            <span className="text-mono text-sm">{egressDisplay(route.egress) || 'Not configured'}</span>
+                          </div>
+                        </td>
+                        <td data-label="Status">
+                          <div className="flex flex-col gap-1">
+                            <span className={httpState === 'active' ? 'status-active' : httpState === 'starting' ? 'status-starting' : httpState === 'failed' ? 'status-failed' : 'status-inactive'}>
+                              HTTP: {httpState}
+                            </span>
+                            <span className={socksState === 'active' ? 'status-active' : socksState === 'starting' ? 'status-starting' : socksState === 'failed' ? 'status-failed' : 'status-inactive'}>
+                              SOCKS: {socksState}
+                            </span>
+                          </div>
+                        </td>
+                        <td data-label="HTTP URL">
+                          <button type="button" className="dashboard-copy-line" onClick={() => copyProxyLine(httpUrl, `auth-http-${route.username}`)}>
+                            <code className="dashboard-copy-code">{httpUrl}</code>
+                            {copiedToken === `auth-http-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                          </button>
+                        </td>
+                        <td data-label="SOCKS5 URL">
+                          <button type="button" className="dashboard-copy-line" onClick={() => copyProxyLine(socksUrl, `auth-socks-${route.username}`)}>
+                            <code className="dashboard-copy-code">{socksUrl}</code>
+                            {copiedToken === `auth-socks-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                          </button>
+                        </td>
+                        <td className="text-right" data-label="Actions">
+                          <div className="dashboard-row-actions">
+                            <button type="button" className="btn-primary" disabled={busy || !route.enabled} onClick={() => runAuthRouteAction(route.username, 'start')}>
+                              Start
+                            </button>
+                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => runAuthRouteAction(route.username, 'restart')}>
+                              Restart
+                            </button>
+                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => runAuthRouteAction(route.username, 'stop')}>
+                              Stop
+                            </button>
+                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => loadAuthRouteForEdit(route)}>
+                              <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
+                            </button>
+                            <button type="button" className="btn-danger" disabled={busy} onClick={() => runAuthRouteAction(route.username, 'delete')}>
+                              <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>delete</span>
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card p-4 mt-4">
+          <div className="table-header px-0 pt-0">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-primary">tune</span>
+              <h3 className="font-bold">Route config</h3>
+            </div>
+          </div>
+          <form className="dashboard-modal-body" onSubmit={saveAuthRoute}>
+            <div className="form-grid">
+              <label className="form-field">
+                <span>Username</span>
+                <input
+                  className="input"
+                  value={authRouteForm.username}
+                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, username: e.target.value }))}
+                  placeholder="us_chicago"
+                />
+              </label>
+              <label className="form-field">
+                <span>Label</span>
+                <input
+                  className="input"
+                  value={authRouteForm.label}
+                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, label: e.target.value }))}
+                  placeholder="US Chicago"
+                />
+              </label>
+              <label className="form-field">
+                <span>Egress</span>
+                <select
+                  className="input"
+                  value={authRouteForm.egressType}
+                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, egressType: e.target.value }))}
+                >
+                  <option value="ovpn">OpenVPN</option>
+                  <option value="upstream">Upstream proxy</option>
+                </select>
+              </label>
+              {authRouteForm.egressType === 'ovpn' ? (
+                <label className="form-field">
+                  <span>OVPN profile</span>
+                  <OvpnFileSelect
+                    files={sortedOvpnFiles}
+                    value={authRouteForm.ovpn}
+                    onChange={(file) => setAuthRouteForm((prev) => ({ ...prev, ovpn: file }))}
+                    placeholder="Select profile..."
+                  />
+                </label>
+              ) : (
+                <label className="form-field">
+                  <span>Upstream proxy</span>
+                  <select
+                    className="input"
+                    value={authRouteForm.upstreamProxyId}
+                    onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, upstreamProxyId: e.target.value }))}
+                  >
+                    <option value="">Select upstream...</option>
+                    {upstreamProxies.map((proxy) => (
+                      <option key={proxy.id} value={proxy.id}>
+                        {proxy.label || proxy.host || proxy.id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <label className="form-field flex-row items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={authRouteForm.enabled}
+                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, enabled: e.target.checked }))}
+                />
+                <span>Enabled</span>
+              </label>
+            </div>
+            <div className="dashboard-row-actions justify-end">
+              <button type="button" className="btn-secondary" onClick={resetAuthRouteForm}>
+                Clear
+              </button>
+              <button type="submit" className="btn-primary" disabled={Boolean(authRouteBusy)}>
+                {authRouteBusy?.startsWith('save:') ? 'Saving...' : 'Save Route'}
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+    );
+  }
 
   return (
     <div className="dashboard">

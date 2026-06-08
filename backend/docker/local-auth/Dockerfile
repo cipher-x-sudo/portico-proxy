@@ -1,0 +1,16 @@
+# Gateway image for the local auth-routing deployment.
+# Build context = ./backend (set by docker-compose.local-auth.yml at repo root).
+FROM python:3.10-slim
+
+RUN pip install --no-cache-dir docker redis PySocks
+
+WORKDIR /app
+COPY gateway.py openvpn_proxy_runner.py backend_docker.py ovpn_filter.py provider_auth.py upstream_proxy.py ./
+
+ENV CONFIG_PATH=/config/openvpn-proxy-config.json
+ENV USE_DOCKER=1
+ENV AUTH_ROUTING_ENABLED=1
+ENV AUTH_HTTP_PORT=58080
+ENV AUTH_SOCKS_PORT=58081
+
+CMD ["python", "gateway.py", "--config", "/config/openvpn-proxy-config.json"]

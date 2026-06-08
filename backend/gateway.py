@@ -12,6 +12,7 @@ if str(_sys_path) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(_sys_path))
 
 import argparse
+import base64
 import errno
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -157,6 +158,9 @@ LOG_BUFFER_MAX = 1000
 log_buffer: List[str] = []
 DEFAULT_PROXY_USERNAME = "huzaifa"
 DEFAULT_PROXY_PASSWORD = "huzaifa"
+AUTH_HTTP_PORT_DEFAULT = 58080
+AUTH_SOCKS_PORT_DEFAULT = 58081
+AUTH_ROUTE_BACKEND_BASE = 60000
 ALLOWED_ASSET_EXTENSIONS = {
     ".ovpn",
     ".crt",
@@ -386,6 +390,157 @@ def _enforce_default_proxy_auth(config: Dict[str, Any]) -> None:
     if not user or not password:
         config["proxyUsername"] = DEFAULT_PROXY_USERNAME
         config["proxyPassword"] = DEFAULT_PROXY_PASSWORD
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def is_auth_routing_enabled(config: Dict[str, Any]) -> bool:
+    if _env_truthy("AUTH_ROUTING_ENABLED"):
+        return True
+    auth_cfg = config.get("authRouting")
+    return isinstance(auth_cfg, dict) and bool(auth_cfg.get("enabled"))
+
+
+def _auth_routing_dict(config: Dict[str, Any]) -> Dict[str, Any]:
+    auth_cfg = config.get("authRouting")
+    return auth_cfg if isinstance(auth_cfg, dict) else {}
+
+
+def _auth_global_password(config: Dict[str, Any]) -> str:
+    env_password = os.environ.get("PROXY_GLOBAL_PASSWORD")
+    if env_password is not None and env_password != "":
+        return env_password
+    auth_cfg = _auth_routing_dict(config)
+    cfg_password = auth_cfg.get("globalPassword")
+    if cfg_password is not None and str(cfg_password) != "":
+        return str(cfg_password)
+    cfg_proxy_password = config.get("proxyPassword")
+    if cfg_proxy_password is not None and str(cfg_proxy_password) != "":
+        return str(cfg_proxy_password)
+    return DEFAULT_PROXY_PASSWORD
+
+
+def _auth_http_port(config: Dict[str, Any]) -> int:
+    raw = (os.environ.get("AUTH_HTTP_PORT") or "").strip()
+    if raw.isdigit():
+        return max(1, min(65535, int(raw)))
+    return max(1, min(65535, _cfg_int(_auth_routing_dict(config).get("httpPort"), AUTH_HTTP_PORT_DEFAULT)))
+
+
+def _auth_socks_port(config: Dict[str, Any]) -> int:
+    raw = (os.environ.get("AUTH_SOCKS_PORT") or "").strip()
+    if raw.isdigit():
+        return max(1, min(65535, int(raw)))
+    return max(1, min(65535, _cfg_int(_auth_routing_dict(config).get("socksPort"), AUTH_SOCKS_PORT_DEFAULT)))
+
+
+def _normalize_auth_route_egress(route: Dict[str, Any]) -> Dict[str, str]:
+    egress = route.get("egress") if isinstance(route.get("egress"), dict) else {}
+    egress_type = (str(egress.get("type") or route.get("egressType") or "")).strip().lower()
+    ovpn = (str(egress.get("ovpn") or route.get("ovpn") or "")).strip()
+    upstream_id = (
+        str(egress.get("upstreamProxyId") or route.get("upstreamProxyId") or "")
+    ).strip()
+    if egress_type == "upstream" or upstream_id:
+        return {"type": "upstream", "upstreamProxyId": upstream_id} if upstream_id else {"type": "none"}
+    if egress_type == "ovpn" or ovpn:
+        return {"type": "ovpn", "ovpn": ovpn} if ovpn else {"type": "none"}
+    return {"type": "none"}
+
+
+def normalize_auth_routes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    auth_cfg = _auth_routing_dict(config)
+    raw_routes = auth_cfg.get("routes") if isinstance(auth_cfg.get("routes"), list) else []
+    routes: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for idx, raw in enumerate(raw_routes):
+        if not isinstance(raw, dict):
+            continue
+        username = (str(raw.get("username") or "")).strip()
+        if not username or username in seen:
+            continue
+        seen.add(username)
+        label = (str(raw.get("label") or username)).strip() or username
+        enabled = raw.get("enabled")
+        if enabled is None:
+            enabled = True
+        routes.append(
+            {
+                "index": len(routes),
+                "username": username,
+                "label": label,
+                "enabled": bool(enabled),
+                "egress": _normalize_auth_route_egress(raw),
+            }
+        )
+    return routes
+
+
+def _auth_route_backend_key(route_index: int, scheme: str) -> int:
+    offset = 1 if (scheme or "").lower() == "socks5" else 0
+    return AUTH_ROUTE_BACKEND_BASE + (route_index * 2) + offset
+
+
+def _auth_route_location_config(routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    locations: List[Dict[str, Any]] = []
+    for route in routes:
+        egress = route.get("egress") or {}
+        locations.append(
+            {
+                "label": route.get("label") or route.get("username") or "",
+                "ovpn": egress.get("ovpn", "") if egress.get("type") == "ovpn" else "",
+            }
+        )
+    return locations
+
+
+def _auth_route_by_username(
+    routes: Iterable[Dict[str, Any]],
+    username: str,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    target = (username or "").strip()
+    for idx, route in enumerate(routes):
+        if (route.get("username") or "").strip() == target:
+            return idx, route
+    return None
+
+
+def _route_password_matches(expected: str, supplied: str) -> bool:
+    return secrets.compare_digest(str(expected or ""), str(supplied or ""))
+
+
+def _persist_auth_routes_config(config_path: Path, state: Dict[str, Any], routes: List[Dict[str, Any]]) -> Optional[str]:
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        return f"Could not read config: {e}"
+    if not isinstance(cfg, dict):
+        return "Config root must be an object"
+    auth_cfg = cfg.get("authRouting")
+    if not isinstance(auth_cfg, dict):
+        auth_cfg = {}
+    auth_cfg["enabled"] = True
+    auth_cfg["httpPort"] = int(state.get("auth_http_port") or AUTH_HTTP_PORT_DEFAULT)
+    auth_cfg["socksPort"] = int(state.get("auth_socks_port") or AUTH_SOCKS_PORT_DEFAULT)
+    auth_cfg["routes"] = [
+        {
+            "username": route.get("username") or "",
+            "label": route.get("label") or route.get("username") or "",
+            "enabled": bool(route.get("enabled", True)),
+            "egress": dict(route.get("egress") or {"type": "none"}),
+        }
+        for route in routes
+    ]
+    cfg["authRouting"] = auth_cfg
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError as e:
+        return str(e)
+    return None
 
 
 def apply_openvpn_auth_env(config: Dict[str, Any]) -> None:
@@ -1925,6 +2080,464 @@ def forward(
             pass
 
 
+def _relay_existing_sockets(
+    client_sock: socket.socket,
+    backend_sock: socket.socket,
+    slot: Optional[Dict[str, Any]],
+    lock: threading.Lock,
+) -> None:
+    try:
+        client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        backend_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    client_sock.settimeout(300)
+    backend_sock.settimeout(300)
+
+    def update_activity() -> None:
+        if slot and lock:
+            with lock:
+                slot["last_activity"] = time.monotonic()
+
+    def pump(a: socket.socket, b: socket.socket) -> bool:
+        try:
+            data = a.recv(65536)
+            if not data:
+                return False
+            b.sendall(data)
+            update_activity()
+            return True
+        except (BlockingIOError, socket.error):
+            return True
+        except Exception:
+            return False
+
+    try:
+        while True:
+            r, _, _ = select.select([client_sock, backend_sock], [], [], 30)
+            if not r:
+                continue
+            for s in r:
+                if s is client_sock:
+                    if not pump(client_sock, backend_sock):
+                        return
+                elif not pump(backend_sock, client_sock):
+                    return
+    except Exception:
+        pass
+    finally:
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+        try:
+            backend_sock.close()
+        except Exception:
+            pass
+
+
+def _auth_route_launch_config(state: Dict[str, Any]) -> Dict[str, Any]:
+    config = dict(state.get("auth_runtime_config") or {})
+    routes = list(state.get("auth_routes") or [])
+    config["locations"] = _auth_route_location_config(routes)
+    config["internalProxyAuthEnabled"] = False
+    config["proxyUsername"] = ""
+    config["proxyPassword"] = ""
+    return config
+
+
+def _start_auth_route_backend(
+    state: Dict[str, Any],
+    route_index: int,
+    scheme: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    routes = list(state.get("auth_routes") or [])
+    if route_index < 0 or route_index >= len(routes):
+        return None, "Route not found"
+    route = routes[route_index]
+    if not bool(route.get("enabled", True)):
+        return None, "Route is disabled"
+    scheme = "socks5" if scheme == "socks5" else "http"
+    backend_key = _auth_route_backend_key(route_index, scheme)
+    use_docker = bool(state.get("use_docker"))
+    with state["lock"]:
+        existing = state["port_to_slot"].get(backend_key)
+        if existing and is_backend_running(existing, use_docker):
+            existing["last_activity"] = time.monotonic()
+            return existing, None
+
+    launch_config = _auth_route_launch_config(state)
+    egress = dict(route.get("egress") or {})
+    upstream_profiles = state.get("upstream_profiles_by_id") or {}
+    upstream_profile = upstream_profiles.get((egress.get("upstreamProxyId") or "").strip())
+    validation_err = validate_port_egress(
+        launch_config,
+        state["config_path"],
+        route_index,
+        use_docker,
+        egress,
+        upstream_profiles,
+    )
+    if validation_err:
+        return None, validation_err
+
+    with state["lock"]:
+        slot = state["port_to_slot"].get(backend_key)
+        if slot is None:
+            for candidate in state["slots"]:
+                if candidate.get("external_port") is None:
+                    slot = candidate
+                    break
+        if slot is None and len([s for s in state["slots"] if s.get("external_port") is not None]) >= state["max_slots"]:
+            used = [s for s in state["slots"] if s.get("external_port") is not None]
+            oldest = min(used, key=lambda s: s["last_activity"])
+            old_key = oldest.get("external_port")
+            if old_key is not None:
+                state["port_to_slot"].pop(old_key, None)
+            teardown_slot(oldest, use_docker)
+            slot = oldest
+        if slot is None:
+            if len(state["slots"]) >= state["max_slots"]:
+                return None, "No available slot capacity"
+            slot = {
+                "internal_port": int(state.get("internal_port_base", 51000)) + len(state["slots"]),
+                "location_index": None,
+                "openvpn_process": None,
+                "proxy_process": None,
+                "log_path": "",
+                "auth_path": "",
+                "backend_host": None,
+                "backend_port": None,
+                "container_name": None,
+                "last_activity": time.monotonic(),
+                "external_port": None,
+                "proxy_type": None,
+                "egress_type": None,
+                "route_username": None,
+            }
+            state["slots"].append(slot)
+        slot["location_index"] = route_index
+        slot["external_port"] = backend_key
+        slot["proxy_type"] = scheme
+        slot["route_username"] = route.get("username") or ""
+        state["port_to_slot"][backend_key] = slot
+        state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "starting"
+
+    try:
+        if use_docker:
+            from backend_docker import start_docker_backend
+
+            backend_host, _ = start_docker_backend(
+                route_index,
+                backend_key,
+                launch_config,
+                state.get("docker_image") or os.environ.get("DOCKER_IMAGE", "portico-worker"),
+                state.get("docker_network") or os.environ.get("DOCKER_NETWORK", "proxynet"),
+                state.get("ovpn_volume_name") or os.environ.get("DOCKER_OVPN_VOLUME", "ovpn_data"),
+                proxy_listen_scheme=scheme,
+                upstream_profile=upstream_profile if egress.get("type") == "upstream" else None,
+            )
+            with state["lock"]:
+                slot["backend_host"] = backend_host
+                slot["backend_port"] = BACKEND_HTTP_PORT
+                slot["container_name"] = backend_host
+                slot["last_activity"] = time.monotonic()
+                slot["egress_type"] = egress.get("type")
+            if not wait_for_backend(backend_host, BACKEND_HTTP_PORT):
+                teardown_slot(slot, use_docker)
+                with state["lock"]:
+                    state["port_to_slot"].pop(backend_key, None)
+                    state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "failed"
+                    state.setdefault("auth_route_error", {})[f"{route.get('username')}:{scheme}"] = "Backend did not become ready in time"
+                return None, "Backend did not become ready in time"
+        else:
+            if egress.get("type") == "upstream" and upstream_profile:
+                openvpn_process = None
+                proxy_process = start_one_upstream_proxy(
+                    launch_config,
+                    slot["internal_port"],
+                    upstream_profile,
+                    listen_scheme=scheme,
+                )
+                log_path = auth_path = ""
+            else:
+                openvpn_process, proxy_process, log_path, auth_path = start_one_location(
+                    launch_config,
+                    route_index,
+                    slot["internal_port"],
+                    state["config_path"],
+                    listen_scheme=scheme,
+                )
+            with state["lock"]:
+                slot["openvpn_process"] = openvpn_process
+                slot["proxy_process"] = proxy_process
+                slot["log_path"] = log_path
+                slot["auth_path"] = auth_path
+                slot["backend_host"] = "127.0.0.1"
+                slot["backend_port"] = slot["internal_port"]
+                slot["last_activity"] = time.monotonic()
+                slot["egress_type"] = egress.get("type")
+            if not wait_for_backend("127.0.0.1", slot["internal_port"]):
+                teardown_slot(slot, use_docker)
+                with state["lock"]:
+                    state["port_to_slot"].pop(backend_key, None)
+                    state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "failed"
+                    state.setdefault("auth_route_error", {})[f"{route.get('username')}:{scheme}"] = "Backend did not become ready in time"
+                return None, "Backend did not become ready in time"
+    except Exception as e:
+        with state["lock"]:
+            teardown_slot(slot, use_docker)
+            state["port_to_slot"].pop(backend_key, None)
+            state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "failed"
+            state.setdefault("auth_route_error", {})[f"{route.get('username')}:{scheme}"] = str(e)
+        return None, str(e)
+
+    with state["lock"]:
+        state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "active"
+        state.setdefault("auth_route_error", {}).pop(f"{route.get('username')}:{scheme}", None)
+    return slot, None
+
+
+def _stop_auth_route_backends(
+    state: Dict[str, Any],
+    username: str,
+    scheme: str = "both",
+) -> bool:
+    routes = list(state.get("auth_routes") or [])
+    found = _auth_route_by_username(routes, username)
+    if not found:
+        return False
+    route_index, route = found
+    schemes = ["http", "socks5"] if scheme == "both" else ["socks5" if scheme == "socks5" else "http"]
+    with state["lock"]:
+        for item in schemes:
+            key = _auth_route_backend_key(route_index, item)
+            slot = state["port_to_slot"].pop(key, None)
+            if slot is not None:
+                teardown_slot(slot, bool(state.get("use_docker")))
+            state.setdefault("auth_route_state", {})[f"{route.get('username')}:{item}"] = "inactive"
+            state.setdefault("auth_route_error", {}).pop(f"{route.get('username')}:{item}", None)
+    return True
+
+
+def _read_http_proxy_initial(client_sock: socket.socket) -> bytes:
+    data = b""
+    client_sock.settimeout(5)
+    while b"\r\n\r\n" not in data and len(data) < BUFFER_SIZE:
+        chunk = client_sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    client_sock.settimeout(300)
+    return data
+
+
+def parse_http_proxy_basic_auth(initial_data: bytes) -> Tuple[str, str, Optional[str]]:
+    header_block = initial_data.split(b"\r\n\r\n", 1)[0]
+    auth_value = ""
+    for raw_line in header_block.split(b"\r\n")[1:]:
+        if raw_line.lower().startswith(b"proxy-authorization:"):
+            auth_value = raw_line.split(b":", 1)[1].decode("latin-1", errors="replace").strip()
+            break
+    if not auth_value:
+        return "", "", "Missing Proxy-Authorization header"
+    scheme, _, token = auth_value.partition(" ")
+    if scheme.lower() != "basic" or not token.strip():
+        return "", "", "Proxy-Authorization must use Basic auth"
+    try:
+        decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+    except Exception:
+        return "", "", "Invalid Basic auth token"
+    username, sep, password = decoded.partition(":")
+    if not sep or not username:
+        return "", "", "Basic auth must contain username and password"
+    return username, password, None
+
+
+def strip_proxy_authorization_header(initial_data: bytes) -> bytes:
+    head, sep, tail = initial_data.partition(b"\r\n\r\n")
+    if not sep:
+        return initial_data
+    lines = head.split(b"\r\n")
+    filtered = [lines[0]]
+    filtered.extend(
+        line for line in lines[1:] if not line.lower().startswith(b"proxy-authorization:")
+    )
+    return b"\r\n".join(filtered) + sep + tail
+
+
+def _send_http_proxy_auth_required(client_sock: socket.socket, message: str = "Proxy authentication required") -> None:
+    body = (message + "\n").encode("utf-8")
+    resp = (
+        b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+        b'Proxy-Authenticate: Basic realm="Portico"\r\n'
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+        + body
+    )
+    try:
+        client_sock.sendall(resp)
+    except Exception:
+        pass
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        data += chunk
+    return data
+
+
+def _read_socks5_request(sock: socket.socket) -> bytes:
+    head = _recv_exact(sock, 4)
+    if len(head) != 4 or head[0] != 5:
+        raise ValueError("Invalid SOCKS5 request")
+    atyp = head[3]
+    if atyp == 1:
+        addr = _recv_exact(sock, 4)
+    elif atyp == 3:
+        ln = _recv_exact(sock, 1)
+        addr = ln + _recv_exact(sock, ln[0])
+    elif atyp == 4:
+        addr = _recv_exact(sock, 16)
+    else:
+        raise ValueError("Unsupported SOCKS5 address type")
+    port = _recv_exact(sock, 2)
+    return head + addr + port
+
+
+def _read_socks5_response(sock: socket.socket) -> bytes:
+    return _read_socks5_request(sock)
+
+
+def _send_socks5_reply(sock: socket.socket, code: int) -> None:
+    try:
+        sock.sendall(bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
+    except Exception:
+        pass
+
+
+def _auth_route_for_credentials(
+    state: Dict[str, Any],
+    username: str,
+    password: str,
+) -> Tuple[Optional[int], Optional[Dict[str, Any]], Optional[str]]:
+    if not _route_password_matches(state.get("auth_global_password") or "", password):
+        return None, None, "Invalid username or password"
+    found = _auth_route_by_username(state.get("auth_routes") or [], username)
+    if not found:
+        return None, None, "Unknown route username"
+    route_index, route = found
+    if not bool(route.get("enabled", True)):
+        return None, None, "Route is disabled"
+    return route_index, route, None
+
+
+def handle_auth_http_connection(client_sock: socket.socket, state: Dict[str, Any]) -> None:
+    try:
+        initial_data = _read_http_proxy_initial(client_sock)
+        username, password, auth_err = parse_http_proxy_basic_auth(initial_data)
+        if auth_err:
+            _send_http_proxy_auth_required(client_sock, auth_err)
+            return
+        route_index, route, route_err = _auth_route_for_credentials(state, username, password)
+        if route_err or route is None or route_index is None:
+            _send_http_proxy_auth_required(client_sock, route_err or "Proxy authentication failed")
+            return
+        slot, start_err = _start_auth_route_backend(state, route_index, "http")
+        if start_err or slot is None:
+            _send_http_proxy_auth_required(client_sock, start_err or "Route backend unavailable")
+            return
+        backend_host = slot.get("backend_host")
+        backend_port = slot.get("backend_port")
+        if not backend_host or not backend_port:
+            _send_http_proxy_auth_required(client_sock, "Route backend unavailable")
+            return
+        forward(
+            client_sock,
+            str(backend_host),
+            int(backend_port),
+            strip_proxy_authorization_header(initial_data),
+            slot,
+            state["lock"],
+        )
+    finally:
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+
+
+def handle_auth_socks_connection(client_sock: socket.socket, state: Dict[str, Any]) -> None:
+    backend_sock: Optional[socket.socket] = None
+    try:
+        client_sock.settimeout(30)
+        greeting = _recv_exact(client_sock, 2)
+        if len(greeting) != 2 or greeting[0] != 5:
+            return
+        methods = _recv_exact(client_sock, greeting[1])
+        if 2 not in methods:
+            client_sock.sendall(b"\x05\xff")
+            return
+        client_sock.sendall(b"\x05\x02")
+        auth_head = _recv_exact(client_sock, 2)
+        if len(auth_head) != 2 or auth_head[0] != 1:
+            client_sock.sendall(b"\x01\x01")
+            return
+        username = _recv_exact(client_sock, auth_head[1]).decode("utf-8", errors="replace")
+        pass_len = _recv_exact(client_sock, 1)[0]
+        password = _recv_exact(client_sock, pass_len).decode("utf-8", errors="replace")
+        route_index, route, route_err = _auth_route_for_credentials(state, username, password)
+        if route_err or route is None or route_index is None:
+            client_sock.sendall(b"\x01\x01")
+            return
+        client_sock.sendall(b"\x01\x00")
+        request = _read_socks5_request(client_sock)
+        if request[1] != 1:
+            _send_socks5_reply(client_sock, 7)
+            return
+        slot, start_err = _start_auth_route_backend(state, route_index, "socks5")
+        if start_err or slot is None:
+            _send_socks5_reply(client_sock, 1)
+            return
+        backend_host = slot.get("backend_host")
+        backend_port = slot.get("backend_port")
+        if not backend_host or not backend_port:
+            _send_socks5_reply(client_sock, 1)
+            return
+
+        backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        backend_sock.settimeout(30)
+        backend_sock.connect((str(backend_host), int(backend_port)))
+        backend_sock.sendall(b"\x05\x01\x00")
+        backend_greeting = _recv_exact(backend_sock, 2)
+        if backend_greeting != b"\x05\x00":
+            _send_socks5_reply(client_sock, 1)
+            return
+        backend_sock.sendall(request)
+        response = _read_socks5_response(backend_sock)
+        client_sock.sendall(response)
+        if len(response) >= 2 and response[1] != 0:
+            return
+        _relay_existing_sockets(client_sock, backend_sock, slot, state["lock"])
+        backend_sock = None
+    except Exception:
+        pass
+    finally:
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+        if backend_sock is not None:
+            try:
+                backend_sock.close()
+            except Exception:
+                pass
+
+
 def handle_connection(
     client_sock: socket.socket,
     external_port: int,
@@ -2248,17 +2861,33 @@ def idle_eviction_loop(
             for slot in slots:
                 if slot.get("external_port") is not None and (now - slot.get("last_activity", 0)) > idle_timeout_seconds:
                     to_evict.append(slot)
-            evicted_ports = [port_base + s["location_index"] for s in to_evict]
+            evicted_ports = [
+                s.get("external_port")
+                if s.get("external_port") is not None
+                else port_base + s["location_index"]
+                for s in to_evict
+            ]
             for slot in to_evict:
-                loc = slot["location_index"]
-                port_to_slot.pop(port_base + loc, None)
+                ep = slot.get("external_port")
+                loc = slot.get("location_index")
+                if ep is not None:
+                    port_to_slot.pop(ep, None)
+                elif loc is not None:
+                    port_to_slot.pop(port_base + loc, None)
                 teardown_slot(slot, use_docker)
                 slot["external_port"] = None
                 slot["location_index"] = None
             for ep in evicted_ports:
-                state["active_ports"].discard(ep)
-                state["activation_state_by_port"][ep] = "inactive"
-                state["activation_error_by_port"].pop(ep, None)
+                if state.get("auth_routing"):
+                    for route in state.get("auth_routes") or []:
+                        for scheme in ("http", "socks5"):
+                            if ep == _auth_route_backend_key(int(route.get("index") or 0), scheme):
+                                state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "inactive"
+                                state.setdefault("auth_route_error", {}).pop(f"{route.get('username')}:{scheme}", None)
+                else:
+                    state["active_ports"].discard(ep)
+                    state["activation_state_by_port"][ep] = "inactive"
+                    state["activation_error_by_port"].pop(ep, None)
             if to_evict:
                 _log(f"Evicted {len(to_evict)} idle slot(s): {evicted_ports}")
         if to_evict:
@@ -3036,8 +3665,53 @@ def _control_api_handler_factory(
                 client_proxy_host = wan if wan else "127.0.0.1"
             else:
                 client_proxy_host = listen_h
+            auth_payload: Dict[str, Any] = {"enabled": False}
+            if state.get("auth_routing"):
+                auth_routes_public: List[Dict[str, Any]] = []
+                with lock:
+                    route_state = dict(state.get("auth_route_state") or {})
+                    route_error = dict(state.get("auth_route_error") or {})
+                    slots_by_key = dict(state.get("port_to_slot") or {})
+                    routes_snapshot = list(state.get("auth_routes") or [])
+                    upstream_profiles_snapshot = dict(state.get("upstream_profiles_by_id") or {})
+                for idx, route in enumerate(routes_snapshot):
+                    protocol_state: Dict[str, Any] = {}
+                    for scheme in ("http", "socks5"):
+                        slot_key = _auth_route_backend_key(idx, scheme)
+                        slot = slots_by_key.get(slot_key)
+                        running = bool(slot and is_backend_running(slot, bool(state.get("use_docker"))))
+                        status_value = "active" if running else route_state.get(f"{route.get('username')}:{scheme}", "inactive")
+                        if not running and status_value == "active":
+                            status_value = "inactive"
+                        last = slot.get("last_activity") if slot else 0
+                        age_seconds = max(0.0, now - last) if last else 0.0
+                        protocol_state[scheme] = {
+                            "status": status_value,
+                            "running": running,
+                            "lastActivityAgeSeconds": round(age_seconds, 1),
+                            "error": route_error.get(f"{route.get('username')}:{scheme}", ""),
+                            "containerName": slot.get("container_name") if slot else "",
+                        }
+                    auth_routes_public.append(
+                        {
+                            "username": route.get("username") or "",
+                            "label": route.get("label") or route.get("username") or "",
+                            "enabled": bool(route.get("enabled", True)),
+                            "egress": _public_egress(route.get("egress"), upstream_profiles_snapshot),
+                            "protocols": protocol_state,
+                        }
+                    )
+                auth_payload = {
+                    "enabled": True,
+                    "httpPort": state.get("auth_http_port"),
+                    "socksPort": state.get("auth_socks_port"),
+                    "clientProxyHost": client_proxy_host,
+                    "globalPassword": state.get("auth_global_password") or "",
+                    "routes": auth_routes_public,
+                }
             self._send_json({
                 "running": True,
+                "authRouting": auth_payload,
                 "portBase": state["port_base"],
                 "publishedPortBase": state.get("published_port_base"),
                 "dockerPublishedHostPortFirst": state.get("docker_published_host_port_first"),
@@ -3556,6 +4230,173 @@ def _control_api_handler_factory(
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, status=500)
 
+        def _require_auth_routing(self) -> bool:
+            if not state.get("auth_routing"):
+                self._send_error_body("Auth routing mode is not enabled", 404)
+                return False
+            return True
+
+        def _auth_route_from_body(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+            payload, body_err = self._read_json_body(64 * 1024)
+            if body_err or payload is None:
+                return None, body_err or "Invalid body"
+            username = (str(payload.get("username") or "")).strip()
+            if not username:
+                return None, "username is required"
+            if any(c.isspace() for c in username) or any(c in username for c in ":/@\\\r\n\x00"):
+                return None, "username must not contain spaces, URL separators, or control characters"
+            label = (str(payload.get("label") or username)).strip() or username
+            enabled = payload.get("enabled")
+            if enabled is None:
+                enabled = True
+            egress = _normalize_auth_route_egress(payload)
+            route = {
+                "index": 0,
+                "username": username,
+                "label": label,
+                "enabled": bool(enabled),
+                "egress": egress,
+            }
+            if egress.get("type") == "ovpn":
+                ovpn = (egress.get("ovpn") or "").strip()
+                if Path(ovpn).suffix.lower() != ".ovpn" or not _is_safe_relative_ovpn_name(ovpn):
+                    return None, "ovpn must be a safe relative .ovpn path"
+                allowed = list_allowed_ovpn_files(
+                    dict(state.get("auth_runtime_config") or {}),
+                    state["config_path"],
+                    bool(state.get("use_docker")),
+                )
+                if ovpn not in allowed:
+                    return None, "Selected ovpn is not in allowed list"
+            if egress.get("type") == "upstream":
+                upstream_id = (egress.get("upstreamProxyId") or "").strip()
+                if not upstream_id:
+                    return None, "upstreamProxyId is required for upstream routes"
+                if upstream_id not in (state.get("upstream_profiles_by_id") or {}):
+                    return None, f"Upstream proxy profile not found: {upstream_id}"
+            return route, None
+
+        def _handle_post_auth_route(self) -> None:
+            if not self._require_auth_routing():
+                return
+            route, err = self._auth_route_from_body()
+            if err or route is None:
+                self._send_error_body(err or "Invalid route", 400)
+                return
+            with state["lock"]:
+                routes = [dict(r) for r in (state.get("auth_routes") or [])]
+                existing_idx = next(
+                    (i for i, r in enumerate(routes) if (r.get("username") or "") == route["username"]),
+                    None,
+                )
+                if existing_idx is None:
+                    route["index"] = len(routes)
+                    routes.append(route)
+                else:
+                    route["index"] = existing_idx
+                    routes[existing_idx] = route
+                for i, r in enumerate(routes):
+                    r["index"] = i
+            save_err = _persist_auth_routes_config(state["config_path"], state, routes)
+            if save_err:
+                self._send_error_body(save_err, 500)
+                return
+            if existing_idx is not None:
+                _stop_auth_route_backends(state, route["username"], "both")
+            with state["lock"]:
+                state["auth_routes"] = routes
+                runtime = dict(state.get("auth_runtime_config") or {})
+                auth_cfg = dict(_auth_routing_dict(runtime))
+                auth_cfg.update(
+                    {
+                        "enabled": True,
+                        "httpPort": state.get("auth_http_port"),
+                        "socksPort": state.get("auth_socks_port"),
+                        "routes": routes,
+                    }
+                )
+                runtime["authRouting"] = auth_cfg
+                state["auth_runtime_config"] = runtime
+            self._send_json({"ok": True, "route": route})
+
+        def _auth_route_username_from_query(self, query: str) -> Tuple[str, str]:
+            params = urllib.parse.parse_qs(query)
+            username = (params.get("username", [""])[0] or "").strip()
+            scheme = (params.get("scheme", ["both"])[0] or "both").strip().lower()
+            if scheme not in ("http", "socks5", "both"):
+                scheme = "both"
+            return username, scheme
+
+        def _handle_post_auth_route_start(self, query: str) -> None:
+            if not self._require_auth_routing():
+                return
+            username, scheme = self._auth_route_username_from_query(query)
+            if not username:
+                self._send_error_body("Missing username", 400)
+                return
+            found = _auth_route_by_username(state.get("auth_routes") or [], username)
+            if not found:
+                self._send_error_body("Route not found", 404)
+                return
+            route_index, _route = found
+            schemes = ["http", "socks5"] if scheme == "both" else [scheme]
+            results = []
+            for item in schemes:
+                _slot, err = _start_auth_route_backend(state, route_index, item)
+                results.append({"scheme": item, "ok": err is None, "error": err or ""})
+            ok = all(r["ok"] for r in results)
+            self._send_json({"ok": ok, "username": username, "results": results}, status=200 if ok else 400)
+
+        def _handle_post_auth_route_stop(self, query: str) -> None:
+            if not self._require_auth_routing():
+                return
+            username, scheme = self._auth_route_username_from_query(query)
+            if not username:
+                self._send_error_body("Missing username", 400)
+                return
+            if not _stop_auth_route_backends(state, username, scheme):
+                self._send_error_body("Route not found", 404)
+                return
+            self._send_json({"ok": True, "username": username})
+
+        def _handle_post_auth_route_restart(self, query: str) -> None:
+            if not self._require_auth_routing():
+                return
+            username, scheme = self._auth_route_username_from_query(query)
+            if not username:
+                self._send_error_body("Missing username", 400)
+                return
+            if not _stop_auth_route_backends(state, username, scheme):
+                self._send_error_body("Route not found", 404)
+                return
+            self._handle_post_auth_route_start(query)
+
+        def _handle_post_auth_route_delete(self, query: str) -> None:
+            if not self._require_auth_routing():
+                return
+            username, _scheme = self._auth_route_username_from_query(query)
+            if not username:
+                self._send_error_body("Missing username", 400)
+                return
+            if not _stop_auth_route_backends(state, username, "both"):
+                self._send_error_body("Route not found", 404)
+                return
+            with state["lock"]:
+                routes = [
+                    dict(r)
+                    for r in (state.get("auth_routes") or [])
+                    if (r.get("username") or "") != username
+                ]
+                for i, r in enumerate(routes):
+                    r["index"] = i
+            save_err = _persist_auth_routes_config(state["config_path"], state, routes)
+            if save_err:
+                self._send_error_body(save_err, 500)
+                return
+            with state["lock"]:
+                state["auth_routes"] = routes
+            self._send_json({"ok": True, "username": username})
+
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path.rstrip("/")
@@ -3599,6 +4440,16 @@ def _control_api_handler_factory(
                 self._handle_post_set_rotation(parsed.query)
             elif path == "/api/set-upstream-refresh":
                 self._handle_post_set_upstream_refresh(parsed.query)
+            elif path == "/api/auth-route":
+                self._handle_post_auth_route()
+            elif path == "/api/auth-route-start":
+                self._handle_post_auth_route_start(parsed.query)
+            elif path == "/api/auth-route-stop":
+                self._handle_post_auth_route_stop(parsed.query)
+            elif path == "/api/auth-route-restart":
+                self._handle_post_auth_route_restart(parsed.query)
+            elif path == "/api/auth-route-delete":
+                self._handle_post_auth_route_delete(parsed.query)
             else:
                 self.send_error(404)
 
@@ -4508,12 +5359,16 @@ def main() -> int:
         print(f"Invalid locationSpec: {e}", file=sys.stderr)
         return 1
     use_docker = config.get("useDocker") is True or os.environ.get("USE_DOCKER", "").lower() in ("1", "true", "yes")
+    auth_routing = is_auth_routing_enabled(config)
+    auth_routes = normalize_auth_routes(config) if auth_routing else []
 
     locations_raw = list(config.get("locations") or [])
     _log(f"Config loaded: {len(locations_raw)} location row(s) from {config_path}")
-    locations = apply_docker_published_listener_slots(locations_raw, config, use_docker)
+    locations = [] if auth_routing else apply_docker_published_listener_slots(locations_raw, config, use_docker)
     config["locations"] = locations
-    if locations_raw and len(locations) != len(locations_raw):
+    if auth_routing:
+        _log(f"Auth routing mode enabled: {len(auth_routes)} route(s)")
+    elif locations_raw and len(locations) != len(locations_raw):
         _log(
             f"Effective TCP listeners: {len(locations)} (Docker DOCKER_PROXY_CONTAINER_PORT_FIRST/LAST publish span)."
         )
@@ -4521,11 +5376,13 @@ def main() -> int:
     _enforce_default_proxy_auth(config)
     apply_openvpn_auth_env(config)
 
-    if not locations:
+    if not locations and not auth_routing:
         _log(
             "No locations in config (add a locations[] array or a valid locationSpec). "
             "Control API will start so the dashboard can load; add locations and restart the gateway for proxy listeners."
         )
+    if auth_routing and not auth_routes:
+        _log("Auth routing is enabled but no authRouting.routes are configured; proxy auth will reject all routes.")
 
     docker_image = config.get("dockerImage") or os.environ.get("DOCKER_IMAGE", "portico-worker")
     docker_network = config.get("dockerNetwork") or os.environ.get("DOCKER_NETWORK", "proxynet")
@@ -4549,7 +5406,9 @@ def main() -> int:
     if use_docker:
         listen_host = "0.0.0.0"  # must listen on all interfaces so Docker port publishing works
 
-    num_ports = len(locations)
+    num_ports = 0 if auth_routing else len(locations)
+    auth_http_port = _auth_http_port(config) if auth_routing else 0
+    auth_socks_port = _auth_socks_port(config) if auth_routing else 0
     if published_proxy_port_base is not None:
         if num_ports > 0:
             _log(
@@ -4601,10 +5460,31 @@ def main() -> int:
                     pass
             return 1
 
-    if num_ports > 0:
+    auth_sockets_by_scheme: Dict[socket.socket, str] = {}
+    if auth_routing:
+        for port, scheme in ((auth_http_port, "http"), (auth_socks_port, "socks5")):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((listen_host, port))
+                s.listen(128)
+                s.setblocking(False)
+                auth_sockets_by_scheme[s] = scheme
+                listening_sockets.append(s)
+            except OSError as e:
+                print(f"Failed to bind {listen_host}:{port}: {e}", file=sys.stderr)
+                for ss in listening_sockets:
+                    try:
+                        ss.close()
+                    except Exception:
+                        pass
+                return 1
+    elif num_ports > 0:
         _log(f"Listening on {listen_host}:{port_base}-{port_base + num_ports - 1} ({num_ports} ports)")
     else:
         _log("No proxy listener ports (0 locations); control API only.")
+    if auth_routing:
+        _log(f"Auth proxy listeners: HTTP {listen_host}:{auth_http_port}, SOCKS5 {listen_host}:{auth_socks_port}")
     _log(f"Backend: {'Docker' if use_docker else 'local'}; max_slots={max_slots} idle_timeout={idle_timeout_minutes}min")
 
     slots: List[Dict[str, Any]] = []
@@ -4698,6 +5578,18 @@ def main() -> int:
         "max_slots": max_slots,
         "idle_timeout_minutes": idle_timeout_minutes,
         "use_docker": use_docker,
+        "auth_routing": auth_routing,
+        "auth_routes": auth_routes,
+        "auth_global_password": _auth_global_password(config),
+        "auth_http_port": auth_http_port,
+        "auth_socks_port": auth_socks_port,
+        "auth_runtime_config": dict(config),
+        "auth_route_state": {},
+        "auth_route_error": {},
+        "internal_port_base": internal_port_base,
+        "docker_image": docker_image,
+        "docker_network": docker_network,
+        "ovpn_volume_name": ovpn_volume_name,
         "locations": locations,
         "listen_host": listen_host,
         "control_port": max(0, _cfg_int(config.get("controlPort"), CONTROL_PORT_DEFAULT)),
@@ -4732,7 +5624,7 @@ def main() -> int:
     )
     upstream_refresh_thread.start()
 
-    if auto_activate_on_startup and _loaded_active_ports:
+    if auto_activate_on_startup and _loaded_active_ports and not auth_routing:
         _enforce_default_proxy_auth(config)
         _log(
             f"autoActivateOnStartup: bringing up {len(_loaded_active_ports)} persisted listener port(s)"
@@ -4782,7 +5674,7 @@ def main() -> int:
         control_thread.start()
         _log(f"Control GUI: http://0.0.0.0:{control_port}")
 
-    server_sockets = list(sockets_by_port.values())
+    server_sockets = list(auth_sockets_by_scheme.keys()) if auth_routing else list(sockets_by_port.values())
     global shutdown_flag
 
     def _on_shutdown_signal(signum: int, frame: Any) -> None:
@@ -4798,6 +5690,16 @@ def main() -> int:
         try:
             client_sock, _ = sock.accept()
         except OSError:
+            return
+        if auth_routing and sock in auth_sockets_by_scheme:
+            scheme = auth_sockets_by_scheme[sock]
+            target = handle_auth_socks_connection if scheme == "socks5" else handle_auth_http_connection
+            t = threading.Thread(
+                target=target,
+                args=(client_sock, gateway_state),
+                daemon=True,
+            )
+            t.start()
             return
         port = port_base
         for p, s in sockets_by_port.items():
