@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from provider_auth import load_provider_auth
@@ -17,10 +18,45 @@ WORKER_CONTAINER_LABEL = "portico.proxy.worker"
 _PROXY_NAME_RE = re.compile(r"^proxy-\d+$")
 DEFAULT_PROXY_USERNAME = "huzaifa"
 DEFAULT_PROXY_PASSWORD = "huzaifa"
+CONTAINER_NAME_RELEASE_TIMEOUT_SECONDS = 5.0
+CONTAINER_NAME_RELEASE_POLL_SECONDS = 0.1
 
 
 def _log(msg: str) -> None:
     print(f"[Docker backend] {msg}", flush=True, file=sys.stderr)
+
+
+def _is_not_found_error(err: Exception) -> bool:
+    err_str = str(err).strip().lower()
+    return "404" in err_str or "no such container" in err_str or "not found" in err_str
+
+
+def _is_container_name_conflict(err: Exception, container_name: str) -> bool:
+    err_str = str(err).strip().lower()
+    name_variants = (container_name.lower(), f"/{container_name.lower()}")
+    return (
+        ("409" in err_str or "conflict" in err_str)
+        and "already in use" in err_str
+        and any(name in err_str for name in name_variants)
+    )
+
+
+def _wait_for_container_absent(
+    client: Any,
+    container_name: str,
+    timeout_seconds: float = CONTAINER_NAME_RELEASE_TIMEOUT_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            client.containers.get(container_name)
+        except Exception as e:
+            if _is_not_found_error(e):
+                return True
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(CONTAINER_NAME_RELEASE_POLL_SECONDS)
 
 
 def _resolve_network(client: Any, preferred: str) -> str:
@@ -87,7 +123,11 @@ def start_docker_backend(
     auth_pass = ""
     egress_type = "upstream" if upstream_profile else "ovpn"
     if egress_type == "ovpn":
-        provider_auth = load_provider_auth(ovpn_file, Path("/ovpn"))
+        provider_auth = load_provider_auth(
+            ovpn_file,
+            Path("/ovpn"),
+            config.get("_providerCredentials") if isinstance(config.get("_providerCredentials"), dict) else None,
+        )
         auth_user = provider_auth.username
         auth_pass = provider_auth.password
 
@@ -109,13 +149,8 @@ def start_docker_backend(
     resolved_network = _resolve_network(client, docker_network)
     _log(f"Resolved network: {resolved_network}")
 
-    # Remove if a previous container with this name exists (e.g. from a crash)
-    try:
-        old = client.containers.get(container_name)
-        _log(f"Removing existing container: {container_name}")
-        old.remove(force=True)
-    except Exception:
-        pass
+    # Remove if a previous container with this name exists (e.g. from a crash or stale gateway state).
+    remove_worker_container_by_name(container_name, client=client)
 
     scheme = (proxy_listen_scheme or "http").strip().lower()
     if scheme not in ("http", "socks5"):
@@ -135,23 +170,36 @@ def start_docker_backend(
         f"Creating container name={container_name} image={docker_image} network={resolved_network} "
         f"volume={ovpn_volume_name}:/ovpn:ro egress={egress_type} ovpn_file={ovpn_file if egress_type == 'ovpn' else ''}"
     )
+    run_kwargs = {
+        "name": container_name,
+        "network": resolved_network,
+        "environment": {e.split("=", 1)[0]: e.split("=", 1)[1] for e in env},
+        "volumes": {ovpn_volume_name: {"bind": "/ovpn", "mode": "ro"}},
+        "cap_add": ["NET_ADMIN"],
+        "devices": ["/dev/net/tun:/dev/net/tun"],
+        "dns": ["8.8.8.8"],
+        "detach": True,
+        "remove": False,
+        "labels": {WORKER_CONTAINER_LABEL: "true"},
+    }
     try:
         # OpenVPN needs /dev/net/tun; pass host TUN device and volume via run() kwargs
-        container = client.containers.run(
-            docker_image,
-            name=container_name,
-            network=resolved_network,
-            environment={e.split("=", 1)[0]: e.split("=", 1)[1] for e in env},
-            volumes={ovpn_volume_name: {"bind": "/ovpn", "mode": "ro"}},
-            cap_add=["NET_ADMIN"],
-            devices=["/dev/net/tun:/dev/net/tun"],
-            dns=["8.8.8.8"],
-            detach=True,
-            remove=False,
-            labels={WORKER_CONTAINER_LABEL: "true"},
-        )
+        container = client.containers.run(docker_image, **run_kwargs)
         _log(f"Worker container started: {container_name} (id={container.short_id}) -> {container_name}:{WORKER_PROXY_PORT}")
     except Exception as e:
+        if _is_container_name_conflict(e, container_name):
+            _log(f"Container name conflict for {container_name}; removing stale container and retrying once")
+            remove_worker_container_by_name(container_name, client=client)
+            try:
+                container = client.containers.run(docker_image, **run_kwargs)
+                _log(
+                    f"Worker container started after conflict retry: {container_name} "
+                    f"(id={container.short_id}) -> {container_name}:{WORKER_PROXY_PORT}"
+                )
+                return (container_name, WORKER_PROXY_PORT)
+            except Exception as retry_err:
+                _log(f"containers.run retry failed: {retry_err}")
+                raise
         _log(f"containers.run failed: {e}")
         raise
     return (container_name, WORKER_PROXY_PORT)
@@ -169,13 +217,70 @@ def teardown_docker_backend(container_name: str) -> None:
         container = client.containers.get(container_name)
         container.stop(timeout=5)
         container.remove(force=True)
-        _log(f"Stopped and removed container: {container_name}")
+        if _wait_for_container_absent(client, container_name):
+            _log(f"Stopped and removed container: {container_name}")
+        else:
+            _log(f"Stopped and removed container but name is still reserved: {container_name}")
     except Exception as e:
-        err_str = str(e).strip()
-        if "404" in err_str or "No such container" in err_str or "not found" in err_str.lower():
+        if _is_not_found_error(e):
             _log(f"Teardown {container_name}: container already removed")
         else:
             _log(f"Teardown {container_name}: {e}")
+
+
+def inspect_worker_container(container_name: str) -> Dict[str, Any]:
+    """Return a small public snapshot for a worker container by name."""
+    try:
+        import docker
+    except ImportError:
+        return {"exists": False, "running": False, "name": container_name, "status": "", "id": ""}
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+        status = str(getattr(container, "status", "") or "").lower()
+        if not status:
+            status = str((container.attrs or {}).get("State", {}).get("Status", "") or "").lower()
+        return {
+            "exists": True,
+            "running": status == "running",
+            "name": container.name or container_name,
+            "status": status,
+            "id": getattr(container, "short_id", "") or "",
+        }
+    except Exception:
+        return {"exists": False, "running": False, "name": container_name, "status": "", "id": ""}
+
+
+def remove_worker_container_by_name(container_name: str, client: Optional[Any] = None) -> bool:
+    """Best-effort stop/remove by deterministic worker name. Returns True if a container was found."""
+    try:
+        import docker
+    except ImportError:
+        return False
+    if client is None:
+        try:
+            client = docker.from_env()
+        except Exception:
+            return False
+    try:
+        container = client.containers.get(container_name)
+    except Exception as e:
+        if not _is_not_found_error(e):
+            _log(f"Lookup {container_name}: {e}")
+        return False
+    try:
+        _log(f"Removing existing container: {container_name}")
+        try:
+            container.stop(timeout=5)
+        except Exception:
+            pass
+        container.remove(force=True)
+        if not _wait_for_container_absent(client, container_name):
+            _log(f"Remove {container_name}: name still reserved after removal timeout")
+        return True
+    except Exception as e:
+        _log(f"Remove {container_name}: {e}")
+        return True
 
 
 def remove_all_dynamic_worker_containers() -> List[str]:

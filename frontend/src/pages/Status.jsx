@@ -132,6 +132,18 @@ export default function Status() {
           <p className="stat-value">{data.useDocker ? 'Docker' : 'Local'}</p>
         </div>
         <div className="card stat-card col-span-2">
+          <p className="stat-label">Server Proxy Host</p>
+          <p className="stat-value">
+            {data.clientProxyHost || '127.0.0.1'}
+            {data.clientProxyHostSource && (
+              <span className="text-muted text-sm"> ({data.clientProxyHostSource})</span>
+            )}
+          </p>
+          {data.publicWanIp && data.publicWanIp !== data.clientProxyHost && (
+            <p className="stat-value text-muted text-sm mt-1 mb-0">Server public IP: {data.publicWanIp}</p>
+          )}
+        </div>
+        <div className="card stat-card col-span-2">
           <p className="stat-label">Listen Host</p>
           <p className="stat-value">{data.listenHost || '127.0.0.1'} <span className="text-muted text-sm">: {data.controlPort || 'N/A'} (Control)</span></p>
         </div>

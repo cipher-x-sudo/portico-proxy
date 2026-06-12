@@ -6,6 +6,30 @@ import { formatOvpnDisplayLabel, sortOvpnFiles } from '../utils/ovpnFiles';
 import { copyToClipboard } from '../utils/copyToClipboard';
 import { internalPortForIndex, internalToPublishedPort, publishedPortForIndex } from '../utils/portDisplay';
 
+const randomProxySuffix = () => Math.random().toString(16).slice(2, 6).padEnd(4, '0');
+
+const providerFromOvpn = (filename) => {
+  const parts = String(filename || '').split(/[\\/]+/).filter(Boolean);
+  return parts.length > 1 ? parts[0] : 'Uploaded';
+};
+
+const locationFromOvpn = (filename) => {
+  const parts = String(filename || '').split(/[\\/]+/).filter(Boolean);
+  const leaf = parts.length ? parts[parts.length - 1] : filename;
+  return formatOvpnDisplayLabel(leaf || filename);
+};
+
+const slugifyProxyUsername = (value) => {
+  const slug = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_')
+    .slice(0, 32)
+    .replace(/^_+|_+$/g, '');
+  return slug || 'proxy';
+};
+
 export default function Dashboard() {
   const confirmAction = useConfirm();
   const toast = useToast();
@@ -27,11 +51,28 @@ export default function Dashboard() {
   const [authRouteForm, setAuthRouteForm] = useState({
     username: '',
     label: '',
+    externalId: '',
+    proxyType: 'http',
     enabled: true,
     egressType: 'ovpn',
     ovpn: '',
     upstreamProxyId: '',
+    rotationMinutes: '0',
+    rotationCountry: '',
   });
+  const [showAuthRouteEditor, setShowAuthRouteEditor] = useState(false);
+  const [showCreateProxy, setShowCreateProxy] = useState(false);
+  const [createProxyProvider, setCreateProxyProvider] = useState('');
+  const [createProxyLocation, setCreateProxyLocation] = useState('');
+  const [createProxyOvpn, setCreateProxyOvpn] = useState('');
+  const [createProxyLabel, setCreateProxyLabel] = useState('');
+  const [createProxyExternalId, setCreateProxyExternalId] = useState('');
+  const [createProxyType, setCreateProxyType] = useState('http');
+  const [createProxyRotationMinutes, setCreateProxyRotationMinutes] = useState('0');
+  const [createProxyRotationCountry, setCreateProxyRotationCountry] = useState('');
+  const [createProxySuffix, setCreateProxySuffix] = useState(randomProxySuffix);
+  const [creatingProxy, setCreatingProxy] = useState(false);
+  const [createdProxy, setCreatedProxy] = useState(null);
 
   const [showCreateEntry, setShowCreateEntry] = useState(false);
   const [newEntryId, setNewEntryId] = useState('');
@@ -39,8 +80,6 @@ export default function Dashboard() {
   const [newEntryEgressType, setNewEntryEgressType] = useState('ovpn');
   const [newEntryUpstreamProxyId, setNewEntryUpstreamProxyId] = useState('');
   const [newEntryProxyType, setNewEntryProxyType] = useState('http');
-  const [newEntryRotationMinutes, setNewEntryRotationMinutes] = useState('0');
-  const [newEntryRotationCountry, setNewEntryRotationCountry] = useState('');
   const [newEntryUpstreamRefreshMinutes, setNewEntryUpstreamRefreshMinutes] = useState('0');
   const [creatingEntry, setCreatingEntry] = useState(false);
 
@@ -52,9 +91,6 @@ export default function Dashboard() {
   const [editEntryUpstreamProxyId, setEditEntryUpstreamProxyId] = useState('');
   const [editEntryProxyType, setEditEntryProxyType] = useState('http');
   const [editProxyTypeInitial, setEditProxyTypeInitial] = useState('http');
-  const [editEntryRotationMinutes, setEditEntryRotationMinutes] = useState('0');
-  const [editEntryRotationCountry, setEditEntryRotationCountry] = useState('');
-  const [editRotationInitial, setEditRotationInitial] = useState({ minutes: 0, country: '' });
   const [editEntryUpstreamRefreshMinutes, setEditEntryUpstreamRefreshMinutes] = useState('0');
   const [editUpstreamRefreshInitial, setEditUpstreamRefreshInitial] = useState(0);
   const [isEditingEntry, setIsEditingEntry] = useState(false);
@@ -96,7 +132,7 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    const modalOpen = showCreateEntry || showEditEntry;
+    const modalOpen = showCreateEntry || showEditEntry || showCreateProxy || showAuthRouteEditor;
     const page = document.querySelector('.main-content .page-container');
     if (!page) return undefined;
     if (!modalOpen) return undefined;
@@ -105,9 +141,18 @@ export default function Dashboard() {
     return () => {
       page.style.overflow = prevOverflow;
     };
-  }, [showCreateEntry, showEditEntry]);
+  }, [showCreateEntry, showEditEntry, showCreateProxy, showAuthRouteEditor]);
 
   const sortedOvpnFiles = useMemo(() => sortOvpnFiles(ovpnFiles), [ovpnFiles]);
+  const ovpnRouteRows = useMemo(
+    () =>
+      sortedOvpnFiles.map((file) => ({
+        file,
+        provider: providerFromOvpn(file),
+        location: locationFromOvpn(file),
+      })),
+    [sortedOvpnFiles]
+  );
 
   const saveEgress = async (port, type, { ovpn = '', upstreamProxyId = '' } = {}) => {
     setBusyPort(port);
@@ -186,29 +231,6 @@ export default function Dashboard() {
       return true;
     } catch (err) {
       setError('Failed to save proxy type: ' + err.message);
-      return false;
-    }
-  };
-
-  /** Persist rotation settings for one port. Pass minutes=0 to disable rotation. */
-  const saveRotation = async (port, minutes, country) => {
-    const intervalMinutes = Math.max(0, Math.floor(Number(minutes) || 0));
-    const payload = { intervalMinutes, country: (country || '').toUpperCase() };
-    setError('');
-    try {
-      const res = await fetch(`/api/set-rotation?port=${encodeURIComponent(port)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        setError(data.error || 'Failed to save rotation settings');
-        return false;
-      }
-      return true;
-    } catch (err) {
-      setError('Failed to save rotation settings: ' + err.message);
       return false;
     }
   };
@@ -397,13 +419,6 @@ export default function Dashboard() {
           if (!egressOk) throw new Error(`Assigned ID ${currentId} but failed to save egress.`);
         }
 
-        const rotMins = Math.max(0, Math.floor(Number(newEntryRotationMinutes) || 0));
-        if (newEntryEgressType === 'ovpn' && rotMins > 0) {
-          const rotOk = await saveRotation(targetPort, rotMins, newEntryRotationCountry);
-          if (!rotOk) {
-            throw new Error(`Failed to save rotation settings for ${currentId}`);
-          }
-        }
         const refreshMins = Math.max(0, Math.floor(Number(newEntryUpstreamRefreshMinutes) || 0));
         if (newEntryEgressType === 'upstream' && refreshMins > 0) {
           const refreshOk = await saveUpstreamRefresh(targetPort, refreshMins);
@@ -416,8 +431,6 @@ export default function Dashboard() {
       setNewEntryEgressType('ovpn');
       setNewEntryUpstreamProxyId('');
       setNewEntryProxyType('http');
-      setNewEntryRotationMinutes('0');
-      setNewEntryRotationCountry('');
       setNewEntryUpstreamRefreshMinutes('0');
       setShowCreateEntry(false);
       
@@ -432,7 +445,7 @@ export default function Dashboard() {
     }
   };
 
-  const openEditModal = (port, currentId, currentEgress, currentProxyType, currentRotation, currentRefresh) => {
+  const openEditModal = (port, currentId, currentEgress, currentProxyType, currentRefresh) => {
     setEditTargetPort(port);
     setEditEntryId(currentId || '');
     const egressType = currentEgress?.type === 'upstream' ? 'upstream' : 'ovpn';
@@ -442,11 +455,6 @@ export default function Dashboard() {
     const pt = currentProxyType === 'socks5' ? 'socks5' : 'http';
     setEditEntryProxyType(pt);
     setEditProxyTypeInitial(pt);
-    const rotMins = Math.max(0, Math.floor(Number(currentRotation?.minutes) || 0));
-    const rotCountry = (currentRotation?.country || '').toUpperCase();
-    setEditEntryRotationMinutes(String(rotMins));
-    setEditEntryRotationCountry(rotCountry);
-    setEditRotationInitial({ minutes: rotMins, country: rotCountry });
     const refreshMins = Math.max(0, Math.floor(Number(currentRefresh) || 0));
     setEditEntryUpstreamRefreshMinutes(String(refreshMins));
     setEditUpstreamRefreshInitial(refreshMins);
@@ -484,20 +492,6 @@ export default function Dashboard() {
         throw new Error('Failed to update proxy type');
       }
 
-      const nextRotMins = Math.max(0, Math.floor(Number(editEntryRotationMinutes) || 0));
-      const nextRotCountry = (editEntryRotationCountry || '').toUpperCase();
-      const rotChanged =
-        nextRotMins !== editRotationInitial.minutes ||
-        nextRotCountry !== editRotationInitial.country;
-      if (editEntryEgressType === 'ovpn' && rotChanged) {
-        const rotOk = await saveRotation(editTargetPort, nextRotMins, nextRotCountry);
-        if (!rotOk) {
-          throw new Error('Failed to update rotation settings');
-        }
-      }
-      if (editEntryEgressType !== 'ovpn' && editRotationInitial.minutes > 0) {
-        await saveRotation(editTargetPort, 0, '');
-      }
       const nextRefreshMins = Math.max(0, Math.floor(Number(editEntryUpstreamRefreshMinutes) || 0));
       if (editEntryEgressType === 'upstream' && nextRefreshMins !== editUpstreamRefreshInitial) {
         const refreshOk = await saveUpstreamRefresh(editTargetPort, nextRefreshMins);
@@ -803,15 +797,129 @@ export default function Dashboard() {
   };
 
   const authRouting = status.authRouting?.enabled ? status.authRouting : null;
+  const providerOptions = Array.from(new Set(ovpnRouteRows.map((row) => row.provider))).sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true })
+  );
+  const selectedCreateProvider = createProxyProvider || providerOptions[0] || '';
+  const providerRouteRows = ovpnRouteRows.filter((row) => row.provider === selectedCreateProvider);
+  const locationOptions = Array.from(new Set(providerRouteRows.map((row) => row.location))).sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true })
+  );
+  const selectedCreateLocation = createProxyLocation || locationOptions[0] || '';
+  const locationRouteRows = providerRouteRows.filter((row) => row.location === selectedCreateLocation);
+  const selectedCreateOvpn =
+    createProxyOvpn ||
+    locationRouteRows[0]?.file ||
+    providerRouteRows[0]?.file ||
+    sortedOvpnFiles[0] ||
+    '';
+  const selectedCreateRouteRow =
+    ovpnRouteRows.find((row) => row.file === selectedCreateOvpn) || {
+      file: selectedCreateOvpn,
+      provider: selectedCreateProvider,
+      location: selectedCreateLocation,
+    };
+  const createProxyUsernamePreview = `${slugifyProxyUsername(
+    createProxyExternalId ||
+      createProxyLabel ||
+      [selectedCreateRouteRow.provider, selectedCreateRouteRow.location].filter(Boolean).join('_')
+  )}_${createProxySuffix}`;
+
+  const openCreateProxyModal = () => {
+    const provider = providerOptions[0] || '';
+    const rows = ovpnRouteRows.filter((row) => row.provider === provider);
+    const location = rows[0]?.location || '';
+    const ovpn = rows[0]?.file || '';
+    setCreateProxyProvider(provider);
+    setCreateProxyLocation(location);
+    setCreateProxyOvpn(ovpn);
+    setCreateProxyLabel('');
+    setCreateProxyExternalId('');
+    setCreateProxyType('http');
+    setCreateProxyRotationMinutes('0');
+    setCreateProxyRotationCountry('');
+    setCreateProxySuffix(randomProxySuffix());
+    setCreatedProxy(null);
+    setShowCreateProxy(true);
+  };
+
+  const handleCreateProxyProviderChange = (provider) => {
+    const rows = ovpnRouteRows.filter((row) => row.provider === provider);
+    setCreateProxyProvider(provider);
+    setCreateProxyLocation(rows[0]?.location || '');
+    setCreateProxyOvpn(rows[0]?.file || '');
+    setCreatedProxy(null);
+  };
+
+  const handleCreateProxyLocationChange = (location) => {
+    const rows = providerRouteRows.filter((row) => row.location === location);
+    setCreateProxyLocation(location);
+    setCreateProxyOvpn(rows[0]?.file || '');
+    setCreatedProxy(null);
+  };
+
+  const handleCreateProxyRoute = async (event) => {
+    event.preventDefault();
+    const ovpn = selectedCreateOvpn;
+    if (!ovpn) {
+      setError('Select an OVPN profile first.');
+      return;
+    }
+    const payload = {
+      autoGenerateUsername: true,
+      username: createProxyUsernamePreview,
+      label: createProxyLabel.trim() || createProxyExternalId.trim() || formatOvpnDisplayLabel(ovpn),
+      externalId: createProxyExternalId.trim(),
+      proxyType: createProxyType === 'socks5' ? 'socks5' : 'http',
+      enabled: true,
+      rotationIntervalMinutes: Math.max(0, Math.floor(Number(createProxyRotationMinutes) || 0)),
+      rotationCountry: (createProxyRotationCountry || '').toUpperCase(),
+      egress: { type: 'ovpn', ovpn },
+    };
+    setCreatingProxy(true);
+    setAuthRouteBusy(`create:${createProxyUsernamePreview}`);
+    setError('');
+    try {
+      const res = await fetch('/api/auth-route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        setError(data.error || 'Failed to create proxy');
+        return;
+      }
+      const route = data.route || {};
+      await refreshStatus();
+      setCreatedProxy({
+        username: route.username || createProxyUsernamePreview,
+        label: route.label || payload.label,
+        proxyType: route.proxyType || payload.proxyType,
+        ovpn,
+      });
+      setCreateProxySuffix(randomProxySuffix());
+      toast({ title: 'Proxy created', message: route.username || createProxyUsernamePreview, variant: 'success' });
+    } catch (err) {
+      setError('Failed to create proxy: ' + err.message);
+    } finally {
+      setCreatingProxy(false);
+      setAuthRouteBusy(null);
+    }
+  };
 
   const resetAuthRouteForm = () => {
     setAuthRouteForm({
       username: '',
       label: '',
+      externalId: '',
+      proxyType: 'http',
       enabled: true,
       egressType: 'ovpn',
       ovpn: '',
       upstreamProxyId: '',
+      rotationMinutes: '0',
+      rotationCountry: '',
     });
   };
 
@@ -820,11 +928,16 @@ export default function Dashboard() {
     setAuthRouteForm({
       username: route.username || '',
       label: route.label || route.username || '',
+      externalId: route.externalId || '',
+      proxyType: route.proxyType === 'socks5' ? 'socks5' : 'http',
       enabled: route.enabled !== false,
       egressType: egress.type === 'upstream' ? 'upstream' : 'ovpn',
       ovpn: egress.type === 'ovpn' ? egress.ovpn || '' : '',
       upstreamProxyId: egress.type === 'upstream' ? egress.upstreamProxyId || '' : '',
+      rotationMinutes: String(Math.max(0, Math.floor(Number(route.rotationIntervalMinutes) || 0))),
+      rotationCountry: (route.rotationCountry || '').toUpperCase(),
     });
+    setShowAuthRouteEditor(true);
   };
 
   const saveAuthRoute = async (event) => {
@@ -837,7 +950,15 @@ export default function Dashboard() {
     const payload = {
       username,
       label: authRouteForm.label.trim() || username,
+      externalId: authRouteForm.externalId.trim(),
+      proxyType: authRouteForm.proxyType === 'socks5' ? 'socks5' : 'http',
       enabled: authRouteForm.enabled,
+      rotationIntervalMinutes:
+        authRouteForm.egressType === 'ovpn'
+          ? Math.max(0, Math.floor(Number(authRouteForm.rotationMinutes) || 0))
+          : 0,
+      rotationCountry:
+        authRouteForm.egressType === 'ovpn' ? (authRouteForm.rotationCountry || '').toUpperCase() : '',
       egress:
         authRouteForm.egressType === 'upstream'
           ? { type: 'upstream', upstreamProxyId: authRouteForm.upstreamProxyId }
@@ -858,6 +979,7 @@ export default function Dashboard() {
       }
       await refreshStatus();
       resetAuthRouteForm();
+      setShowAuthRouteEditor(false);
       toast({ title: 'Route saved', message: username, variant: 'success' });
     } catch (err) {
       setError('Failed to save route: ' + err.message);
@@ -906,13 +1028,30 @@ export default function Dashboard() {
   };
 
   if (authRouting) {
-    const authHost = authRouting.clientProxyHost || status.clientProxyHost || '127.0.0.1';
+    const browserHost =
+      typeof window !== 'undefined' && window.location?.hostname
+        ? window.location.hostname
+        : '';
+    const normalizedBrowserHost =
+      browserHost === 'localhost' || browserHost === '[::1]' || browserHost === '::1'
+        ? '127.0.0.1'
+        : browserHost || '127.0.0.1';
+    const authCopyHost =
+      authRouting.copyHost ||
+      (authRouting.copyHostMode === 'local'
+        ? normalizedBrowserHost
+        : authRouting.clientProxyHost || status.clientProxyHost || '127.0.0.1');
+    const authHostSource =
+      authRouting.copyHostSource ||
+      (authRouting.copyHostMode === 'local'
+        ? 'browser-local'
+        : authRouting.clientProxyHostSource || status.clientProxyHostSource || '');
     const authPassword = authRouting.globalPassword || '';
     const httpPort = authRouting.httpPort || 58080;
     const socksPort = authRouting.socksPort || 58081;
     const routes = Array.isArray(authRouting.routes) ? authRouting.routes : [];
-    const routeProxyUrl = (scheme, username, port) =>
-      `${scheme}://${encUrl(username)}:${encUrl(authPassword)}@${authHost}:${port}`;
+    const routeColonFormat = (username, port) => `${authCopyHost}:${port}:${username}:${authPassword}`;
+    const routeAtFormat = (username, port) => `${username}:${authPassword}@${authCopyHost}:${port}`;
 
     return (
       <div className="dashboard">
@@ -933,11 +1072,21 @@ export default function Dashboard() {
               <span className="material-symbols-outlined text-primary">route</span>
               <h3 className="font-bold">Auth routes</h3>
             </div>
-            <span className="badge-primary">{routes.length} ROUTES</span>
+            <div className="dashboard-row-actions">
+              <span className="badge-primary">{routes.length} ROUTES</span>
+              <button type="button" className="btn-primary" onClick={openCreateProxyModal}>
+                <span className="material-symbols-outlined">add</span>
+                Create Proxy
+              </button>
+            </div>
           </div>
           <p className="text-muted text-sm px-4 pt-2 pb-0 mb-0">
             HTTP listens on <code className="text-mono">{httpPort}</code> and SOCKS5 listens on{' '}
             <code className="text-mono">{socksPort}</code>. Username selects the route.
+          </p>
+          <p className="text-muted text-sm px-4 pt-1 pb-0 mb-0">
+            Connect host shown in proxy lines: <code className="text-mono">{authCopyHost}</code>
+            {authHostSource && <span> ({authHostSource})</span>}
           </p>
           <div className="table-container">
             <table className="data-table dashboard-copy-table">
@@ -945,24 +1094,33 @@ export default function Dashboard() {
                 <tr>
                   <th>Route</th>
                   <th>Egress</th>
+                  <th>Type</th>
                   <th>Status</th>
-                  <th>HTTP URL</th>
-                  <th>SOCKS5 URL</th>
+                  <th>VPN Public IP</th>
+                  <th>IP:PORT:USER:PASS</th>
+                  <th>USER:PASS@IP:PORT</th>
                   <th className="text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {routes.length === 0 ? (
                   <tr>
-                    <td colSpan="6" className="text-center p-6 text-muted">No auth routes configured.</td>
+                    <td colSpan="8" className="text-center p-6 text-muted">No auth routes configured.</td>
                   </tr>
                 ) : (
                   routes.map((route) => {
-                    const httpState = route.protocols?.http?.status || 'inactive';
-                    const socksState = route.protocols?.socks5?.status || 'inactive';
-                    const httpUrl = routeProxyUrl('http', route.username, httpPort);
-                    const socksUrl = routeProxyUrl('socks5', route.username, socksPort);
+                    const routeType = route.proxyType === 'socks5' ? 'socks5' : 'http';
+                    const routeProtocol = route.protocols?.[routeType] || {};
+                    const routeState = routeProtocol.status || 'inactive';
+                    const egressPublicIp = routeProtocol.egressPublicIp || '';
+                    const egressPublicIpError = routeProtocol.egressPublicIpError || '';
+                    const routePort = routeType === 'socks5' ? socksPort : httpPort;
+                    const routeColon = routeColonFormat(route.username, routePort);
+                    const routeAt = routeAtFormat(route.username, routePort);
                     const busy = authRouteBusy && authRouteBusy.endsWith(`:${route.username}`);
+                    const rotationMinutes = Math.max(0, Math.floor(Number(route.rotationIntervalMinutes) || 0));
+                    const rotationCountry = (route.rotationCountry || '').toUpperCase();
+                    const isRotating = route.egress?.type === 'ovpn' && rotationMinutes > 0;
                     return (
                       <tr key={route.username} className={route.enabled ? undefined : 'opacity-60'}>
                         <td data-label="Route">
@@ -977,6 +1135,7 @@ export default function Dashboard() {
                               {copiedToken === `auth-user-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
                             </button>
                             {!route.enabled && <span className="status-inactive">Disabled</span>}
+                            {route.externalId && <span className="text-muted text-sm">ID: {route.externalId}</span>}
                           </div>
                         </td>
                         <td data-label="Egress">
@@ -987,44 +1146,110 @@ export default function Dashboard() {
                             <span className="text-mono text-sm">{egressDisplay(route.egress) || 'Not configured'}</span>
                           </div>
                         </td>
+                        <td data-label="Type">
+                          <span className="badge-primary">{routeType === 'socks5' ? 'SOCKS5' : 'HTTP'}</span>
+                        </td>
                         <td data-label="Status">
                           <div className="flex flex-col gap-1">
-                            <span className={httpState === 'active' ? 'status-active' : httpState === 'starting' ? 'status-starting' : httpState === 'failed' ? 'status-failed' : 'status-inactive'}>
-                              HTTP: {httpState}
+                            <span className={routeState === 'active' ? 'status-active' : routeState === 'starting' ? 'status-starting' : routeState === 'failed' ? 'status-failed' : 'status-inactive'}>
+                              {routeType === 'socks5' ? 'SOCKS5' : 'HTTP'}: {routeState}
                             </span>
-                            <span className={socksState === 'active' ? 'status-active' : socksState === 'starting' ? 'status-starting' : socksState === 'failed' ? 'status-failed' : 'status-inactive'}>
-                              SOCKS: {socksState}
-                            </span>
+                            {isRotating && (
+                              <span
+                                className="dashboard-rotation-badge"
+                                title={`Rotates every ${rotationMinutes}m${
+                                  rotationCountry ? ` from ${rotationCountry} pool` : ''
+                                }`}
+                              >
+                                <span className="material-symbols-outlined" aria-hidden>
+                                  autorenew
+                                </span>
+                                <span>
+                                  Rotating - {rotationMinutes}m
+                                  {rotationCountry ? ` - ${rotationCountry}` : ''}
+                                </span>
+                              </span>
+                            )}
                           </div>
                         </td>
-                        <td data-label="HTTP URL">
-                          <button type="button" className="dashboard-copy-line" onClick={() => copyProxyLine(httpUrl, `auth-http-${route.username}`)}>
-                            <code className="dashboard-copy-code">{httpUrl}</code>
-                            {copiedToken === `auth-http-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                        <td data-label="VPN Public IP">
+                          <div className="flex flex-col gap-1">
+                            <span className="text-mono text-sm">
+                              {routeState === 'active'
+                                ? egressPublicIp || (egressPublicIpError ? 'Unavailable' : 'Checking...')
+                                : 'Inactive'}
+                            </span>
+                            {routeState === 'active' && egressPublicIpError && (
+                              <span className="status-error-text">{egressPublicIpError}</span>
+                            )}
+                          </div>
+                        </td>
+                        <td data-label="IP:PORT:USER:PASS">
+                          <button type="button" className="dashboard-copy-line" onClick={() => copyProxyLine(routeColon, `auth-colon-${route.username}`)}>
+                            <code className="dashboard-copy-code">{routeColon}</code>
+                            {copiedToken === `auth-colon-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
                           </button>
                         </td>
-                        <td data-label="SOCKS5 URL">
-                          <button type="button" className="dashboard-copy-line" onClick={() => copyProxyLine(socksUrl, `auth-socks-${route.username}`)}>
-                            <code className="dashboard-copy-code">{socksUrl}</code>
-                            {copiedToken === `auth-socks-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                        <td data-label="USER:PASS@IP:PORT">
+                          <button type="button" className="dashboard-copy-line" onClick={() => copyProxyLine(routeAt, `auth-at-${route.username}`)}>
+                            <code className="dashboard-copy-code">{routeAt}</code>
+                            {copiedToken === `auth-at-${route.username}` && <span className="dashboard-copy-toast">Copied</span>}
                           </button>
                         </td>
                         <td className="text-right" data-label="Actions">
-                          <div className="dashboard-row-actions">
-                            <button type="button" className="btn-primary" disabled={busy || !route.enabled} onClick={() => runAuthRouteAction(route.username, 'start')}>
-                              Start
+                          <div className="dashboard-auth-actions">
+                            {routeState === 'active' || routeState === 'starting' ? (
+                              <button
+                                type="button"
+                                className="dashboard-auth-action dashboard-auth-action-stop"
+                                disabled={busy || routeState === 'starting'}
+                                onClick={() => runAuthRouteAction(route.username, 'stop')}
+                                title={routeState === 'starting' ? 'Starting' : 'Stop route'}
+                                aria-label={routeState === 'starting' ? 'Route starting' : 'Stop route'}
+                              >
+                                <span className="material-symbols-outlined">stop_circle</span>
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="dashboard-auth-action dashboard-auth-action-start"
+                                disabled={busy || !route.enabled}
+                                onClick={() => runAuthRouteAction(route.username, 'start')}
+                                title="Start route"
+                                aria-label="Start route"
+                              >
+                                <span className="material-symbols-outlined">play_circle</span>
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="dashboard-auth-action dashboard-auth-action-restart"
+                              disabled={busy || routeState !== 'active'}
+                              onClick={() => runAuthRouteAction(route.username, 'restart')}
+                              title={routeState === 'active' ? 'Restart route' : 'Restart available when active'}
+                              aria-label="Restart route"
+                            >
+                              <span className="material-symbols-outlined">restart_alt</span>
                             </button>
-                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => runAuthRouteAction(route.username, 'restart')}>
-                              Restart
+                            <button
+                              type="button"
+                              className="dashboard-auth-action"
+                              disabled={busy}
+                              onClick={() => loadAuthRouteForEdit(route)}
+                              title="Edit route"
+                              aria-label="Edit route"
+                            >
+                              <span className="material-symbols-outlined">edit</span>
                             </button>
-                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => runAuthRouteAction(route.username, 'stop')}>
-                              Stop
-                            </button>
-                            <button type="button" className="btn-secondary" disabled={busy} onClick={() => loadAuthRouteForEdit(route)}>
-                              <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
-                            </button>
-                            <button type="button" className="btn-danger" disabled={busy} onClick={() => runAuthRouteAction(route.username, 'delete')}>
-                              <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>delete</span>
+                            <button
+                              type="button"
+                              className="dashboard-auth-action dashboard-auth-action-delete"
+                              disabled={busy}
+                              onClick={() => runAuthRouteAction(route.username, 'delete')}
+                              title="Delete route"
+                              aria-label="Delete route"
+                            >
+                              <span className="material-symbols-outlined">delete</span>
                             </button>
                           </div>
                         </td>
@@ -1037,90 +1262,407 @@ export default function Dashboard() {
           </div>
         </section>
 
-        <section className="card p-4 mt-4">
-          <div className="table-header px-0 pt-0">
-            <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-primary">tune</span>
-              <h3 className="font-bold">Route config</h3>
-            </div>
-          </div>
-          <form className="dashboard-modal-body" onSubmit={saveAuthRoute}>
-            <div className="form-grid">
-              <label className="form-field">
-                <span>Username</span>
-                <input
-                  className="input"
-                  value={authRouteForm.username}
-                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, username: e.target.value }))}
-                  placeholder="us_chicago"
-                />
-              </label>
-              <label className="form-field">
-                <span>Label</span>
-                <input
-                  className="input"
-                  value={authRouteForm.label}
-                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, label: e.target.value }))}
-                  placeholder="US Chicago"
-                />
-              </label>
-              <label className="form-field">
-                <span>Egress</span>
-                <select
-                  className="input"
-                  value={authRouteForm.egressType}
-                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, egressType: e.target.value }))}
+        {showCreateProxy && (
+          <div className="dashboard-modal-overlay" onClick={() => setShowCreateProxy(false)}>
+            <div
+              className="dashboard-modal-panel dashboard-create-proxy-panel"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dashboard-create-proxy-title"
+            >
+              <div className="dashboard-modal-header">
+                <h3 id="dashboard-create-proxy-title" className="dashboard-modal-title">
+                  Create Proxy
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setShowCreateProxy(false)}
+                  className="dashboard-modal-close"
+                  aria-label="Close"
                 >
-                  <option value="ovpn">OpenVPN</option>
-                  <option value="upstream">Upstream proxy</option>
-                </select>
-              </label>
-              {authRouteForm.egressType === 'ovpn' ? (
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+              <form className="dashboard-modal-body" onSubmit={handleCreateProxyRoute}>
+                <div className="form-grid">
+                  <label className="form-field">
+                    <span>Provider</span>
+                    <select
+                      className="input"
+                      value={selectedCreateProvider}
+                      onChange={(e) => handleCreateProxyProviderChange(e.target.value)}
+                      disabled={creatingProxy || providerOptions.length === 0}
+                    >
+                      {providerOptions.length === 0 ? (
+                        <option value="">No providers</option>
+                      ) : (
+                        providerOptions.map((provider) => (
+                          <option key={provider} value={provider}>
+                            {provider}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                  <label className="form-field">
+                    <span>Location</span>
+                    <select
+                      className="input"
+                      value={selectedCreateLocation}
+                      onChange={(e) => handleCreateProxyLocationChange(e.target.value)}
+                      disabled={creatingProxy || locationOptions.length === 0}
+                    >
+                      {locationOptions.length === 0 ? (
+                        <option value="">No locations</option>
+                      ) : (
+                        locationOptions.map((location) => (
+                          <option key={location} value={location}>
+                            {location}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                </div>
                 <label className="form-field">
                   <span>OVPN profile</span>
-                  <OvpnFileSelect
-                    files={sortedOvpnFiles}
-                    value={authRouteForm.ovpn}
-                    onChange={(file) => setAuthRouteForm((prev) => ({ ...prev, ovpn: file }))}
-                    placeholder="Select profile..."
-                  />
-                </label>
-              ) : (
-                <label className="form-field">
-                  <span>Upstream proxy</span>
                   <select
                     className="input"
-                    value={authRouteForm.upstreamProxyId}
-                    onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, upstreamProxyId: e.target.value }))}
+                    value={selectedCreateOvpn}
+                    onChange={(e) => {
+                      setCreateProxyOvpn(e.target.value);
+                      setCreatedProxy(null);
+                    }}
+                    disabled={creatingProxy || locationRouteRows.length === 0}
+                    required
                   >
-                    <option value="">Select upstream...</option>
-                    {upstreamProxies.map((proxy) => (
-                      <option key={proxy.id} value={proxy.id}>
-                        {proxy.label || proxy.host || proxy.id}
-                      </option>
-                    ))}
+                    {locationRouteRows.length === 0 ? (
+                      <option value="">No OVPN profiles</option>
+                    ) : (
+                      locationRouteRows.map((row) => (
+                        <option key={row.file} value={row.file}>
+                          {row.file}
+                        </option>
+                      ))
+                    )}
                   </select>
                 </label>
-              )}
-              <label className="form-field flex-row items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={authRouteForm.enabled}
-                  onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, enabled: e.target.checked }))}
-                />
-                <span>Enabled</span>
-              </label>
+                <div className="form-grid">
+                  <label className="form-field">
+                    <span>Proxy type</span>
+                    <select
+                      className="input"
+                      value={createProxyType}
+                      onChange={(e) => {
+                        setCreateProxyType(e.target.value === 'socks5' ? 'socks5' : 'http');
+                        setCreatedProxy(null);
+                      }}
+                      disabled={creatingProxy}
+                    >
+                      <option value="http">HTTP</option>
+                      <option value="socks5">SOCKS5</option>
+                    </select>
+                  </label>
+                  <label className="form-field">
+                    <span>Label</span>
+                    <input
+                      className="input"
+                      value={createProxyLabel}
+                      onChange={(e) => {
+                        setCreateProxyLabel(e.target.value);
+                        setCreatedProxy(null);
+                      }}
+                      placeholder={formatOvpnDisplayLabel(selectedCreateOvpn) || 'US Chicago'}
+                      disabled={creatingProxy}
+                    />
+                  </label>
+                  <label className="form-field">
+                    <span>External ID</span>
+                    <input
+                      className="input"
+                      value={createProxyExternalId}
+                      onChange={(e) => {
+                        setCreateProxyExternalId(e.target.value);
+                        setCreatedProxy(null);
+                      }}
+                      placeholder="launcher-123"
+                      disabled={creatingProxy}
+                    />
+                  </label>
+                </div>
+                <fieldset className="dashboard-rotation-fieldset" disabled={creatingProxy}>
+                  <legend className="dashboard-modal-label">OpenVPN Rotation</legend>
+                  <div className="dashboard-rotation-grid">
+                    <label className="form-field">
+                      <span>Interval minutes</span>
+                      <input
+                        type="number"
+                        className="input"
+                        min="0"
+                        step="1"
+                        value={createProxyRotationMinutes}
+                        onChange={(e) => {
+                          setCreateProxyRotationMinutes(e.target.value);
+                          setCreatedProxy(null);
+                        }}
+                        placeholder="0"
+                      />
+                    </label>
+                    <label className="form-field">
+                      <span>Country pool</span>
+                      <select
+                        className="input"
+                        value={createProxyRotationCountry}
+                        onChange={(e) => {
+                          setCreateProxyRotationCountry(e.target.value);
+                          setCreatedProxy(null);
+                        }}
+                        disabled={creatingProxy || Number(createProxyRotationMinutes) <= 0}
+                      >
+                        <option value="">Use global default</option>
+                        {ovpnCountries.map((country) => (
+                          <option key={country.code} value={country.code}>
+                            {country.label}
+                            {typeof country.count === 'number' ? ` (${country.count})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </fieldset>
+                <div className="dashboard-generated-preview">
+                  <span className="dashboard-modal-label">Username preview</span>
+                  <code className="text-mono">{createProxyUsernamePreview}</code>
+                </div>
+                {createdProxy && (
+                  <div className="dashboard-created-proxy">
+                    <div className="dashboard-created-proxy-title">
+                      <span className="material-symbols-outlined">check_circle</span>
+                      <strong>{createdProxy.username}</strong>
+                    </div>
+                    {(() => {
+                      const createdPort = createdProxy.proxyType === 'socks5' ? socksPort : httpPort;
+                      const createdColon = routeColonFormat(createdProxy.username, createdPort);
+                      const createdAt = routeAtFormat(createdProxy.username, createdPort);
+                      return (
+                        <>
+                          <button
+                            type="button"
+                            className="dashboard-copy-line"
+                            onClick={() => copyProxyLine(createdColon, `created-colon-${createdProxy.username}`)}
+                          >
+                            <code className="dashboard-copy-code">{createdColon}</code>
+                            {copiedToken === `created-colon-${createdProxy.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                          </button>
+                          <button
+                            type="button"
+                            className="dashboard-copy-line"
+                            onClick={() => copyProxyLine(createdAt, `created-at-${createdProxy.username}`)}
+                          >
+                            <code className="dashboard-copy-code">{createdAt}</code>
+                            {copiedToken === `created-at-${createdProxy.username}` && <span className="dashboard-copy-toast">Copied</span>}
+                          </button>
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
+                <div className="dashboard-modal-actions">
+                  <button
+                    type="submit"
+                    className="btn-primary dashboard-modal-submit"
+                    disabled={creatingProxy || !selectedCreateOvpn}
+                  >
+                    {creatingProxy ? 'Creating...' : 'Create Proxy'}
+                  </button>
+                </div>
+              </form>
             </div>
-            <div className="dashboard-row-actions justify-end">
-              <button type="button" className="btn-secondary" onClick={resetAuthRouteForm}>
-                Clear
-              </button>
-              <button type="submit" className="btn-primary" disabled={Boolean(authRouteBusy)}>
-                {authRouteBusy?.startsWith('save:') ? 'Saving...' : 'Save Route'}
-              </button>
+          </div>
+        )}
+
+        {showAuthRouteEditor && (
+          <div className="dashboard-modal-overlay" onClick={() => setShowAuthRouteEditor(false)}>
+            <div
+              className="dashboard-modal-panel dashboard-route-editor-panel"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="dashboard-route-editor-title"
+            >
+              <div className="dashboard-modal-header">
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-primary">tune</span>
+                  <h3 id="dashboard-route-editor-title" className="dashboard-modal-title">
+                    Edit Route
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowAuthRouteEditor(false)}
+                  className="dashboard-modal-close"
+                  aria-label="Close"
+                >
+                  <span className="material-symbols-outlined">close</span>
+                </button>
+              </div>
+              <form className="dashboard-modal-body" onSubmit={saveAuthRoute}>
+                <div className="form-grid">
+                  <label className="form-field">
+                    <span>Username</span>
+                    <input
+                      className="input"
+                      value={authRouteForm.username}
+                      onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, username: e.target.value }))}
+                      placeholder="us_chicago"
+                    />
+                  </label>
+                  <label className="form-field">
+                    <span>Label</span>
+                    <input
+                      className="input"
+                      value={authRouteForm.label}
+                      onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, label: e.target.value }))}
+                      placeholder="US Chicago"
+                    />
+                  </label>
+                  <label className="form-field">
+                    <span>External ID</span>
+                    <input
+                      className="input"
+                      value={authRouteForm.externalId}
+                      onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, externalId: e.target.value }))}
+                      placeholder="launcher-123"
+                    />
+                  </label>
+                  <label className="form-field">
+                    <span>Proxy type</span>
+                    <select
+                      className="input"
+                      value={authRouteForm.proxyType}
+                      onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, proxyType: e.target.value === 'socks5' ? 'socks5' : 'http' }))}
+                    >
+                      <option value="http">HTTP</option>
+                      <option value="socks5">SOCKS5</option>
+                    </select>
+                  </label>
+                  <label className="form-field">
+                    <span>Egress</span>
+                    <select
+                      className="input"
+                      value={authRouteForm.egressType}
+                      onChange={(e) => {
+                        const nextType = e.target.value === 'upstream' ? 'upstream' : 'ovpn';
+                        setAuthRouteForm((prev) => ({
+                          ...prev,
+                          egressType: nextType,
+                          rotationMinutes: nextType === 'ovpn' ? prev.rotationMinutes : '0',
+                          rotationCountry: nextType === 'ovpn' ? prev.rotationCountry : '',
+                        }));
+                      }}
+                    >
+                      <option value="ovpn">OpenVPN</option>
+                      <option value="upstream">Upstream proxy</option>
+                    </select>
+                  </label>
+                  {authRouteForm.egressType === 'ovpn' ? (
+                    <label className="form-field">
+                      <span>OVPN profile</span>
+                      <OvpnFileSelect
+                        files={sortedOvpnFiles}
+                        value={authRouteForm.ovpn}
+                        onChange={(file) => setAuthRouteForm((prev) => ({ ...prev, ovpn: file }))}
+                        placeholder="Select profile..."
+                      />
+                    </label>
+                  ) : (
+                    <label className="form-field">
+                      <span>Upstream proxy</span>
+                      <select
+                        className="input"
+                        value={authRouteForm.upstreamProxyId}
+                        onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, upstreamProxyId: e.target.value }))}
+                      >
+                        <option value="">Select upstream...</option>
+                        {upstreamProxies.map((proxy) => (
+                          <option key={proxy.id} value={proxy.id}>
+                            {proxy.label || proxy.host || proxy.id}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {authRouteForm.egressType === 'ovpn' && (
+                    <fieldset className="dashboard-rotation-fieldset dashboard-auth-rotation-fieldset">
+                      <legend className="dashboard-modal-label">OpenVPN Rotation</legend>
+                      <div className="dashboard-rotation-grid">
+                        <label className="form-field">
+                          <span>Interval minutes</span>
+                          <input
+                            type="number"
+                            className="input"
+                            min="0"
+                            step="1"
+                            value={authRouteForm.rotationMinutes}
+                            onChange={(e) =>
+                              setAuthRouteForm((prev) => ({
+                                ...prev,
+                                rotationMinutes: e.target.value,
+                              }))
+                            }
+                            placeholder="0"
+                          />
+                        </label>
+                        <label className="form-field">
+                          <span>Country pool</span>
+                          <select
+                            className="input"
+                            value={authRouteForm.rotationCountry}
+                            onChange={(e) =>
+                              setAuthRouteForm((prev) => ({
+                                ...prev,
+                                rotationCountry: e.target.value,
+                              }))
+                            }
+                            disabled={Number(authRouteForm.rotationMinutes) <= 0}
+                          >
+                            <option value="">Use global default</option>
+                            {ovpnCountries.map((country) => (
+                              <option key={country.code} value={country.code}>
+                                {country.label}
+                                {typeof country.count === 'number' ? ` (${country.count})` : ''}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    </fieldset>
+                  )}
+                  <label className="form-field flex-row items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={authRouteForm.enabled}
+                      onChange={(e) => setAuthRouteForm((prev) => ({ ...prev, enabled: e.target.checked }))}
+                    />
+                    <span>Enabled</span>
+                  </label>
+                </div>
+                <div className="dashboard-row-actions justify-end">
+                  <button type="button" className="btn-secondary" onClick={() => setShowAuthRouteEditor(false)}>
+                    Cancel
+                  </button>
+                  <button type="button" className="btn-secondary" onClick={resetAuthRouteForm}>
+                    Clear
+                  </button>
+                  <button type="submit" className="btn-primary" disabled={Boolean(authRouteBusy)}>
+                    {authRouteBusy?.startsWith('save:') ? 'Saving...' : 'Save Route'}
+                  </button>
+                </div>
+              </form>
             </div>
-          </form>
-        </section>
+          </div>
+        )}
       </div>
     );
   }
@@ -1397,20 +1939,13 @@ export default function Dashboard() {
                 )}
                 {newEntryEgressType === 'ovpn' && (
                 <label className="dashboard-modal-field">
-                  <span className="dashboard-modal-label">
-                    Location Configuration{' '}
-                    {Number(newEntryRotationMinutes) > 0 ? '(picked at each rotation)' : '(Optional)'}
-                  </span>
+                  <span className="dashboard-modal-label">Location Configuration (Optional)</span>
                   <OvpnFileSelect
                     files={sortedOvpnFiles}
                     value={newEntryOvpn}
                     onChange={setNewEntryOvpn}
-                    disabled={creatingEntry || Number(newEntryRotationMinutes) > 0}
-                    placeholder={
-                      Number(newEntryRotationMinutes) > 0
-                        ? 'Auto-selected each rotation'
-                        : 'Select location .ovpn…'
-                    }
+                    disabled={creatingEntry}
+                    placeholder="Select location .ovpn..."
                   />
                 </label>
                 )}
@@ -1427,48 +1962,7 @@ export default function Dashboard() {
                     <option value="socks5">SOCKS5</option>
                   </select>
                 </label>
-                {newEntryEgressType === 'ovpn' ? (
-                <fieldset className="dashboard-rotation-fieldset" disabled={creatingEntry}>
-                  <legend className="dashboard-modal-label">Rotation</legend>
-                  <div className="dashboard-rotation-grid">
-                    <label className="dashboard-modal-field dashboard-rotation-minutes">
-                      <span className="dashboard-modal-label">Interval (minutes, 0 = off)</span>
-                      <input
-                        type="number"
-                        className="dashboard-modal-input"
-                        min="0"
-                        step="1"
-                        value={newEntryRotationMinutes}
-                        onChange={(e) => setNewEntryRotationMinutes(e.target.value)}
-                        placeholder="0"
-                      />
-                    </label>
-                    <label className="dashboard-modal-field dashboard-rotation-country">
-                      <span className="dashboard-modal-label">Country pool</span>
-                      <select
-                        className="dashboard-modal-input"
-                        value={newEntryRotationCountry}
-                        onChange={(e) => setNewEntryRotationCountry(e.target.value)}
-                        disabled={creatingEntry || Number(newEntryRotationMinutes) <= 0}
-                        aria-label="Rotation country override"
-                      >
-                        <option value="">Use global default</option>
-                        {ovpnCountries.map((c) => (
-                          <option key={c.code} value={c.code}>
-                            {c.label}
-                            {typeof c.count === 'number' ? ` (${c.count})` : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </div>
-                  <p className="dashboard-rotation-hint text-muted text-xs">
-                    {Number(newEntryRotationMinutes) > 0
-                      ? 'Active ports are rotated to a random .ovpn at this interval.'
-                      : 'Set a positive interval to enable automatic OVPN rotation while the port is active.'}
-                  </p>
-                </fieldset>
-                ) : (
+                {newEntryEgressType === 'upstream' && (
                   <fieldset className="dashboard-rotation-fieldset" disabled={creatingEntry}>
                     <legend className="dashboard-modal-label">Upstream Refresh</legend>
                     <label className="dashboard-modal-field">
@@ -1561,20 +2055,13 @@ export default function Dashboard() {
                 )}
                 {editEntryEgressType === 'ovpn' && (
                 <label className="dashboard-modal-field">
-                  <span className="dashboard-modal-label">
-                    Location Configuration
-                    {Number(editEntryRotationMinutes) > 0 ? ' (picked at each rotation)' : ''}
-                  </span>
+                  <span className="dashboard-modal-label">Location Configuration</span>
                   <OvpnFileSelect
                     files={sortedOvpnFiles}
                     value={editEntryOvpn}
                     onChange={setEditEntryOvpn}
-                    disabled={isEditingEntry || Number(editEntryRotationMinutes) > 0}
-                    placeholder={
-                      Number(editEntryRotationMinutes) > 0
-                        ? 'Auto-selected each rotation'
-                        : 'Select location .ovpn…'
-                    }
+                    disabled={isEditingEntry}
+                    placeholder="Select location .ovpn..."
                   />
                 </label>
                 )}
@@ -1591,48 +2078,7 @@ export default function Dashboard() {
                     <option value="socks5">SOCKS5</option>
                   </select>
                 </label>
-                {editEntryEgressType === 'ovpn' ? (
-                <fieldset className="dashboard-rotation-fieldset" disabled={isEditingEntry}>
-                  <legend className="dashboard-modal-label">Rotation</legend>
-                  <div className="dashboard-rotation-grid">
-                    <label className="dashboard-modal-field dashboard-rotation-minutes">
-                      <span className="dashboard-modal-label">Interval (minutes, 0 = off)</span>
-                      <input
-                        type="number"
-                        className="dashboard-modal-input"
-                        min="0"
-                        step="1"
-                        value={editEntryRotationMinutes}
-                        onChange={(e) => setEditEntryRotationMinutes(e.target.value)}
-                        placeholder="0"
-                      />
-                    </label>
-                    <label className="dashboard-modal-field dashboard-rotation-country">
-                      <span className="dashboard-modal-label">Country pool</span>
-                      <select
-                        className="dashboard-modal-input"
-                        value={editEntryRotationCountry}
-                        onChange={(e) => setEditEntryRotationCountry(e.target.value)}
-                        disabled={isEditingEntry || Number(editEntryRotationMinutes) <= 0}
-                        aria-label="Rotation country override"
-                      >
-                        <option value="">Use global default</option>
-                        {ovpnCountries.map((c) => (
-                          <option key={c.code} value={c.code}>
-                            {c.label}
-                            {typeof c.count === 'number' ? ` (${c.count})` : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </div>
-                  <p className="dashboard-rotation-hint text-muted text-xs">
-                    {Number(editEntryRotationMinutes) > 0
-                      ? 'Active ports are rotated to a random .ovpn at this interval.'
-                      : 'Set a positive interval to enable automatic OVPN rotation while the port is active.'}
-                  </p>
-                </fieldset>
-                ) : (
+                {editEntryEgressType === 'upstream' && (
                   <fieldset className="dashboard-rotation-fieldset" disabled={isEditingEntry}>
                     <legend className="dashboard-modal-label">Upstream Refresh</legend>
                     <label className="dashboard-modal-field">
@@ -1773,7 +2219,6 @@ export default function Dashboard() {
                   const rotationMinutes = Math.max(0, Math.floor(Number(loc.rotationIntervalMinutes) || 0));
                   const rotationCountry = (loc.rotationCountry || '').toUpperCase();
                   const isRotating = rotationMinutes > 0;
-                  const rotationInfo = { minutes: rotationMinutes, country: rotationCountry };
                   const refreshMinutes = Math.max(0, Math.floor(Number(loc.upstreamRefreshIntervalMinutes) || 0));
                   const activationState = activationStateByPort[portKey] || (enabledPorts.has(port) ? 'active' : 'inactive');
                   const isStarting = activationState === 'starting';
@@ -1895,8 +2340,8 @@ export default function Dashboard() {
                                 autorenew
                               </span>
                               <span>
-                                Rotating · {rotationMinutes}m
-                                {rotationCountry ? ` · ${rotationCountry}` : ''}
+                                Rotating - {rotationMinutes}m
+                                {rotationCountry ? ` - ${rotationCountry}` : ''}
                               </span>
                             </span>
                           )}
@@ -1938,7 +2383,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, egress, proxyTypeServer, rotationInfo, refreshMinutes)}
+                                onClick={() => openEditModal(port, launcherIdServer, egress, proxyTypeServer, refreshMinutes)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>
@@ -1993,7 +2438,7 @@ export default function Dashboard() {
                                 className="btn-secondary"
                                 title="Edit Configuration"
                                 disabled={busyPort === port || isStarting}
-                                onClick={() => openEditModal(port, launcherIdServer, egress, proxyTypeServer, rotationInfo, refreshMinutes)}
+                                onClick={() => openEditModal(port, launcherIdServer, egress, proxyTypeServer, refreshMinutes)}
                                 style={{ padding: '0.4rem', display: 'flex', alignItems: 'center' }}
                               >
                                 <span className="material-symbols-outlined" style={{ fontSize: '1rem' }}>edit</span>

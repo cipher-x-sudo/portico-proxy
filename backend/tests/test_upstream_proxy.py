@@ -24,6 +24,72 @@ from upstream_proxy import (  # noqa: E402
 )
 
 
+class FetchPublicIpViaProxyTests(unittest.TestCase):
+    def test_socks5_public_ip_check_uses_local_dns(self):
+        calls = {}
+
+        class FakeSocksSocket:
+            def set_proxy(self, proxy_type, host, port, rdns, username=None, password=None):
+                calls["set_proxy"] = {
+                    "proxy_type": proxy_type,
+                    "host": host,
+                    "port": port,
+                    "rdns": rdns,
+                    "username": username,
+                    "password": password,
+                }
+
+            def settimeout(self, timeout):
+                calls["timeout"] = timeout
+
+            def connect(self, address):
+                calls["connect"] = address
+
+        class FakeTlsSocket:
+            def __init__(self):
+                self.chunks = [
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+                    b'{"ip":"203.0.113.44"}',
+                    b"",
+                ]
+
+            def sendall(self, data):
+                calls["request"] = data
+
+            def recv(self, size):
+                return self.chunks.pop(0)
+
+            def close(self):
+                calls["closed"] = True
+
+        class FakeSslContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                calls["server_hostname"] = server_hostname
+                return FakeTlsSocket()
+
+        fake_socks = type(
+            "FakeSocksModule",
+            (),
+            {"SOCKS5": object(), "socksocket": FakeSocksSocket},
+        )
+
+        with (
+            patch.dict(sys.modules, {"socks": fake_socks}),
+            patch("ssl.create_default_context", return_value=FakeSslContext()),
+        ):
+            ip = gateway.fetch_public_ip_via_proxy(
+                "proxy-60003",
+                8080,
+                "socks5",
+                username="user",
+                password="pass",
+            )
+
+        self.assertEqual(ip, "203.0.113.44")
+        self.assertIs(calls["set_proxy"]["rdns"], False)
+        self.assertEqual(calls["connect"], ("api.ipify.org", 443))
+
+
 class UpstreamProxyCatalogTests(unittest.TestCase):
     def test_profile_validation_rejects_invalid_scheme_and_port(self):
         with self.assertRaises(UpstreamProxyError):
@@ -131,6 +197,49 @@ class TypedEgressStateTests(unittest.TestCase):
 
 
 class AuthRoutingTests(unittest.TestCase):
+    def test_generated_route_username_uses_requested_preview_when_unique(self):
+        payload = {
+            "autoGenerateUsername": True,
+            "username": "nc_chicago_a8f3",
+            "egress": {"type": "ovpn", "ovpn": "NC/chicago.ovpn"},
+        }
+
+        username = gateway._auth_route_unique_username(payload, [])
+
+        self.assertEqual(username, "nc_chicago_a8f3")
+
+    def test_generated_route_username_regenerates_on_duplicate_preview(self):
+        payload = {
+            "autoGenerateUsername": True,
+            "username": "nc_chicago_a8f3",
+            "egress": {"type": "ovpn", "ovpn": "NC/chicago.ovpn"},
+        }
+
+        username = gateway._auth_route_unique_username(payload, [{"username": "nc_chicago_a8f3"}])
+
+        self.assertRegex(username, r"^nc_chicago_a8f3_[0-9a-f]{4}$")
+
+    def test_normalized_auth_routes_preserve_external_id(self):
+        config = {
+            "authRouting": {
+                "enabled": True,
+                "routes": [
+                    {
+                        "username": "nc_chicago",
+                        "label": "Chicago",
+                        "externalId": "launcher-42",
+                        "proxyType": "socks5",
+                        "egress": {"type": "ovpn", "ovpn": "NC/chicago.ovpn"},
+                    }
+                ],
+            }
+        }
+
+        routes = gateway.normalize_auth_routes(config)
+
+        self.assertEqual(routes[0]["externalId"], "launcher-42")
+        self.assertEqual(routes[0]["proxyType"], "socks5")
+
     def test_http_basic_auth_parses_username_and_password(self):
         token = base64.b64encode(b"us_chicago:secret").decode("ascii")
         raw = (
@@ -187,16 +296,145 @@ class AuthRoutingTests(unittest.TestCase):
         }
         state = {"auth_routes": gateway.normalize_auth_routes(config), "auth_global_password": "secret"}
 
-        idx, route, err = gateway._auth_route_for_credentials(state, "us_chicago", "secret")
+        idx, route, err = gateway._auth_route_for_credentials(state, "us_chicago", "secret", "http")
         self.assertIsNone(err)
         self.assertEqual(idx, 0)
         self.assertEqual(route["egress"], {"type": "ovpn", "ovpn": "NC/example.ovpn"})
 
-        _idx, _route, err = gateway._auth_route_for_credentials(state, "us_chicago", "wrong")
+        _idx, _route, err = gateway._auth_route_for_credentials(state, "us_chicago", "wrong", "http")
         self.assertIn("Invalid", err)
 
-        _idx, _route, err = gateway._auth_route_for_credentials(state, "disabled", "secret")
+        _idx, _route, err = gateway._auth_route_for_credentials(state, "disabled", "secret", "http")
         self.assertIn("disabled", err)
+
+    def test_auth_route_rejects_wrong_protocol(self):
+        config = {
+            "authRouting": {
+                "enabled": True,
+                "routes": [
+                    {
+                        "username": "socksonly",
+                        "proxyType": "socks5",
+                        "enabled": True,
+                        "egress": {"type": "ovpn", "ovpn": "NC/example.ovpn"},
+                    }
+                ],
+            }
+        }
+        state = {"auth_routes": gateway.normalize_auth_routes(config), "auth_global_password": "secret"}
+
+        _idx, _route, err = gateway._auth_route_for_credentials(state, "socksonly", "secret", "http")
+        self.assertIn("SOCKS5", err)
+
+        idx, route, err = gateway._auth_route_for_credentials(state, "socksonly", "secret", "socks5")
+        self.assertIsNone(err)
+        self.assertEqual(idx, 0)
+        self.assertEqual(route["proxyType"], "socks5")
+
+    def test_auth_routing_host_resolution_uses_public_ip_for_all_interfaces(self):
+        with patch.object(gateway, "get_cached_public_wan_ipv4", return_value="203.0.113.10"):
+            result = gateway.resolve_client_proxy_host("", "0.0.0.0", True)
+
+        self.assertEqual(result["host"], "203.0.113.10")
+        self.assertEqual(result["source"], "auto-public-ip")
+        self.assertEqual(result["publicWanIp"], "203.0.113.10")
+
+    def test_auth_routing_host_resolution_falls_back_to_localhost(self):
+        with patch.object(gateway, "get_cached_public_wan_ipv4", return_value=None):
+            result = gateway.resolve_client_proxy_host("", "0.0.0.0", True)
+
+        self.assertEqual(result["host"], "127.0.0.1")
+        self.assertEqual(result["source"], "fallback-localhost")
+
+    def test_local_auth_copy_host_uses_browser_local_mode_without_public_wan(self):
+        result = gateway.auth_route_copy_host_payload("", True)
+
+        self.assertEqual(result["copyHost"], "")
+        self.assertEqual(result["copyHostMode"], "local")
+        self.assertEqual(result["copyHostSource"], "browser-local")
+
+    def test_auth_copy_host_explicit_config_wins(self):
+        result = gateway.auth_route_copy_host_payload("192.168.1.50", True)
+
+        self.assertEqual(result["copyHost"], "192.168.1.50")
+        self.assertEqual(result["copyHostMode"], "configured")
+        self.assertEqual(result["copyHostSource"], "config")
+
+    def test_auth_route_start_reattaches_running_docker_container(self):
+        route = gateway.normalize_auth_routes(
+            {
+                "authRouting": {
+                    "routes": [
+                        {
+                            "username": "socksonly",
+                            "proxyType": "socks5",
+                            "enabled": True,
+                            "egress": {"type": "ovpn", "ovpn": "NC/example.ovpn"},
+                        }
+                    ]
+                }
+            }
+        )[0]
+        state = {
+            "auth_routes": [route],
+            "use_docker": True,
+            "lock": threading.Lock(),
+            "port_to_slot": {},
+            "slots": [],
+            "max_slots": 2,
+            "internal_port_base": 51000,
+            "auth_route_state": {},
+            "auth_route_error": {},
+        }
+
+        with (
+            patch.object(
+                gateway,
+                "_auth_route_docker_container_state",
+                return_value={"exists": True, "running": True, "name": "proxy-60001", "status": "running"},
+            ),
+            patch.object(gateway, "validate_port_egress") as validate_mock,
+            patch("backend_docker.start_docker_backend") as start_mock,
+        ):
+            slot, err = gateway._start_auth_route_backend(state, 0, "socks5")
+
+        self.assertIsNone(err)
+        self.assertEqual(slot["container_name"], "proxy-60001")
+        self.assertEqual(state["auth_route_state"]["socksonly:socks5"], "active")
+        validate_mock.assert_not_called()
+        start_mock.assert_not_called()
+
+    def test_auth_route_stop_removes_stale_docker_container_without_slot(self):
+        route = gateway.normalize_auth_routes(
+            {
+                "authRouting": {
+                    "routes": [
+                        {
+                            "username": "socksonly",
+                            "proxyType": "socks5",
+                            "enabled": True,
+                            "egress": {"type": "ovpn", "ovpn": "NC/example.ovpn"},
+                        }
+                    ]
+                }
+            }
+        )[0]
+        state = {
+            "auth_routes": [route],
+            "use_docker": True,
+            "lock": threading.Lock(),
+            "port_to_slot": {},
+            "auth_route_state": {"socksonly:socks5": "active"},
+            "auth_route_error": {"socksonly:socks5": "old"},
+        }
+
+        with patch.object(gateway, "_remove_auth_route_docker_container", return_value=True) as remove_mock:
+            ok = gateway._stop_auth_route_backends(state, "socksonly", "socks5")
+
+        self.assertTrue(ok)
+        remove_mock.assert_called_once_with(60001)
+        self.assertEqual(state["auth_route_state"]["socksonly:socks5"], "inactive")
+        self.assertNotIn("socksonly:socks5", state["auth_route_error"])
 
 
 class OvpnUploadTests(unittest.TestCase):

@@ -2,10 +2,10 @@
 # Build context = ./backend (set by docker-compose.local-auth.yml at repo root).
 FROM python:3.10-slim
 
-RUN pip install --no-cache-dir docker redis PySocks
+RUN pip install --no-cache-dir docker redis PySocks psycopg2-binary
 
 WORKDIR /app
-COPY gateway.py openvpn_proxy_runner.py backend_docker.py ovpn_filter.py provider_auth.py upstream_proxy.py ./
+COPY gateway.py openvpn_proxy_runner.py backend_docker.py ovpn_filter.py provider_auth.py upstream_proxy.py storage.py ./
 
 ENV CONFIG_PATH=/config/openvpn-proxy-config.json
 ENV USE_DOCKER=1

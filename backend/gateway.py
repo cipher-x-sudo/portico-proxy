@@ -64,6 +64,7 @@ from upstream_proxy import (
     resolve_catalog_path,
     save_catalog,
 )
+from storage import PorticoStore, database_url as storage_database_url, enabled as storage_enabled
 
 BUFFER_SIZE = 65536  # 64 KB max buffer while waiting for backend
 BACKEND_READY_TIMEOUT = 90  # seconds to wait for proxy (cap so client can retry if VPN is slow)
@@ -75,12 +76,15 @@ INITIAL_READ_DEADLINE = 0.5  # max seconds to wait for first byte (avoids long s
 PORTS_PER_LOCATION = 1  # One client listener per location (pproxy: http or socks5 on worker :8080)
 BACKEND_HTTP_PORT = 8080
 EXTEND_PORT_IDLE_SECONDS = 30 * 60  # user extend: add this much idle budget (monotonic last_activity)
+DB_STORE: Optional[PorticoStore] = None
 
 # Public WAN IPv4 for dashboard proxy URLs when clientProxyHost is empty and listeners bind all interfaces.
 _AUTO_WAN_IP_STATE: Dict[str, Any] = {"ip": None, "valid_until": 0.0, "cooldown_until": 0.0}
 _AUTO_WAN_IP_LOCK = threading.Lock()
 _AUTO_WAN_IP_TTL_SEC = 600.0
 _AUTO_WAN_IP_FAIL_COOLDOWN_SEC = 45.0
+_EGRESS_PUBLIC_IP_TTL_SEC = 300.0
+_EGRESS_PUBLIC_IP_FAIL_COOLDOWN_SEC = 30.0
 
 
 def _is_plain_ipv4(s: str) -> bool:
@@ -149,6 +153,118 @@ def get_cached_public_wan_ipv4() -> Optional[str]:
         _AUTO_WAN_IP_STATE["cooldown_until"] = now2 + _AUTO_WAN_IP_FAIL_COOLDOWN_SEC
         cur = _AUTO_WAN_IP_STATE.get("ip")
         return str(cur) if cur else None
+
+
+def resolve_client_proxy_host(
+    cfg_client: str,
+    listen_host: str,
+    auto_detect_wan: bool,
+) -> Dict[str, str]:
+    """Resolve the host clients should use in copied proxy strings."""
+    explicit = (cfg_client or "").strip()
+    if explicit:
+        return {"host": explicit, "source": "config", "publicWanIp": ""}
+    listen_h = (listen_host or "127.0.0.1").strip() or "127.0.0.1"
+    if listen_h in ("0.0.0.0", "::", "[::]"):
+        wan = get_cached_public_wan_ipv4() if auto_detect_wan else None
+        if wan:
+            return {"host": wan, "source": "auto-public-ip", "publicWanIp": wan}
+        return {"host": "127.0.0.1", "source": "fallback-localhost", "publicWanIp": ""}
+    return {"host": listen_h, "source": "listen-host", "publicWanIp": ""}
+
+
+def auth_route_copy_host_payload(cfg_client: str, local_auth_routing: bool) -> Dict[str, Any]:
+    """Describe how auth-route copy strings should choose their connect host."""
+    explicit = (cfg_client or "").strip()
+    if explicit:
+        return {"copyHost": explicit, "copyHostSource": "config", "copyHostMode": "configured"}
+    if local_auth_routing:
+        return {"copyHost": "", "copyHostSource": "browser-local", "copyHostMode": "local"}
+    return {"copyHost": "", "copyHostSource": "server-status", "copyHostMode": "server"}
+
+
+def _parse_ipify_body(body: str) -> str:
+    match = re.search(r'"ip"\s*:\s*"([^"]+)"', body or "")
+    ip = match.group(1).strip() if match else (body or "").strip()
+    return ip if _is_plain_ipv4(ip) else ""
+
+
+def fetch_public_ip_via_proxy(
+    proxy_host: str,
+    proxy_port: int,
+    proxy_type: str,
+    username: str = "",
+    password: str = "",
+    timeout: float = 12.0,
+) -> str:
+    """Return the public IP seen after routing through a running proxy backend."""
+    ptype = "socks5" if proxy_type == "socks5" else "http"
+    if ptype == "http":
+        import urllib.request as urllib_request
+
+        auth = ""
+        if username or password:
+            user_enc = urllib.parse.quote(username or "", safe="")
+            pass_enc = urllib.parse.quote(password or "", safe="")
+            auth = f"{user_enc}:{pass_enc}@"
+        proxy_url = f"http://{auth}{proxy_host}:{proxy_port}"
+        proxy_handler = urllib_request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        opener = urllib_request.build_opener(proxy_handler)
+        req = urllib_request.Request(
+            "https://api.ipify.org?format=json",
+            headers={"User-Agent": "Portico-Proxy-Gateway/1.0"},
+        )
+        with opener.open(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        ip = _parse_ipify_body(body)
+        if not ip:
+            raise RuntimeError("ipify response did not contain a plain IPv4 address")
+        return ip
+
+    try:
+        import socks  # type: ignore
+    except ImportError as e:
+        raise RuntimeError("SOCKS5 public IP check requires PySocks") from e
+    s = socks.socksocket()
+    s.set_proxy(
+        socks.SOCKS5,
+        proxy_host,
+        proxy_port,
+        rdns=False,
+        username=username or None,
+        password=password or None,
+    )
+    s.settimeout(timeout)
+    try:
+        s.connect(("api.ipify.org", 443))
+        ctx = __import__("ssl").create_default_context()
+        tls = ctx.wrap_socket(s, server_hostname="api.ipify.org")
+        try:
+            tls.sendall(
+                b"GET /?format=json HTTP/1.1\r\n"
+                b"Host: api.ipify.org\r\n"
+                b"User-Agent: Portico-Proxy-Gateway/1.0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            chunks: List[bytes] = []
+            while True:
+                chunk = tls.recv(8192)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            tls.close()
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    raw = b"".join(chunks).decode("utf-8", errors="replace")
+    _hdr, _sep, body = raw.partition("\r\n\r\n")
+    ip = _parse_ipify_body(body)
+    if not ip:
+        raise RuntimeError("ipify response did not contain a plain IPv4 address")
+    return ip
 
 
 listening_sockets: List[socket.socket] = []
@@ -463,24 +579,216 @@ def normalize_auth_routes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         seen.add(username)
         label = (str(raw.get("label") or username)).strip() or username
+        external_id = (str(raw.get("externalId") or raw.get("external_id") or "")).strip()
+        proxy_type = "socks5" if (str(raw.get("proxyType") or raw.get("proxy_type") or "")).strip().lower() == "socks5" else "http"
+        try:
+            rotation_minutes = int(raw.get("rotationIntervalMinutes") or raw.get("rotation_interval_minutes") or 0)
+        except (TypeError, ValueError):
+            rotation_minutes = 0
+        rotation_minutes = max(0, min(_ROTATION_INTERVAL_MAX_MINUTES, rotation_minutes))
+        rotation_country_raw = (str(raw.get("rotationCountry") or raw.get("rotation_country") or "")).strip()
+        rotation_country = ""
+        if rotation_minutes > 0 and rotation_country_raw:
+            norm_country = normalize_randomize_country(rotation_country_raw)
+            if norm_country != "random":
+                rotation_country = norm_country
+        try:
+            rotation_last_run = float(raw.get("rotationLastRun") or raw.get("rotation_last_run") or 0.0)
+        except (TypeError, ValueError):
+            rotation_last_run = 0.0
         enabled = raw.get("enabled")
         if enabled is None:
             enabled = True
+        egress = _normalize_auth_route_egress(raw)
+        if egress.get("type") != "ovpn":
+            rotation_minutes = 0
+            rotation_country = ""
+            rotation_last_run = 0.0
         routes.append(
             {
                 "index": len(routes),
                 "username": username,
                 "label": label,
+                "externalId": external_id,
+                "proxyType": proxy_type,
+                "rotationIntervalMinutes": rotation_minutes,
+                "rotationCountry": rotation_country,
+                "rotationLastRun": rotation_last_run if rotation_minutes > 0 else 0.0,
                 "enabled": bool(enabled),
-                "egress": _normalize_auth_route_egress(raw),
+                "egress": egress,
             }
         )
     return routes
 
 
+def _auth_username_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    return slug[:32].strip("_") or "proxy"
+
+
+def _auth_username_seed(payload: Dict[str, Any]) -> str:
+    explicit = (str(payload.get("username") or "")).strip()
+    if explicit:
+        return explicit
+    for key in ("externalId", "external_id", "label"):
+        raw = (str(payload.get(key) or "")).strip()
+        if raw:
+            return raw
+    egress = _normalize_auth_route_egress(payload)
+    ovpn = (egress.get("ovpn") or "").strip()
+    if ovpn:
+        pieces = [p for p in re.split(r"[\\/]+", ovpn) if p]
+        provider = pieces[0] if len(pieces) > 1 else ""
+        basename = Path(pieces[-1]).stem if pieces else ovpn
+        return "_".join([p for p in (provider, basename) if p])
+    upstream_id = (egress.get("upstreamProxyId") or "").strip()
+    if upstream_id:
+        return upstream_id
+    return "proxy"
+
+
+def _auth_route_unique_username(payload: Dict[str, Any], routes: Iterable[Dict[str, Any]]) -> str:
+    existing = {
+        (str(route.get("username") or "")).strip()
+        for route in routes
+        if (str(route.get("username") or "")).strip()
+    }
+    base = _auth_username_slug(_auth_username_seed(payload))
+    requested = (str(payload.get("username") or "")).strip()
+    requested_slug = _auth_username_slug(requested) if requested else ""
+    if requested and requested == requested_slug and requested not in existing:
+        return requested
+    if requested:
+        base = requested_slug
+    for _ in range(32):
+        candidate = f"{base}_{secrets.token_hex(2)}"
+        if candidate not in existing:
+            return candidate
+    return f"{base}_{secrets.token_hex(4)}"
+
+
 def _auth_route_backend_key(route_index: int, scheme: str) -> int:
     offset = 1 if (scheme or "").lower() == "socks5" else 0
     return AUTH_ROUTE_BACKEND_BASE + (route_index * 2) + offset
+
+
+def _auth_route_container_name(backend_key: int) -> str:
+    return f"proxy-{backend_key}"
+
+
+def _auth_route_protocol_key(username: str, scheme: str) -> str:
+    return f"{username}:{'socks5' if scheme == 'socks5' else 'http'}"
+
+
+def _auth_route_docker_container_state(backend_key: int) -> Dict[str, Any]:
+    try:
+        from backend_docker import inspect_worker_container
+
+        return inspect_worker_container(_auth_route_container_name(backend_key))
+    except Exception:
+        return {
+            "exists": False,
+            "running": False,
+            "name": _auth_route_container_name(backend_key),
+            "status": "",
+            "id": "",
+        }
+
+
+def _remove_auth_route_docker_container(backend_key: int) -> bool:
+    try:
+        from backend_docker import remove_worker_container_by_name
+
+        return remove_worker_container_by_name(_auth_route_container_name(backend_key))
+    except Exception:
+        return False
+
+
+def _make_auth_route_slot(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for candidate in state["slots"]:
+        if candidate.get("external_port") is None:
+            return candidate
+    if len([s for s in state["slots"] if s.get("external_port") is not None]) >= state["max_slots"]:
+        used = [s for s in state["slots"] if s.get("external_port") is not None]
+        if not used:
+            return None
+        oldest = min(used, key=lambda s: s["last_activity"])
+        old_key = oldest.get("external_port")
+        if old_key is not None:
+            state["port_to_slot"].pop(old_key, None)
+        teardown_slot(oldest, bool(state.get("use_docker")))
+        return oldest
+    if len(state["slots"]) >= state["max_slots"]:
+        return None
+    slot = {
+        "internal_port": int(state.get("internal_port_base", 51000)) + len(state["slots"]),
+        "location_index": None,
+        "openvpn_process": None,
+        "proxy_process": None,
+        "log_path": "",
+        "auth_path": "",
+        "backend_host": None,
+        "backend_port": None,
+        "container_name": None,
+        "last_activity": time.monotonic(),
+        "external_port": None,
+        "proxy_type": None,
+        "egress_type": None,
+        "route_username": None,
+    }
+    state["slots"].append(slot)
+    return slot
+
+
+def _refresh_auth_route_egress_ip(state: Dict[str, Any], username: str, scheme: str, slot: Dict[str, Any]) -> None:
+    key = _auth_route_protocol_key(username, scheme)
+    host = str(slot.get("backend_host") or "").strip()
+    try:
+        port = int(slot.get("backend_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not host or port <= 0:
+        return
+    try:
+        ip = fetch_public_ip_via_proxy(host, port, "socks5" if scheme == "socks5" else "http")
+        payload = {"ip": ip, "checkedAt": time.time(), "error": "", "validUntil": time.time() + _EGRESS_PUBLIC_IP_TTL_SEC}
+    except Exception as e:
+        payload = {
+            "ip": "",
+            "checkedAt": time.time(),
+            "error": str(e),
+            "validUntil": time.time() + _EGRESS_PUBLIC_IP_FAIL_COOLDOWN_SEC,
+        }
+    with state["lock"]:
+        state.setdefault("auth_route_egress_ip", {})[key] = payload
+        state.setdefault("auth_route_egress_ip_refreshing", set()).discard(key)
+
+
+def _maybe_start_auth_route_egress_ip_refresh(
+    state: Dict[str, Any],
+    username: str,
+    scheme: str,
+    slot: Optional[Dict[str, Any]],
+    force: bool = False,
+) -> None:
+    if not slot:
+        return
+    key = _auth_route_protocol_key(username, scheme)
+    now = time.time()
+    with state["lock"]:
+        cache = dict((state.get("auth_route_egress_ip") or {}).get(key) or {})
+        refreshing = state.setdefault("auth_route_egress_ip_refreshing", set())
+        if key in refreshing:
+            return
+        if not force and now < float(cache.get("validUntil") or 0.0):
+            return
+        refreshing.add(key)
+    threading.Thread(
+        target=_refresh_auth_route_egress_ip,
+        args=(state, username, scheme, dict(slot)),
+        daemon=True,
+    ).start()
 
 
 def _auth_route_location_config(routes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -512,6 +820,21 @@ def _route_password_matches(expected: str, supplied: str) -> bool:
 
 
 def _persist_auth_routes_config(config_path: Path, state: Dict[str, Any], routes: List[Dict[str, Any]]) -> Optional[str]:
+    store = state.get("db_store")
+    if store is not None:
+        try:
+            store.save_auth_routes(routes)
+            cfg = dict(state.get("auth_runtime_config") or {})
+            auth_cfg = dict(_auth_routing_dict(cfg))
+            auth_cfg["enabled"] = True
+            auth_cfg["httpPort"] = int(state.get("auth_http_port") or AUTH_HTTP_PORT_DEFAULT)
+            auth_cfg["socksPort"] = int(state.get("auth_socks_port") or AUTH_SOCKS_PORT_DEFAULT)
+            auth_cfg["routes"] = routes
+            cfg["authRouting"] = auth_cfg
+            store.save_config(_prepare_config_for_disk(cfg))
+            return None
+        except Exception as e:
+            return str(e)
     try:
         with open(config_path, encoding="utf-8") as f:
             cfg = json.load(f)
@@ -529,6 +852,11 @@ def _persist_auth_routes_config(config_path: Path, state: Dict[str, Any], routes
         {
             "username": route.get("username") or "",
             "label": route.get("label") or route.get("username") or "",
+            "externalId": route.get("externalId") or route.get("external_id") or "",
+            "proxyType": "socks5" if route.get("proxyType") == "socks5" else "http",
+            "rotationIntervalMinutes": int(route.get("rotationIntervalMinutes") or 0),
+            "rotationCountry": route.get("rotationCountry") or "",
+            "rotationLastRun": float(route.get("rotationLastRun") or 0.0),
             "enabled": bool(route.get("enabled", True)),
             "egress": dict(route.get("egress") or {"type": "none"}),
         }
@@ -560,6 +888,16 @@ def apply_openvpn_auth_env(config: Dict[str, Any]) -> None:
         for loc in (config.get("locations") or []):
             if isinstance(loc, dict):
                 loc["password"] = p
+
+
+def attach_provider_credentials(config: Dict[str, Any]) -> None:
+    global DB_STORE
+    if DB_STORE is None:
+        return
+    try:
+        config["_providerCredentials"] = DB_STORE.load_provider_credentials()
+    except Exception as e:
+        _log(f"Could not load provider credentials from Postgres: {e}")
 
 
 def apply_location_spec(config: Dict[str, Any]) -> None:
@@ -696,13 +1034,21 @@ def _parse_auth_file_credentials(auth_path: Path) -> Tuple[str, str]:
 
 
 def _collect_provider_auth_rows(
-    config: Dict[str, Any], config_path: Path, use_docker: bool
+    config: Dict[str, Any],
+    config_path: Path,
+    use_docker: bool,
+    provider_credentials: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[str], int]:
     ovpn_root = _resolve_provider_auth_root(config, config_path, use_docker)
     if not ovpn_root.exists() or not ovpn_root.is_dir():
         return [], f"ovpnRoot does not exist or is not a directory: {ovpn_root}", 400
 
     provider_names: Set[str] = set()
+    for name in (provider_credentials or {}).keys():
+        if name == name.casefold():
+            continue
+        if _is_safe_provider_name(name):
+            provider_names.add(name)
     for p in ovpn_root.rglob("*.ovpn"):
         if not p.is_file():
             continue
@@ -723,13 +1069,18 @@ def _collect_provider_auth_rows(
         username = ""
         password = ""
         has_auth_file = auth_path.is_file()
-        if has_auth_file:
+        db_row = (provider_credentials or {}).get(provider) or (provider_credentials or {}).get(provider.casefold())
+        if isinstance(db_row, dict):
+            username = db_row.get("username") or ""
+            password = db_row.get("password") or ""
+        elif has_auth_file:
             username, password = _parse_auth_file_credentials(auth_path)
         rows.append(
             {
                 "provider": provider,
                 "authPath": str(auth_path.resolve()),
                 "hasAuthFile": has_auth_file,
+                "hasDbCredentials": bool(isinstance(db_row, dict) and username and password),
                 "username": username,
                 "password": password,
             }
@@ -800,12 +1151,13 @@ def save_ovpn_upload_batch(
     password: str,
     files: List[Dict[str, Any]],
     overwrite: bool = False,
+    write_auth_file: bool = True,
 ) -> Dict[str, Any]:
     """
     Validate and commit a loose-file OVPN upload batch into one provider folder.
 
-    files entries are {"filename": str, "data": bytes}. The provider auth.txt is
-    always derived from username/password, so uploaded auth.txt is reserved.
+    files entries are {"filename": str, "data": bytes}. In legacy file mode the
+    provider auth.txt is derived from username/password, so uploaded auth.txt is reserved.
     """
     provider_name = (provider or "").strip()
     if not _is_safe_provider_name(provider_name):
@@ -816,7 +1168,7 @@ def save_ovpn_upload_batch(
         raise OvpnUploadError("password contains invalid characters")
     username = str(username or "").strip()
     password = str(password or "")
-    if not username or not password:
+    if write_auth_file and (not username or not password):
         raise OvpnUploadError("username and password are required")
     if not files:
         raise OvpnUploadError("at least one upload file is required")
@@ -885,9 +1237,10 @@ def save_ovpn_upload_batch(
                     continue
                 if not target_ref.exists():
                     raise OvpnUploadError(f"Referenced OpenVPN asset missing for {filename}: {ref}")
-        auth_stage = stage_dir / "auth.txt"
-        auth_stage.write_text(f"{username}\n{password}\n", encoding="utf-8")
-        staged_files.append((auth_stage, (provider_dir / "auth.txt").resolve(), "auth.txt"))
+        if write_auth_file:
+            auth_stage = stage_dir / "auth.txt"
+            auth_stage.write_text(f"{username}\n{password}\n", encoding="utf-8")
+            staged_files.append((auth_stage, (provider_dir / "auth.txt").resolve(), "auth.txt"))
 
         provider_dir.mkdir(parents=True, exist_ok=True)
         for _stage_path, target_path, filename in staged_files:
@@ -911,7 +1264,8 @@ def save_ovpn_upload_batch(
         "uploaded": len(uploaded_files),
         "ovpnUploaded": sum(1 for name in uploaded_files if Path(name).suffix.lower() == ".ovpn"),
         "files": uploaded_files,
-        "authPath": str((provider_dir / "auth.txt").resolve()),
+        "authPath": str((provider_dir / "auth.txt").resolve()) if write_auth_file else "",
+        "credentialsStoredIn": "auth.txt" if write_auth_file else ("postgres" if username and password else "none"),
     }
 
 
@@ -973,10 +1327,8 @@ def build_ovpn_files_payload(
             )
         elif len(files) == 0:
             payload["hint"] = (
-                "No .ovpn files under the gateway mount. Copy .ovpn files into the host folder set as "
-                "OVPN_HOST_PATH. If you changed OVPN_HOST_PATH after the first `docker compose up`, "
-                "Docker may still use the old volume: run `docker compose down`, `docker volume rm ovpn_data`, "
-                "then `docker compose up -d`."
+                "No .ovpn files under the gateway mount. Upload OVPN files from the dashboard; "
+                "they will be stored in the ovpn_data Docker volume at /ovpn."
             )
     else:
         base_dir = config_path.resolve().parent
@@ -1001,11 +1353,18 @@ def build_ovpn_files_payload(
 
 def load_disk_config_expanded(config_path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
     """Load config JSON from disk and apply locationSpec (same as gateway startup / GET /api/config)."""
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            cfg: Dict[str, Any] = json.load(f)
-    except Exception as e:
-        return None, f"Could not read config: {e}", 500
+    global DB_STORE
+    if DB_STORE is not None:
+        try:
+            cfg = DB_STORE.load_config()
+        except Exception as e:
+            return None, f"Could not read config from database: {e}", 500
+    else:
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                cfg: Dict[str, Any] = json.load(f)
+        except Exception as e:
+            return None, f"Could not read config: {e}", 500
     try:
         apply_location_spec(cfg)
     except ValueError as e:
@@ -1521,6 +1880,22 @@ def load_gateway_assignments_state(
     """Load OVPN picks + activePorts + launcherIds + proxyTypes + rotation state from Redis or JSON file; migrate file→Redis if needed."""
     if num_ports <= 0:
         return {}, [], {}, {}, {}, {}, {}, {}, {}, {}
+    global DB_STORE
+    if DB_STORE is not None:
+        try:
+            raw = DB_STORE.load_assignment_payload(port_base, num_ports)
+            return _ingest_assignments_raw(
+                raw,
+                port_base,
+                num_ports,
+                runtime_config,
+                cfg_path,
+                use_docker,
+                "postgres port_state",
+            )
+        except Exception as e:
+            _log(f"Could not load assignments from Postgres: {e}")
+            return {}, [], {}, {}, {}, {}, {}, {}, {}, {}
     raw: Optional[Dict[str, Any]] = None
     source = ""
     loaded_from_redis = False
@@ -1650,9 +2025,10 @@ def _anti_wipe_merge_assignments(
 
 def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
     path = state.get("assignments_path")
-    if path is None:
+    store = state.get("db_store")
+    if path is None and store is None:
         return
-    p = Path(path)
+    p = Path(path) if path is not None else Path("")
     redis_url = (state.get("redis_url") or "").strip()
     redis_key = state.get("redis_state_key") or _redis_state_key()
     mirror_file = os.environ.get("REDIS_ASSIGNMENTS_MIRROR_FILE", "").lower() in ("1", "true", "yes")
@@ -1685,6 +2061,9 @@ def persist_assignments_snapshot(state: Dict[str, Any]) -> None:
             snap_refresh_intervals,
             snap_refresh_last_run,
         )
+        if store is not None:
+            store.save_assignment_payload(payload, port_base, num_ports)
+            return
         if redis_url:
             try:
                 _redis_save_json(redis_url, redis_key, payload)
@@ -1752,7 +2131,7 @@ def validate_location_assets(
         if not mount.exists() or not mount.is_dir():
             return (
                 f"Gateway OVPN volume not mounted at {mount}. "
-                "Add ovpn_data:/ovpn:ro to the gateway service in docker-compose.yml and restart."
+                "Add ovpn_data:/ovpn to the gateway service in docker-compose.yml and restart."
             )
         ovpn_full = (mount / ovpn_name).resolve()
         if not _is_safe_under_root(ovpn_full, mount):
@@ -1760,7 +2139,7 @@ def validate_location_assets(
         if not ovpn_full.exists() or not ovpn_full.is_file():
             return (
                 f"OVPN file not found in VPN folder: {ovpn_name}. "
-                "Copy it into the host directory set as OVPN_HOST_PATH (or ../ovpn) and restart if needed."
+                "Upload it from the dashboard into the OVPN volume and try again."
             )
         if ovpn_full.suffix.lower() not in ALLOWED_ASSET_EXTENSIONS:
             return f"OVPN file extension not allowed: {ovpn_full.name}"
@@ -1777,7 +2156,11 @@ def validate_location_assets(
             if not ref_path.exists() or not ref_path.is_file():
                 return f"Referenced OpenVPN asset missing: {ref}"
         try:
-            load_provider_auth(ovpn_name, mount)
+            load_provider_auth(
+                ovpn_name,
+                mount,
+                config.get("_providerCredentials") if isinstance(config.get("_providerCredentials"), dict) else None,
+            )
         except RuntimeError as e:
             return str(e)
         return None
@@ -2158,6 +2541,9 @@ def _start_auth_route_backend(
     if not bool(route.get("enabled", True)):
         return None, "Route is disabled"
     scheme = "socks5" if scheme == "socks5" else "http"
+    route_proxy_type = "socks5" if route.get("proxyType") == "socks5" else "http"
+    if scheme != route_proxy_type:
+        return None, f"Route is configured for {route_proxy_type.upper()} only"
     backend_key = _auth_route_backend_key(route_index, scheme)
     use_docker = bool(state.get("use_docker"))
     with state["lock"]:
@@ -2165,6 +2551,40 @@ def _start_auth_route_backend(
         if existing and is_backend_running(existing, use_docker):
             existing["last_activity"] = time.monotonic()
             return existing, None
+        if existing and state.setdefault("auth_route_state", {}).get(f"{route.get('username')}:{scheme}") == "starting":
+            return existing, None
+        if existing and not is_backend_running(existing, use_docker):
+            state["port_to_slot"].pop(backend_key, None)
+            teardown_slot(existing, use_docker)
+            existing["external_port"] = None
+            existing["location_index"] = None
+
+    if use_docker:
+        container_state = _auth_route_docker_container_state(backend_key)
+        if container_state.get("running"):
+            with state["lock"]:
+                slot = state["port_to_slot"].get(backend_key)
+                if slot is None:
+                    slot = _make_auth_route_slot(state)
+                    if slot is None:
+                        return None, "No available slot capacity"
+                slot["location_index"] = route_index
+                slot["external_port"] = backend_key
+                slot["proxy_type"] = scheme
+                slot["route_username"] = route.get("username") or ""
+                slot["backend_host"] = container_state.get("name") or _auth_route_container_name(backend_key)
+                slot["backend_port"] = BACKEND_HTTP_PORT
+                slot["container_name"] = container_state.get("name") or _auth_route_container_name(backend_key)
+                slot["last_activity"] = time.monotonic()
+                slot["egress_type"] = (route.get("egress") or {}).get("type")
+                state["port_to_slot"][backend_key] = slot
+                state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "active"
+                state.setdefault("auth_route_error", {}).pop(f"{route.get('username')}:{scheme}", None)
+                state.setdefault("auth_route_egress_ip", {}).pop(f"{route.get('username')}:{scheme}", None)
+            _maybe_start_auth_route_egress_ip_refresh(state, route.get("username") or "", scheme, slot, force=True)
+            return slot, None
+        if container_state.get("exists"):
+            _remove_auth_route_docker_container(backend_key)
 
     launch_config = _auth_route_launch_config(state)
     egress = dict(route.get("egress") or {})
@@ -2183,39 +2603,12 @@ def _start_auth_route_backend(
 
     with state["lock"]:
         slot = state["port_to_slot"].get(backend_key)
+        if slot is not None and state.setdefault("auth_route_state", {}).get(f"{route.get('username')}:{scheme}") == "starting":
+            return slot, None
         if slot is None:
-            for candidate in state["slots"]:
-                if candidate.get("external_port") is None:
-                    slot = candidate
-                    break
-        if slot is None and len([s for s in state["slots"] if s.get("external_port") is not None]) >= state["max_slots"]:
-            used = [s for s in state["slots"] if s.get("external_port") is not None]
-            oldest = min(used, key=lambda s: s["last_activity"])
-            old_key = oldest.get("external_port")
-            if old_key is not None:
-                state["port_to_slot"].pop(old_key, None)
-            teardown_slot(oldest, use_docker)
-            slot = oldest
+            slot = _make_auth_route_slot(state)
         if slot is None:
-            if len(state["slots"]) >= state["max_slots"]:
-                return None, "No available slot capacity"
-            slot = {
-                "internal_port": int(state.get("internal_port_base", 51000)) + len(state["slots"]),
-                "location_index": None,
-                "openvpn_process": None,
-                "proxy_process": None,
-                "log_path": "",
-                "auth_path": "",
-                "backend_host": None,
-                "backend_port": None,
-                "container_name": None,
-                "last_activity": time.monotonic(),
-                "external_port": None,
-                "proxy_type": None,
-                "egress_type": None,
-                "route_username": None,
-            }
-            state["slots"].append(slot)
+            return None, "No available slot capacity"
         slot["location_index"] = route_index
         slot["external_port"] = backend_key
         slot["proxy_type"] = scheme
@@ -2295,6 +2688,8 @@ def _start_auth_route_backend(
     with state["lock"]:
         state.setdefault("auth_route_state", {})[f"{route.get('username')}:{scheme}"] = "active"
         state.setdefault("auth_route_error", {}).pop(f"{route.get('username')}:{scheme}", None)
+        state.setdefault("auth_route_egress_ip", {}).pop(f"{route.get('username')}:{scheme}", None)
+    _maybe_start_auth_route_egress_ip_refresh(state, route.get("username") or "", scheme, slot, force=True)
     return slot, None
 
 
@@ -2309,14 +2704,19 @@ def _stop_auth_route_backends(
         return False
     route_index, route = found
     schemes = ["http", "socks5"] if scheme == "both" else ["socks5" if scheme == "socks5" else "http"]
+    use_docker = bool(state.get("use_docker"))
     with state["lock"]:
         for item in schemes:
             key = _auth_route_backend_key(route_index, item)
             slot = state["port_to_slot"].pop(key, None)
             if slot is not None:
-                teardown_slot(slot, bool(state.get("use_docker")))
+                teardown_slot(slot, use_docker)
+            if use_docker:
+                _remove_auth_route_docker_container(key)
             state.setdefault("auth_route_state", {})[f"{route.get('username')}:{item}"] = "inactive"
             state.setdefault("auth_route_error", {}).pop(f"{route.get('username')}:{item}", None)
+            state.setdefault("auth_route_egress_ip", {}).pop(f"{route.get('username')}:{item}", None)
+            state.setdefault("auth_route_egress_ip_refreshing", set()).discard(f"{route.get('username')}:{item}")
     return True
 
 
@@ -2424,6 +2824,7 @@ def _auth_route_for_credentials(
     state: Dict[str, Any],
     username: str,
     password: str,
+    scheme: str,
 ) -> Tuple[Optional[int], Optional[Dict[str, Any]], Optional[str]]:
     if not _route_password_matches(state.get("auth_global_password") or "", password):
         return None, None, "Invalid username or password"
@@ -2433,6 +2834,10 @@ def _auth_route_for_credentials(
     route_index, route = found
     if not bool(route.get("enabled", True)):
         return None, None, "Route is disabled"
+    route_proxy_type = "socks5" if route.get("proxyType") == "socks5" else "http"
+    requested_scheme = "socks5" if scheme == "socks5" else "http"
+    if route_proxy_type != requested_scheme:
+        return None, None, f"Route is configured for {route_proxy_type.upper()} only"
     return route_index, route, None
 
 
@@ -2443,7 +2848,7 @@ def handle_auth_http_connection(client_sock: socket.socket, state: Dict[str, Any
         if auth_err:
             _send_http_proxy_auth_required(client_sock, auth_err)
             return
-        route_index, route, route_err = _auth_route_for_credentials(state, username, password)
+        route_index, route, route_err = _auth_route_for_credentials(state, username, password, "http")
         if route_err or route is None or route_index is None:
             _send_http_proxy_auth_required(client_sock, route_err or "Proxy authentication failed")
             return
@@ -2490,7 +2895,7 @@ def handle_auth_socks_connection(client_sock: socket.socket, state: Dict[str, An
         username = _recv_exact(client_sock, auth_head[1]).decode("utf-8", errors="replace")
         pass_len = _recv_exact(client_sock, 1)[0]
         password = _recv_exact(client_sock, pass_len).decode("utf-8", errors="replace")
-        route_index, route, route_err = _auth_route_for_credentials(state, username, password)
+        route_index, route, route_err = _auth_route_for_credentials(state, username, password, "socks5")
         if route_err or route is None or route_index is None:
             client_sock.sendall(b"\x01\x01")
             return
@@ -2764,7 +3169,7 @@ def handle_connection(
                         for line in logs.strip().splitlines():
                             _log(f"Worker {cn} logs: {line}")
                         if "OVPN file not found" in logs or ("not found" in logs and "/ovpn/" in logs):
-                            _log("Hint: Put .ovpn files in the host directory bound to ovpn_data (e.g. ./ovpn at repo root). See README Docker section.")
+                            _log("Hint: Upload OVPN files from the dashboard into the ovpn_data volume.")
                 except Exception:
                     pass
             teardown_slot(slot, use_docker)
@@ -3214,6 +3619,82 @@ def _perform_port_rotation_to(
     return None
 
 
+def _perform_auth_route_rotation_to(
+    state: Dict[str, Any],
+    username: str,
+    new_ovpn: str,
+    runtime_config: Dict[str, Any],
+    config_path: Path,
+) -> Optional[str]:
+    """Update an auth route OVPN and restart that username's selected active backend."""
+    use_docker = bool(state.get("use_docker"))
+    with state["lock"]:
+        routes = [dict(r) for r in (state.get("auth_routes") or [])]
+        found = _auth_route_by_username(routes, username)
+        if not found:
+            return "Route not found"
+        route_index, route = found
+        if not bool(route.get("enabled", True)):
+            return "Route is disabled"
+        if (route.get("egress") or {}).get("type") != "ovpn":
+            return "Route is not an OpenVPN route"
+        scheme = "socks5" if route.get("proxyType") == "socks5" else "http"
+        backend_key = _auth_route_backend_key(route_index, scheme)
+        slot = state.get("port_to_slot", {}).get(backend_key)
+        was_active = bool(slot and is_backend_running(slot, use_docker)) or (
+            state.get("auth_route_state", {}).get(f"{username}:{scheme}") == "active"
+        )
+
+    updated_routes = [dict(r) for r in routes]
+    updated_route = dict(updated_routes[route_index])
+    updated_route["egress"] = {"type": "ovpn", "ovpn": new_ovpn}
+    updated_route["rotationLastRun"] = time.time()
+    updated_routes[route_index] = updated_route
+
+    launch_config = dict(runtime_config)
+    launch_config["locations"] = _auth_route_location_config(updated_routes)
+    validation_err = validate_port_egress(
+        launch_config,
+        config_path,
+        route_index,
+        use_docker,
+        {"type": "ovpn", "ovpn": new_ovpn},
+        state.get("upstream_profiles_by_id") or {},
+    )
+    if validation_err:
+        return validation_err
+
+    save_err = _persist_auth_routes_config(config_path, state, updated_routes)
+    if save_err:
+        return save_err
+
+    if was_active:
+        _stop_auth_route_backends(state, username, scheme)
+
+    with state["lock"]:
+        for i, row in enumerate(updated_routes):
+            row["index"] = i
+        state["auth_routes"] = updated_routes
+        runtime = dict(state.get("auth_runtime_config") or {})
+        auth_cfg = dict(_auth_routing_dict(runtime))
+        auth_cfg.update(
+            {
+                "enabled": True,
+                "httpPort": state.get("auth_http_port"),
+                "socksPort": state.get("auth_socks_port"),
+                "routes": updated_routes,
+            }
+        )
+        runtime["authRouting"] = auth_cfg
+        state["auth_runtime_config"] = runtime
+
+    if was_active:
+        _slot, start_err = _start_auth_route_backend(state, route_index, scheme)
+        if start_err:
+            return start_err
+    return None
+
+
 def _perform_port_egress_change_to(
     state: Dict[str, Any],
     port: int,
@@ -3427,6 +3908,7 @@ def rotation_loop(state: Dict[str, Any]) -> None:
             )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
+            attach_provider_credentials(runtime_config)
 
             for port, country_override, current_ovpn in due:
                 # Re-check activation under lock right before rotating; skip if user just stopped it.
@@ -3456,6 +3938,86 @@ def rotation_loop(state: Dict[str, Any]) -> None:
                 else:
                     _log(f"Rotation port {port} -> {chosen}")
             persist_assignments_snapshot(state)
+
+            with state["lock"]:
+                auth_routes_snapshot = list(state.get("auth_routes") or [])
+                auth_route_state = dict(state.get("auth_route_state") or {})
+                auth_route_error = dict(state.get("auth_route_error") or {})
+                auth_slots = dict(state.get("port_to_slot") or {})
+                auth_run = dict(state.get("auth_runtime_config") or {})
+                auth_upstreams = dict(state.get("upstream_profiles_by_id") or {})
+            auth_due: List[Tuple[str, int, str, str]] = []  # (username, route_index, scheme, current_ovpn)
+            for idx, route in enumerate(auth_routes_snapshot):
+                egress = dict(route.get("egress") or {})
+                if (egress.get("type") or "") != "ovpn":
+                    continue
+                interval = int(route.get("rotationIntervalMinutes") or 0)
+                if interval <= 0 or not bool(route.get("enabled", True)):
+                    continue
+                scheme = "socks5" if route.get("proxyType") == "socks5" else "http"
+                slot_key = _auth_route_backend_key(idx, scheme)
+                slot = auth_slots.get(slot_key)
+                running = bool(slot and is_backend_running(slot, bool(state.get("use_docker"))))
+                status_value = "active" if running else auth_route_state.get(f"{route.get('username')}:{scheme}", "inactive")
+                if status_value != "active":
+                    continue
+                last_run = float(route.get("rotationLastRun") or 0.0)
+                if last_run <= 0:
+                    with state["lock"]:
+                        updated = [dict(r) for r in (state.get("auth_routes") or [])]
+                        if idx < len(updated):
+                            updated[idx]["rotationLastRun"] = now_wall
+                            state["auth_routes"] = updated
+                    continue
+                if (now_wall - last_run) >= (interval * 60.0):
+                    auth_due.append((str(route.get("username") or ""), idx, scheme, (egress.get("ovpn") or "")))
+
+            if auth_due:
+                runtime_config, load_err, _ = load_disk_config_expanded(config_path)
+                if load_err or runtime_config is None:
+                    _log(f"Auth rotation tick: could not load config: {load_err}")
+                else:
+                    runtime_config = merge_expanded_locations_from_disk(runtime_config, bool(state.get("use_docker")))
+                    _enforce_default_proxy_auth(runtime_config)
+                    apply_openvpn_auth_env(runtime_config)
+                    attach_provider_credentials(runtime_config)
+                    for username, route_index, scheme, current_ovpn in auth_due:
+                        route = (state.get("auth_routes") or [])[route_index] if route_index < len(state.get("auth_routes") or []) else None
+                        if not route or not bool(route.get("enabled", True)):
+                            continue
+                        rotation_country = (route.get("rotationCountry") or "").strip()
+                        chosen, pick_err = _pick_rotation_ovpn(
+                            runtime_config,
+                            config_path,
+                            bool(state.get("use_docker")),
+                            rotation_country,
+                            current_ovpn,
+                        )
+                        if pick_err or not chosen:
+                            _log(f"Auth rotation skip {username}: {pick_err or 'no ovpn chosen'}")
+                            with state["lock"]:
+                                updated = [dict(r) for r in (state.get("auth_routes") or [])]
+                                if route_index < len(updated):
+                                    updated[route_index]["rotationLastRun"] = now_wall
+                                    state["auth_routes"] = updated
+                            continue
+                        err = _perform_auth_route_rotation_to(
+                            state,
+                            username,
+                            chosen,
+                            runtime_config,
+                            config_path,
+                        )
+                        with state["lock"]:
+                            updated = [dict(r) for r in (state.get("auth_routes") or [])]
+                            if route_index < len(updated):
+                                updated[route_index]["rotationLastRun"] = time.time()
+                                state["auth_routes"] = updated
+                        if err:
+                            _log(f"Auth rotation {username} -> {chosen}: failed: {err}")
+                        else:
+                            _log(f"Auth rotation {username} -> {chosen}")
+                    persist_assignments_snapshot(state)
         except Exception as e:
             _log(f"Rotation loop error: {e}")
 
@@ -3648,54 +4210,104 @@ def _control_api_handler_factory(
             randomize_country_pool = "any country"
             cfg_client = ""
             auto_detect_wan = True
-            try:
-                with open(state["config_path"], encoding="utf-8") as _cf:
-                    _cfg = json.load(_cf)
-                randomize_country = normalize_randomize_country(_cfg.get("randomizeCountry"))
-                randomize_country_pool = randomize_country_status_label(_cfg.get("randomizeCountry"))
-                cfg_client = (str(_cfg.get("clientProxyHost") or "")).strip()
-                if "autoDetectClientProxyHost" in _cfg:
-                    auto_detect_wan = bool(_cfg.get("autoDetectClientProxyHost"))
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
-                pass
-            if cfg_client:
-                client_proxy_host = cfg_client
-            elif listen_h in ("0.0.0.0", "::", "[::]"):
-                wan = get_cached_public_wan_ipv4() if auto_detect_wan else None
-                client_proxy_host = wan if wan else "127.0.0.1"
+            _cfg, _cfg_err, _cfg_status = load_disk_config_expanded(state["config_path"])
+            if _cfg is not None:
+                try:
+                    randomize_country = normalize_randomize_country(_cfg.get("randomizeCountry"))
+                    randomize_country_pool = randomize_country_status_label(_cfg.get("randomizeCountry"))
+                    cfg_client = (str(_cfg.get("clientProxyHost") or "")).strip()
+                    if "autoDetectClientProxyHost" in _cfg:
+                        auto_detect_wan = bool(_cfg.get("autoDetectClientProxyHost"))
+                except (TypeError, ValueError):
+                    pass
             else:
-                client_proxy_host = listen_h
+                try:
+                    _log(f"Status config load failed: {_cfg_err or _cfg_status}")
+                except Exception:
+                    pass
+            host_resolution = resolve_client_proxy_host(cfg_client, listen_h, auto_detect_wan)
+            client_proxy_host = host_resolution["host"]
+            client_proxy_host_source = host_resolution["source"]
+            public_wan_ip = host_resolution["publicWanIp"]
+            local_auth_routing = bool(state.get("local_auth_routing"))
+            copy_host_payload = auth_route_copy_host_payload(cfg_client, local_auth_routing)
             auth_payload: Dict[str, Any] = {"enabled": False}
             if state.get("auth_routing"):
                 auth_routes_public: List[Dict[str, Any]] = []
                 with lock:
                     route_state = dict(state.get("auth_route_state") or {})
                     route_error = dict(state.get("auth_route_error") or {})
+                    route_egress_ip = dict(state.get("auth_route_egress_ip") or {})
                     slots_by_key = dict(state.get("port_to_slot") or {})
                     routes_snapshot = list(state.get("auth_routes") or [])
                     upstream_profiles_snapshot = dict(state.get("upstream_profiles_by_id") or {})
                 for idx, route in enumerate(routes_snapshot):
                     protocol_state: Dict[str, Any] = {}
+                    route_proxy_type = "socks5" if route.get("proxyType") == "socks5" else "http"
                     for scheme in ("http", "socks5"):
+                        if scheme != route_proxy_type:
+                            protocol_state[scheme] = {
+                                "status": "disabled",
+                                "running": False,
+                                "lastActivityAgeSeconds": 0,
+                                "error": "",
+                                "containerName": "",
+                            }
+                            continue
                         slot_key = _auth_route_backend_key(idx, scheme)
                         slot = slots_by_key.get(slot_key)
                         running = bool(slot and is_backend_running(slot, bool(state.get("use_docker"))))
+                        container_name = slot.get("container_name") if slot else ""
+                        refresh_slot = slot
+                        if bool(state.get("use_docker")) and not running:
+                            docker_state = _auth_route_docker_container_state(slot_key)
+                            if docker_state.get("running"):
+                                running = True
+                                container_name = docker_state.get("name") or _auth_route_container_name(slot_key)
+                                refresh_slot = {
+                                    "backend_host": container_name,
+                                    "backend_port": BACKEND_HTTP_PORT,
+                                }
                         status_value = "active" if running else route_state.get(f"{route.get('username')}:{scheme}", "inactive")
                         if not running and status_value == "active":
                             status_value = "inactive"
                         last = slot.get("last_activity") if slot else 0
                         age_seconds = max(0.0, now - last) if last else 0.0
+                        protocol_key = _auth_route_protocol_key(route.get("username") or "", scheme)
+                        egress_ip_info = dict(route_egress_ip.get(protocol_key) or {})
+                        if running:
+                            _maybe_start_auth_route_egress_ip_refresh(
+                                state,
+                                route.get("username") or "",
+                                scheme,
+                                refresh_slot,
+                            )
                         protocol_state[scheme] = {
                             "status": status_value,
                             "running": running,
                             "lastActivityAgeSeconds": round(age_seconds, 1),
                             "error": route_error.get(f"{route.get('username')}:{scheme}", ""),
-                            "containerName": slot.get("container_name") if slot else "",
+                            "containerName": container_name,
+                            "egressPublicIp": egress_ip_info.get("ip") or "",
+                            "egressPublicIpCheckedAt": egress_ip_info.get("checkedAt") or None,
+                            "egressPublicIpError": egress_ip_info.get("error") or "",
                         }
                     auth_routes_public.append(
                         {
                             "username": route.get("username") or "",
                             "label": route.get("label") or route.get("username") or "",
+                            "externalId": route.get("externalId") or route.get("external_id") or "",
+                            "proxyType": route_proxy_type,
+                            "rotationIntervalMinutes": int(route.get("rotationIntervalMinutes") or 0),
+                            "rotationCountry": route.get("rotationCountry") or "",
+                            "rotationLastRun": float(route.get("rotationLastRun") or 0.0),
+                            "nextRotationAt": (
+                                float(route.get("rotationLastRun") or 0.0)
+                                + float(route.get("rotationIntervalMinutes") or 0) * 60.0
+                                if int(route.get("rotationIntervalMinutes") or 0) > 0
+                                and float(route.get("rotationLastRun") or 0.0) > 0
+                                else None
+                            ),
                             "enabled": bool(route.get("enabled", True)),
                             "egress": _public_egress(route.get("egress"), upstream_profiles_snapshot),
                             "protocols": protocol_state,
@@ -3706,6 +4318,9 @@ def _control_api_handler_factory(
                     "httpPort": state.get("auth_http_port"),
                     "socksPort": state.get("auth_socks_port"),
                     "clientProxyHost": client_proxy_host,
+                    "clientProxyHostSource": client_proxy_host_source,
+                    "localAuthRouting": local_auth_routing,
+                    **copy_host_payload,
                     "globalPassword": state.get("auth_global_password") or "",
                     "routes": auth_routes_public,
                 }
@@ -3727,6 +4342,8 @@ def _control_api_handler_factory(
                 "useDocker": state["use_docker"],
                 "listenHost": listen_h,
                 "clientProxyHost": client_proxy_host,
+                "clientProxyHostSource": client_proxy_host_source,
+                "publicWanIp": public_wan_ip,
                 "proxyUsername": state.get("proxy_username") or "",
                 "proxyPassword": state.get("proxy_password") or "",
                 "controlPort": state.get("control_port", 0),
@@ -3776,18 +4393,9 @@ def _control_api_handler_factory(
 
         def _handle_get_config(self) -> None:
             config_path = state["config_path"]
-            if not config_path.exists():
-                self._send_error_body("Config file not found", 404)
-                return
-            try:
-                with open(config_path, encoding="utf-8") as f:
-                    config = json.load(f)
-                apply_location_spec(config)
-            except ValueError as e:
-                self._send_error_body(str(e), 400)
-                return
-            except Exception as e:
-                self._send_error_body(str(e), 500)
+            config, load_err, load_status = load_disk_config_expanded(config_path)
+            if load_err or config is None:
+                self._send_error_body(load_err or "Could not load config", load_status)
                 return
             self._send_json(config)
 
@@ -3896,6 +4504,7 @@ def _control_api_handler_factory(
             )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
+            attach_provider_credentials(runtime_config)
             return runtime_config, None, 200
 
         def _restart_ports_using_upstream_profile(self, profile_id: str) -> List[Dict[str, Any]]:
@@ -3945,8 +4554,14 @@ def _control_api_handler_factory(
             else:
                 next_profiles = current_profiles + [profile]
             try:
-                save_catalog(state["upstream_catalog_path"], next_profiles)
+                if state.get("db_store") is not None:
+                    state["db_store"].save_upstream_profiles(next_profiles)
+                else:
+                    save_catalog(state["upstream_catalog_path"], next_profiles)
             except (OSError, UpstreamProxyError) as e:
+                self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
+                return
+            except Exception as e:
                 self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
                 return
             with state["lock"]:
@@ -3977,8 +4592,14 @@ def _control_api_handler_factory(
             next_profiles = current_profiles + profiles
             if profiles:
                 try:
-                    save_catalog(state["upstream_catalog_path"], next_profiles)
+                    if state.get("db_store") is not None:
+                        state["db_store"].save_upstream_profiles(next_profiles)
+                    else:
+                        save_catalog(state["upstream_catalog_path"], next_profiles)
                 except (OSError, UpstreamProxyError) as e:
+                    self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
+                    return
+                except Exception as e:
                     self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
                     return
                 with state["lock"]:
@@ -4017,8 +4638,14 @@ def _control_api_handler_factory(
                 return
             next_profiles = [row for row in profiles if row.get("id") != profile_id]
             try:
-                save_catalog(state["upstream_catalog_path"], next_profiles)
+                if state.get("db_store") is not None:
+                    state["db_store"].save_upstream_profiles(next_profiles)
+                else:
+                    save_catalog(state["upstream_catalog_path"], next_profiles)
             except (OSError, UpstreamProxyError) as e:
+                self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
+                return
+            except Exception as e:
                 self._send_error_body(f"Could not save upstream proxy catalog: {e}", 500)
                 return
             with state["lock"]:
@@ -4078,6 +4705,7 @@ def _control_api_handler_factory(
                 runtime_config,
                 config_path,
                 bool(state.get("use_docker")),
+                state["db_store"].load_provider_credentials() if state.get("db_store") is not None else None,
             )
             if err:
                 self._send_error_body(err, status_code)
@@ -4200,7 +4828,7 @@ def _control_api_handler_factory(
                     socks.SOCKS5,
                     connect_host,
                     port,
-                    rdns=True,
+                    rdns=False,
                     username=proxy_user or None,
                     password=proxy_pass or None,
                 )
@@ -4236,24 +4864,56 @@ def _control_api_handler_factory(
                 return False
             return True
 
-        def _auth_route_from_body(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        def _auth_route_from_body(self, existing_routes: Iterable[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             payload, body_err = self._read_json_body(64 * 1024)
             if body_err or payload is None:
                 return None, body_err or "Invalid body"
-            username = (str(payload.get("username") or "")).strip()
+            auto_username = bool(payload.get("autoGenerateUsername"))
+            username = _auth_route_unique_username(payload, existing_routes) if auto_username else (str(payload.get("username") or "")).strip()
             if not username:
                 return None, "username is required"
             if any(c.isspace() for c in username) or any(c in username for c in ":/@\\\r\n\x00"):
                 return None, "username must not contain spaces, URL separators, or control characters"
-            label = (str(payload.get("label") or username)).strip() or username
+            external_id = (str(payload.get("externalId") or payload.get("external_id") or "")).strip()
+            external_id = re.sub(r"[\r\n\x00]+", " ", external_id)[:256].strip()
+            label = (str(payload.get("label") or external_id or username)).strip() or username
+            proxy_type = "socks5" if (str(payload.get("proxyType") or payload.get("proxy_type") or "")).strip().lower() == "socks5" else "http"
+            try:
+                rotation_minutes = int(payload.get("rotationIntervalMinutes") or payload.get("rotation_interval_minutes") or 0)
+            except (TypeError, ValueError):
+                return None, "rotationIntervalMinutes must be a non-negative integer"
+            if rotation_minutes < 0:
+                return None, "rotationIntervalMinutes must be a non-negative integer"
+            rotation_minutes = min(_ROTATION_INTERVAL_MAX_MINUTES, rotation_minutes)
+            rotation_country_raw = (str(payload.get("rotationCountry") or payload.get("rotation_country") or "")).strip()
+            rotation_country = ""
+            if rotation_minutes > 0 and rotation_country_raw:
+                country_norm = normalize_randomize_country(rotation_country_raw)
+                if country_norm == "random" and rotation_country_raw.lower() not in ("", "random"):
+                    return None, 'rotationCountry must be a 2-letter ISO code or empty for "use global default"'
+                if country_norm != "random":
+                    rotation_country = country_norm
+            try:
+                rotation_last_run = float(payload.get("rotationLastRun") or payload.get("rotation_last_run") or 0.0)
+            except (TypeError, ValueError):
+                rotation_last_run = 0.0
             enabled = payload.get("enabled")
             if enabled is None:
                 enabled = True
             egress = _normalize_auth_route_egress(payload)
+            if egress.get("type") != "ovpn":
+                rotation_minutes = 0
+                rotation_country = ""
+                rotation_last_run = 0.0
             route = {
                 "index": 0,
                 "username": username,
                 "label": label,
+                "externalId": external_id,
+                "proxyType": proxy_type,
+                "rotationIntervalMinutes": rotation_minutes,
+                "rotationCountry": rotation_country,
+                "rotationLastRun": rotation_last_run if rotation_minutes > 0 else 0.0,
                 "enabled": bool(enabled),
                 "egress": egress,
             }
@@ -4279,7 +4939,9 @@ def _control_api_handler_factory(
         def _handle_post_auth_route(self) -> None:
             if not self._require_auth_routing():
                 return
-            route, err = self._auth_route_from_body()
+            with state["lock"]:
+                routes = [dict(r) for r in (state.get("auth_routes") or [])]
+            route, err = self._auth_route_from_body(routes)
             if err or route is None:
                 self._send_error_body(err or "Invalid route", 400)
                 return
@@ -4338,8 +5000,9 @@ def _control_api_handler_factory(
             if not found:
                 self._send_error_body("Route not found", 404)
                 return
-            route_index, _route = found
-            schemes = ["http", "socks5"] if scheme == "both" else [scheme]
+            route_index, route = found
+            route_proxy_type = "socks5" if route.get("proxyType") == "socks5" else "http"
+            schemes = [route_proxy_type] if scheme == "both" else [scheme]
             results = []
             for item in schemes:
                 _slot, err = _start_auth_route_backend(state, route_index, item)
@@ -4475,6 +5138,14 @@ def _control_api_handler_factory(
             _enforce_default_proxy_auth(config)
             to_save = _prepare_config_for_disk(config)
             config_path = state["config_path"]
+            if state.get("db_store") is not None:
+                try:
+                    state["db_store"].save_config(to_save)
+                except Exception as e:
+                    self._send_error_body(f"Could not save config to database: {e}", 500)
+                    return
+                self._send_json({"ok": True, "message": "Config saved. Restart the gateway to apply."})
+                return
             try:
                 with open(config_path, "w", encoding="utf-8") as f:
                     json.dump(to_save, f, indent=2)
@@ -4517,6 +5188,51 @@ def _control_api_handler_factory(
             )
             if not ovpn_root.exists() or not ovpn_root.is_dir():
                 self._send_error_body(f"ovpnRoot does not exist or is not a directory: {ovpn_root}", 400)
+                return
+
+            if state.get("db_store") is not None:
+                results: List[Dict[str, Any]] = []
+                had_error = False
+                rows_to_save: List[Dict[str, str]] = []
+                for i, item in enumerate(entries):
+                    if not isinstance(item, dict):
+                        results.append({"index": i, "ok": False, "error": "Entry must be an object"})
+                        had_error = True
+                        continue
+                    provider = (str(item.get("provider") or "")).strip()
+                    username = str(item.get("username") or "")
+                    password = str(item.get("password") or "")
+                    if not _is_safe_provider_name(provider):
+                        results.append({"provider": provider, "ok": False, "error": "provider must be a safe single folder name"})
+                        had_error = True
+                        continue
+                    if any(c in username for c in "\r\n\x00"):
+                        results.append({"provider": provider, "ok": False, "error": "username contains invalid characters"})
+                        had_error = True
+                        continue
+                    if any(c in password for c in "\r\n\x00"):
+                        results.append({"provider": provider, "ok": False, "error": "password contains invalid characters"})
+                        had_error = True
+                        continue
+                    provider_dir = (ovpn_root / provider).resolve()
+                    if not provider_dir.is_dir():
+                        results.append({"provider": provider, "ok": False, "error": "Provider directory not found under ovpnRoot"})
+                        had_error = True
+                        continue
+                    if not _is_safe_under_root(provider_dir, ovpn_root):
+                        results.append({"provider": provider, "ok": False, "error": "Unsafe provider path"})
+                        had_error = True
+                        continue
+                    rows_to_save.append({"provider": provider, "username": username.strip(), "password": password})
+                    results.append({"provider": provider, "ok": True, "authPath": "", "storedIn": "postgres"})
+                if not had_error:
+                    try:
+                        state["db_store"].save_provider_credentials(rows_to_save)
+                    except Exception as e:
+                        self._send_error_body(f"Could not save provider credentials to database: {e}", 500)
+                        return
+                status_code = 200 if not had_error else 400
+                self._send_json({"ok": not had_error, "results": results}, status=status_code)
                 return
 
             results: List[Dict[str, Any]] = []
@@ -4569,7 +5285,7 @@ def _control_api_handler_factory(
                                 "ok": False,
                                 "error": (
                                     "OVPN mount is read-only. In Docker, change gateway volume "
-                                    "`ovpn_data:/ovpn:ro` to `ovpn_data:/ovpn`, then recreate "
+                                    "to `ovpn_data:/ovpn`, then recreate "
                                     "the stack (`docker compose down && docker compose up -d`)."
                                 ),
                             }
@@ -4602,9 +5318,22 @@ def _control_api_handler_factory(
                     str(payload.get("password") or ""),
                     list(payload.get("files") or []),
                     bool(payload.get("overwrite")),
+                    write_auth_file=state.get("db_store") is None,
                 )
+                if state.get("db_store") is not None:
+                    upload_user = str(payload.get("username") or "").strip()
+                    upload_pass = str(payload.get("password") or "")
+                    if upload_user and upload_pass:
+                        state["db_store"].upsert_provider_credential(
+                            str(payload.get("provider") or ""),
+                            upload_user,
+                            upload_pass,
+                        )
             except OvpnUploadError as e:
                 self._send_error_body(str(e), 400)
+                return
+            except Exception as e:
+                self._send_error_body(f"Could not save provider credentials to database: {e}", 500)
                 return
             files_payload = build_ovpn_files_payload(
                 runtime_config,
@@ -4694,11 +5423,9 @@ def _control_api_handler_factory(
             if not _is_safe_relative_ovpn_name(ovpn):
                 self._send_error_body("ovpn must be a safe relative path", 400)
                 return
-            try:
-                with open(state["config_path"], encoding="utf-8") as f:
-                    runtime_config = json.load(f)
-            except Exception as e:
-                self._send_error_body(f"Could not read config: {e}", 500)
+            runtime_config, load_err, load_status = load_disk_config_expanded(state["config_path"])
+            if load_err or runtime_config is None:
+                self._send_error_body(load_err or "Could not read config", load_status)
                 return
             allowed = list_allowed_ovpn_files(
                 runtime_config,
@@ -4947,6 +5674,7 @@ def _control_api_handler_factory(
             )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
+            attach_provider_credentials(runtime_config)
             assigned_ovpn = ""
             egress: Dict[str, str] = {}
             rotation_minutes = 0
@@ -5108,6 +5836,7 @@ def _control_api_handler_factory(
             )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
+            attach_provider_credentials(runtime_config)
 
             allowed = list_allowed_ovpn_files(
                 runtime_config,
@@ -5224,6 +5953,7 @@ def _control_api_handler_factory(
             )
             _enforce_default_proxy_auth(runtime_config)
             apply_openvpn_auth_env(runtime_config)
+            attach_provider_credentials(runtime_config)
 
             err = validate_location_assets(
                 runtime_config,
@@ -5330,6 +6060,7 @@ def _run_control_server(
 
 
 def main() -> int:
+    global DB_STORE
     _request_admin_rerun()
     parser = argparse.ArgumentParser(description="Dynamic proxy gateway (on-demand, idle shutdown).")
     parser.add_argument("--config", default=str(script_dir() / "openvpn-proxy-config.json"), help="Path to config JSON")
@@ -5337,22 +6068,36 @@ def main() -> int:
     config_path = Path(args.config)
     if not config_path.is_absolute():
         config_path = script_dir() / args.config
-    if not config_path.exists():
-        print(f"Config not found: {config_path}", file=sys.stderr)
-        return 1
-    if config_path.is_dir():
-        print(f"Config path is a directory, not a file: {config_path}. (If using Docker, ensure the host file exists so the bind mount is a file.)", file=sys.stderr)
-        return 1
+    if storage_enabled():
+        try:
+            DB_STORE = PorticoStore(storage_database_url())
+            DB_STORE.initialize(
+                config_path if config_path.is_file() else None,
+                resolve_assignments_path(config_path),
+                resolve_upstream_catalog_path(config_path),
+            )
+            config = DB_STORE.load_config()
+            _log("Config store: Postgres")
+        except Exception as e:
+            print(f"Could not initialize database store: {e}", file=sys.stderr)
+            return 1
+    else:
+        if not config_path.exists():
+            print(f"Config not found: {config_path}", file=sys.stderr)
+            return 1
+        if config_path.is_dir():
+            print(f"Config path is a directory, not a file: {config_path}.", file=sys.stderr)
+            return 1
 
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = json.load(f)
-    except (OSError, UnicodeDecodeError) as e:
-        print(f"Could not read config file: {e}", file=sys.stderr)
-        return 1
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON in config file {config_path}: {e}", file=sys.stderr)
-        return 1
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"Could not read config file: {e}", file=sys.stderr)
+            return 1
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON in config file {config_path}: {e}", file=sys.stderr)
+            return 1
     try:
         apply_location_spec(config)
     except ValueError as e:
@@ -5360,7 +6105,14 @@ def main() -> int:
         return 1
     use_docker = config.get("useDocker") is True or os.environ.get("USE_DOCKER", "").lower() in ("1", "true", "yes")
     auth_routing = is_auth_routing_enabled(config)
-    auth_routes = normalize_auth_routes(config) if auth_routing else []
+    local_auth_routing = _env_truthy("AUTH_ROUTING_ENABLED")
+    if auth_routing and DB_STORE is not None:
+        auth_routes = DB_STORE.load_auth_routes()
+        auth_cfg = dict(_auth_routing_dict(config))
+        auth_cfg["routes"] = auth_routes
+        config["authRouting"] = auth_cfg
+    else:
+        auth_routes = normalize_auth_routes(config) if auth_routing else []
 
     locations_raw = list(config.get("locations") or [])
     _log(f"Config loaded: {len(locations_raw)} location row(s) from {config_path}")
@@ -5375,6 +6127,7 @@ def main() -> int:
 
     _enforce_default_proxy_auth(config)
     apply_openvpn_auth_env(config)
+    attach_provider_credentials(config)
 
     if not locations and not auth_routing:
         _log(
@@ -5494,11 +6247,18 @@ def main() -> int:
     port_egress_by_port: Dict[int, Dict[str, str]] = {}
     assignments_path = resolve_assignments_path(config_path)
     upstream_catalog_path = resolve_upstream_catalog_path(config_path)
-    try:
-        upstream_profiles = load_catalog(upstream_catalog_path)
-    except UpstreamProxyError as e:
-        _log(f"Upstream proxy catalog load failed: {e}")
-        upstream_profiles = []
+    if DB_STORE is not None:
+        try:
+            upstream_profiles = DB_STORE.load_upstream_profiles()
+        except Exception as e:
+            _log(f"Upstream proxy profile load from Postgres failed: {e}")
+            upstream_profiles = []
+    else:
+        try:
+            upstream_profiles = load_catalog(upstream_catalog_path)
+        except UpstreamProxyError as e:
+            _log(f"Upstream proxy catalog load failed: {e}")
+            upstream_profiles = []
     upstream_profiles_by_id = _catalog_index(upstream_profiles)
     redis_url = _redis_url_from_env_or_config(config)
     redis_key = _redis_state_key()
@@ -5579,6 +6339,7 @@ def main() -> int:
         "idle_timeout_minutes": idle_timeout_minutes,
         "use_docker": use_docker,
         "auth_routing": auth_routing,
+        "local_auth_routing": local_auth_routing,
         "auth_routes": auth_routes,
         "auth_global_password": _auth_global_password(config),
         "auth_http_port": auth_http_port,
@@ -5600,6 +6361,7 @@ def main() -> int:
         "assignments_path": assignments_path,
         "redis_url": redis_url,
         "redis_state_key": redis_key,
+        "db_store": DB_STORE,
         **_docker_align,
     }
 

@@ -127,7 +127,11 @@ def start_one_location(
     auth_pass = ""
     if ovpn_root is None:
         raise RuntimeError("ovpnRoot is required for provider auth resolution.")
-    provider_auth = load_provider_auth(loc.get("ovpn") or "", ovpn_root)
+    provider_auth = load_provider_auth(
+        loc.get("ovpn") or "",
+        ovpn_root,
+        config.get("_providerCredentials") if isinstance(config.get("_providerCredentials"), dict) else None,
+    )
     auth_user = provider_auth.username
     auth_pass = provider_auth.password
     if auth_user:

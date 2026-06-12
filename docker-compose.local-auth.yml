@@ -21,6 +21,19 @@ services:
       - proxynet
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: portico-auth-postgres
+    environment:
+      - POSTGRES_DB=portico
+      - POSTGRES_USER=portico
+      - POSTGRES_PASSWORD=portico
+    volumes:
+      - postgres_auth_data:/var/lib/postgresql/data
+    networks:
+      - proxynet
+    restart: unless-stopped
+
   gateway:
     build:
       context: ./backend
@@ -30,6 +43,7 @@ services:
     depends_on:
       - worker
       - redis
+      - postgres
     environment:
       - USE_DOCKER=1
       - AUTH_ROUTING_ENABLED=1
@@ -40,15 +54,11 @@ services:
       - DOCKER_NETWORK=proxynet
       - DOCKER_OVPN_VOLUME=ovpn_data
       - DOCKER_OVPN_MOUNT=/ovpn
-      - OPENVPN_USERNAME=${OPENVPN_USERNAME:-}
-      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
       - REDIS_URL=redis://redis:6379/0
       - REDIS_STATE_KEY=portico:auth-routing-state
+      - DATABASE_URL=postgresql://portico:portico@postgres:5432/portico
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./backend/openvpn-proxy-auth-config.json:/config/openvpn-proxy-config.json
-      - ./backend/openvpn-proxy-assignments.json:/config/openvpn-proxy-assignments.json
-      - ./backend/upstream-proxy-catalog.json:/config/upstream-proxy-catalog.json
       - ovpn_data:/ovpn
     ports:
       - "127.0.0.1:49999:49999"
@@ -84,10 +94,6 @@ networks:
 
 volumes:
   redis_auth_data:
+  postgres_auth_data:
   ovpn_data:
     name: ovpn_data
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ${OVPN_HOST_PATH:-./ovpn}

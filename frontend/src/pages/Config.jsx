@@ -136,7 +136,7 @@ export default function Config() {
         const firstErr = Array.isArray(data.results)
           ? (data.results.find((r) => r && r.ok === false)?.error || '')
           : '';
-        throw new Error(firstErr || data.error || 'Failed to save provider auth files');
+        throw new Error(firstErr || data.error || 'Failed to save provider credentials');
       }
       await refreshProviderAuth();
     } finally {
@@ -335,7 +335,7 @@ export default function Config() {
           setProviderAuthError(authErr.message || 'Provider auth save failed');
           toast({
             title: 'Config saved with auth error',
-            message: authErr.message || 'Provider auth files failed to save.',
+            message: authErr.message || 'Provider credentials failed to save.',
             variant: 'warning',
           });
           return;
@@ -563,9 +563,8 @@ export default function Config() {
             Auto-activate persisted ports on gateway startup
           </label>
           <p className="text-muted text-sm mt-1 mb-0">
-            When enabled, listener ports saved as active in{' '}
-            <code className="text-mono">openvpn-proxy-assignments.json</code> are started again after a restart
-            (OVPN picks and active set are both stored there).
+            When enabled, listener ports saved as active are started again after a restart.
+            OVPN picks and active state are stored in the configured persistence backend.
           </p>
           <div className="form-group mt-4">
             <label htmlFor="config-randomize-country">Random pool country</label>
@@ -599,11 +598,9 @@ export default function Config() {
             </p>
             {ovpnScanMeta.count === 0 && (
               <p className="text-muted text-sm mt-2 mb-0">
-                <strong>0 profiles</strong> visible to the gateway at the configured OVPN path (or Docker{' '}
-                <code className="text-mono">/ovpn</code> mount). Country rows still appear for selection; add{' '}
-                <code className="text-mono">.ovpn</code> files there and refresh this page — or fix{' '}
-                <code className="text-mono">OVPN_HOST_PATH</code> / <code className="text-mono">ovpnRoot</code> if the
-                folder is wrong.
+                <strong>0 profiles</strong> visible to the gateway at the Docker{' '}
+                <code className="text-mono">/ovpn</code> mount. Upload{' '}
+                <code className="text-mono">.ovpn</code> files below and refresh this page.
               </p>
             )}
             {ovpnScanMeta.count > 0 && ovpnScanMeta.unclassified === ovpnScanMeta.count && (
@@ -760,26 +757,26 @@ export default function Config() {
             </div>
             <div className="grid-2-col gap-4">
               <div className="form-group">
-                <label htmlFor="ovpn-upload-username">Batch username</label>
+                <label htmlFor="ovpn-upload-username">Provider username</label>
                 <input
                   id="ovpn-upload-username"
                   type="text"
                   className="premium-input"
                   value={uploadUsername}
                   onChange={(e) => setUploadUsername(e.target.value)}
-                  placeholder="Provider username"
+                  placeholder="Optional; saved as provider credentials"
                   disabled={uploadBusy}
                 />
               </div>
               <div className="form-group">
-                <label htmlFor="ovpn-upload-password">Batch password</label>
+                <label htmlFor="ovpn-upload-password">Provider password</label>
                 <input
                   id="ovpn-upload-password"
                   type="password"
                   className="premium-input"
                   value={uploadPassword}
                   onChange={(e) => setUploadPassword(e.target.value)}
-                  placeholder="Provider password"
+                  placeholder="Optional; saved as provider credentials"
                   disabled={uploadBusy}
                 />
               </div>
@@ -801,8 +798,6 @@ export default function Config() {
                 disabled={
                   uploadBusy ||
                   !uploadProvider.trim() ||
-                  !uploadUsername.trim() ||
-                  !uploadPassword ||
                   uploadFiles.length === 0
                 }
               >
@@ -841,12 +836,10 @@ export default function Config() {
         <section className="card config-card col-span-2">
           <div className="card-header">
             <span className="material-symbols-outlined text-primary">vpn_key</span>
-            <h3 className="card-title">VPN Provider Auth Files</h3>
+            <h3 className="card-title">VPN Provider Credentials</h3>
           </div>
           <p className="text-muted text-sm mt-1 mb-3">
-            Edit username/password per provider folder. Saving writes directly to each provider
-            <code className="text-mono"> auth.txt </code>
-            file under OVPN root.
+            Edit username/password per provider folder. Saving stores credentials in Postgres and workers receive them at activation time.
           </p>
           {providerAuthError ? (
             <div className="config-publish-mismatch-banner" role="alert">

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -63,15 +63,44 @@ def _env_credentials() -> Optional[Tuple[str, str]]:
     return None
 
 
-def load_provider_auth(ovpn_ref: str, ovpn_root: Path) -> ProviderAuthResult:
+def _credentials_from_map(
+    provider: str,
+    auth_path: Path,
+    credentials: Optional[Dict[str, Dict[str, str]]],
+) -> Optional[ProviderAuthResult]:
+    if not credentials:
+        return None
+    row = credentials.get(provider) or credentials.get(provider.casefold())
+    if not row:
+        return None
+    username = (row.get("username") or "").strip()
+    password = row.get("password") or ""
+    if username and password:
+        return ProviderAuthResult(
+            provider=provider,
+            auth_path=auth_path,
+            username=username,
+            password=password,
+        )
+    return None
+
+
+def load_provider_auth(
+    ovpn_ref: str,
+    ovpn_root: Path,
+    provider_credentials: Optional[Dict[str, Dict[str, str]]] = None,
+) -> ProviderAuthResult:
     """
     Resolve username/password for the selected profile.
 
     Resolution order:
-    1. If ovpn_ref has a parent path (e.g. ``NC/profile.ovpn``), use
+    1. If provider credentials are supplied, prefer DB credentials for the
+       first path segment (e.g. ``NC/profile.ovpn`` -> provider ``NC``).
+    2. If ovpn_ref has a parent path (e.g. ``NC/profile.ovpn``), use
        ``<ovpn_root>/<first_segment>/auth.txt`` (provider folder name matched case-insensitively).
-    2. Else (bare filename), use ``<ovpn_root>/auth.txt`` if it exists.
-    3. Else if ``OPENVPN_USERNAME`` and ``OPENVPN_PASSWORD`` are both set, use those (provider label ``env``).
+    3. Else (bare filename), use root/default DB credentials if supplied, then
+       ``<ovpn_root>/auth.txt`` if it exists.
+    4. Else if ``OPENVPN_USERNAME`` and ``OPENVPN_PASSWORD`` are both set, use those (legacy fallback).
     """
     root = ovpn_root.resolve()
     norm = _normalize_ovpn_ref(ovpn_ref)
@@ -85,6 +114,9 @@ def load_provider_auth(ovpn_ref: str, ovpn_root: Path) -> ProviderAuthResult:
         if resolved_dir is not None:
             candidate = (resolved_dir / "auth.txt").resolve()
             tried.append(str(candidate))
+            mapped = _credentials_from_map(resolved_dir.name, candidate, provider_credentials)
+            if mapped is not None:
+                return mapped
             if candidate.is_file():
                 return _read_auth_txt(candidate, resolved_dir.name)
         else:
@@ -92,6 +124,9 @@ def load_provider_auth(ovpn_ref: str, ovpn_root: Path) -> ProviderAuthResult:
 
     root_auth = (root / "auth.txt").resolve()
     tried.append(str(root_auth))
+    mapped = _credentials_from_map("root", root_auth, provider_credentials)
+    if mapped is not None:
+        return mapped
     if root_auth.is_file():
         return _read_auth_txt(root_auth, "root")
 
@@ -105,7 +140,8 @@ def load_provider_auth(ovpn_ref: str, ovpn_root: Path) -> ProviderAuthResult:
             password=p,
         )
 
-    tried.append("OPENVPN_USERNAME + OPENVPN_PASSWORD (both non-empty)")
+    tried.append("provider credentials table")
+    tried.append("OPENVPN_USERNAME + OPENVPN_PASSWORD (both non-empty, legacy)")
     raise RuntimeError(
         "Could not resolve OpenVPN credentials for "
         f"{ovpn_ref!r}. Tried: {'; '.join(tried)}"
