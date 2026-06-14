@@ -2529,10 +2529,29 @@ def _auth_route_launch_config(state: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _refresh_upstream_session_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a runtime-only profile copy with a fresh session token when present."""
+    refreshed = dict(profile)
+    username = str(refreshed.get("username") or "")
+
+    def replace_session(match: re.Match[str]) -> str:
+        token = str(secrets.randbelow(9000000000) + 1000000000)
+        return f"{match.group(1)}session{match.group(2)}{token}"
+
+    refreshed["username"] = re.sub(
+        r"(?i)(^|[-_])session([-_])([A-Za-z0-9]+)",
+        replace_session,
+        username,
+        count=1,
+    )
+    return refreshed
+
+
 def _start_auth_route_backend(
     state: Dict[str, Any],
     route_index: int,
     scheme: str,
+    refresh_upstream_session: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     routes = list(state.get("auth_routes") or [])
     if route_index < 0 or route_index >= len(routes):
@@ -2590,6 +2609,8 @@ def _start_auth_route_backend(
     egress = dict(route.get("egress") or {})
     upstream_profiles = state.get("upstream_profiles_by_id") or {}
     upstream_profile = upstream_profiles.get((egress.get("upstreamProxyId") or "").strip())
+    if refresh_upstream_session and egress.get("type") == "upstream" and upstream_profile:
+        upstream_profile = _refresh_upstream_session_profile(upstream_profile)
     validation_err = validate_port_egress(
         launch_config,
         state["config_path"],
@@ -4531,6 +4552,31 @@ def _control_api_handler_factory(
                 results.append({"port": port, "ok": not bool(err), "error": err or ""})
             return results
 
+        def _restart_auth_routes_using_upstream_profile(self, profile_id: str) -> List[Dict[str, Any]]:
+            if not state.get("auth_routing"):
+                return []
+            with state["lock"]:
+                routes = [dict(route) for route in (state.get("auth_routes") or [])]
+                route_state = dict(state.get("auth_route_state") or {})
+                targets = []
+                for idx, route in enumerate(routes):
+                    egress = dict(route.get("egress") or {})
+                    if egress.get("type") != "upstream" or egress.get("upstreamProxyId") != profile_id:
+                        continue
+                    scheme = "socks5" if route.get("proxyType") == "socks5" else "http"
+                    if route_state.get(f"{route.get('username')}:{scheme}") in ("starting", "active"):
+                        targets.append((idx, route, scheme))
+            results: List[Dict[str, Any]] = []
+            for route_index, route, scheme in targets:
+                username = str(route.get("username") or "")
+                stopped = _stop_auth_route_backends(state, username, scheme)
+                if not stopped:
+                    results.append({"username": username, "scheme": scheme, "ok": False, "error": "Route not found"})
+                    continue
+                _slot, err = _start_auth_route_backend(state, route_index, scheme)
+                results.append({"username": username, "scheme": scheme, "ok": err is None, "error": err or ""})
+            return results
+
         def _handle_post_upstream_proxy(self) -> None:
             payload, body_err = self._read_json_body(64 * 1024)
             if body_err or payload is None:
@@ -4568,12 +4614,16 @@ def _control_api_handler_factory(
                 state["upstream_profiles"] = next_profiles
                 state["upstream_profiles_by_id"] = _catalog_index(next_profiles)
             restart_results = self._restart_ports_using_upstream_profile(profile["id"]) if existing else []
+            auth_restart_results = self._restart_auth_routes_using_upstream_profile(profile["id"]) if existing else []
             self._send_json(
                 {
                     "ok": True,
                     "proxy": public_profile(profile),
-                    "restartedPorts": [r["port"] for r in restart_results if r.get("ok")],
-                    "restartResults": restart_results,
+                    "restartedPorts": [r["port"] for r in restart_results if r.get("ok") and "port" in r],
+                    "restartedRoutes": [
+                        r["username"] for r in auth_restart_results if r.get("ok") and r.get("username")
+                    ],
+                    "restartResults": restart_results + auth_restart_results,
                 }
             )
 
@@ -5029,10 +5079,28 @@ def _control_api_handler_factory(
             if not username:
                 self._send_error_body("Missing username", 400)
                 return
+            found = _auth_route_by_username(state.get("auth_routes") or [], username)
+            if not found:
+                self._send_error_body("Route not found", 404)
+                return
+            route_index, route = found
+            route_proxy_type = "socks5" if route.get("proxyType") == "socks5" else "http"
+            schemes = [route_proxy_type] if scheme == "both" else [scheme]
             if not _stop_auth_route_backends(state, username, scheme):
                 self._send_error_body("Route not found", 404)
                 return
-            self._handle_post_auth_route_start(query)
+            refresh_upstream_session = (route.get("egress") or {}).get("type") == "upstream"
+            results = []
+            for item in schemes:
+                _slot, err = _start_auth_route_backend(
+                    state,
+                    route_index,
+                    item,
+                    refresh_upstream_session=refresh_upstream_session,
+                )
+                results.append({"scheme": item, "ok": err is None, "error": err or ""})
+            ok = all(r["ok"] for r in results)
+            self._send_json({"ok": ok, "username": username, "results": results}, status=200 if ok else 400)
 
         def _handle_post_auth_route_delete(self, query: str) -> None:
             if not self._require_auth_routing():

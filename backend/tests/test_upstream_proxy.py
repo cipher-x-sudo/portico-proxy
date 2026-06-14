@@ -436,6 +436,142 @@ class AuthRoutingTests(unittest.TestCase):
         self.assertEqual(state["auth_route_state"]["socksonly:socks5"], "inactive")
         self.assertNotIn("socksonly:socks5", state["auth_route_error"])
 
+    def test_upstream_session_refresh_changes_session_segment_only(self):
+        profile = {
+            "id": "proxy-a",
+            "scheme": "http",
+            "host": "gate.ipdeep.com",
+            "port": 8082,
+            "username": "d2843204000-res-country-br-session-3237400000-sessiontime-5",
+            "password": "secret",
+        }
+
+        with patch.object(gateway.secrets, "randbelow", return_value=2340000000):
+            refreshed = gateway._refresh_upstream_session_profile(profile)
+
+        self.assertEqual(profile["username"], "d2843204000-res-country-br-session-3237400000-sessiontime-5")
+        self.assertEqual(
+            refreshed["username"],
+            "d2843204000-res-country-br-session-3340000000-sessiontime-5",
+        )
+        self.assertEqual(refreshed["host"], profile["host"])
+        self.assertEqual(refreshed["password"], profile["password"])
+
+    def test_upstream_session_refresh_leaves_non_session_username_unchanged(self):
+        profile = {
+            "id": "proxy-a",
+            "scheme": "http",
+            "host": "proxy.example.com",
+            "port": 8080,
+            "username": "plain-user",
+            "password": "secret",
+        }
+
+        refreshed = gateway._refresh_upstream_session_profile(profile)
+
+        self.assertEqual(refreshed["username"], "plain-user")
+        self.assertIsNot(refreshed, profile)
+
+    def test_auth_route_start_can_refresh_upstream_profile_runtime_only(self):
+        route = gateway.normalize_auth_routes(
+            {
+                "authRouting": {
+                    "routes": [
+                        {
+                            "username": "brazil",
+                            "proxyType": "http",
+                            "enabled": True,
+                            "egress": {"type": "upstream", "upstreamProxyId": "proxy-a"},
+                        }
+                    ]
+                }
+            }
+        )[0]
+        profile = {
+            "id": "proxy-a",
+            "scheme": "http",
+            "host": "gate.ipdeep.com",
+            "port": 8082,
+            "username": "d2843204000-res-country-br-session-3237400000-sessiontime-5",
+            "password": "secret",
+        }
+        state = {
+            "auth_routes": [route],
+            "auth_runtime_config": {},
+            "upstream_profiles_by_id": {"proxy-a": profile},
+            "use_docker": False,
+            "lock": threading.Lock(),
+            "port_to_slot": {},
+            "slots": [],
+            "max_slots": 2,
+            "internal_port_base": 51000,
+            "auth_route_state": {},
+            "auth_route_error": {},
+            "config_path": BACKEND_DIR / "openvpn-proxy-config.example.json",
+        }
+
+        with (
+            patch.object(gateway, "validate_port_egress", return_value=None),
+            patch.object(gateway, "wait_for_backend", return_value=True),
+            patch.object(gateway.secrets, "randbelow", return_value=1111111111),
+            patch.object(gateway, "start_one_upstream_proxy") as start_mock,
+        ):
+            slot, err = gateway._start_auth_route_backend(
+                state,
+                0,
+                "http",
+                refresh_upstream_session=True,
+            )
+
+        self.assertIsNone(err)
+        self.assertIsNotNone(slot)
+        launched_profile = start_mock.call_args.args[2]
+        self.assertEqual(profile["username"], "d2843204000-res-country-br-session-3237400000-sessiontime-5")
+        self.assertEqual(
+            launched_profile["username"],
+            "d2843204000-res-country-br-session-2111111111-sessiontime-5",
+        )
+
+    def test_upstream_profile_restart_targets_active_auth_routes(self):
+        route = gateway.normalize_auth_routes(
+            {
+                "authRouting": {
+                    "routes": [
+                        {
+                            "username": "brazil",
+                            "proxyType": "http",
+                            "enabled": True,
+                            "egress": {"type": "upstream", "upstreamProxyId": "proxy-a"},
+                        },
+                        {
+                            "username": "india",
+                            "proxyType": "http",
+                            "enabled": True,
+                            "egress": {"type": "upstream", "upstreamProxyId": "proxy-b"},
+                        },
+                    ]
+                }
+            }
+        )
+        state = {
+            "auth_routing": True,
+            "auth_routes": route,
+            "auth_route_state": {"brazil:http": "active", "india:http": "active"},
+            "lock": threading.Lock(),
+        }
+        handler_cls = gateway._control_api_handler_factory(BACKEND_DIR, state)
+        handler = object.__new__(handler_cls)
+
+        with (
+            patch.object(gateway, "_stop_auth_route_backends", return_value=True) as stop_mock,
+            patch.object(gateway, "_start_auth_route_backend", return_value=({"ok": True}, None)) as start_mock,
+        ):
+            results = handler._restart_auth_routes_using_upstream_profile("proxy-a")
+
+        self.assertEqual(results, [{"username": "brazil", "scheme": "http", "ok": True, "error": ""}])
+        stop_mock.assert_called_once_with(state, "brazil", "http")
+        start_mock.assert_called_once_with(state, 0, "http")
+
 
 class OvpnUploadTests(unittest.TestCase):
     def test_upload_rejects_unsafe_provider_and_filename(self):
