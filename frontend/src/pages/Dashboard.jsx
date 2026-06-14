@@ -62,9 +62,11 @@ export default function Dashboard() {
   });
   const [showAuthRouteEditor, setShowAuthRouteEditor] = useState(false);
   const [showCreateProxy, setShowCreateProxy] = useState(false);
+  const [createProxyEgressType, setCreateProxyEgressType] = useState('ovpn');
   const [createProxyProvider, setCreateProxyProvider] = useState('');
   const [createProxyLocation, setCreateProxyLocation] = useState('');
   const [createProxyOvpn, setCreateProxyOvpn] = useState('');
+  const [createProxyUpstreamProxyId, setCreateProxyUpstreamProxyId] = useState('');
   const [createProxyLabel, setCreateProxyLabel] = useState('');
   const [createProxyExternalId, setCreateProxyExternalId] = useState('');
   const [createProxyType, setCreateProxyType] = useState('http');
@@ -819,20 +821,34 @@ export default function Dashboard() {
       provider: selectedCreateProvider,
       location: selectedCreateLocation,
     };
+  const selectedCreateUpstreamProxy = upstreamProxies.find((proxy) => proxy.id === createProxyUpstreamProxyId) || null;
+  const createProxyPreviewSource =
+    createProxyEgressType === 'upstream'
+      ? createProxyExternalId ||
+        createProxyLabel ||
+        selectedCreateUpstreamProxy?.label ||
+        selectedCreateUpstreamProxy?.host ||
+        createProxyUpstreamProxyId ||
+        'upstream_proxy'
+      : createProxyExternalId ||
+        createProxyLabel ||
+        [selectedCreateRouteRow.provider, selectedCreateRouteRow.location].filter(Boolean).join('_');
   const createProxyUsernamePreview = `${slugifyProxyUsername(
-    createProxyExternalId ||
-      createProxyLabel ||
-      [selectedCreateRouteRow.provider, selectedCreateRouteRow.location].filter(Boolean).join('_')
+    createProxyPreviewSource
   )}_${createProxySuffix}`;
+  const canCreateProxy =
+    createProxyEgressType === 'upstream' ? Boolean(createProxyUpstreamProxyId) : Boolean(selectedCreateOvpn);
 
   const openCreateProxyModal = () => {
     const provider = providerOptions[0] || '';
     const rows = ovpnRouteRows.filter((row) => row.provider === provider);
     const location = rows[0]?.location || '';
     const ovpn = rows[0]?.file || '';
+    setCreateProxyEgressType('ovpn');
     setCreateProxyProvider(provider);
     setCreateProxyLocation(location);
     setCreateProxyOvpn(ovpn);
+    setCreateProxyUpstreamProxyId('');
     setCreateProxyLabel('');
     setCreateProxyExternalId('');
     setCreateProxyType('http');
@@ -861,20 +877,31 @@ export default function Dashboard() {
   const handleCreateProxyRoute = async (event) => {
     event.preventDefault();
     const ovpn = selectedCreateOvpn;
-    if (!ovpn) {
+    const upstreamProxyId = createProxyUpstreamProxyId;
+    const isUpstreamCreate = createProxyEgressType === 'upstream';
+    if (!isUpstreamCreate && !ovpn) {
       setError('Select an OVPN profile first.');
       return;
     }
+    if (isUpstreamCreate && !upstreamProxyId) {
+      setError('Select an upstream proxy first.');
+      return;
+    }
+    const fallbackLabel = isUpstreamCreate
+      ? selectedCreateUpstreamProxy?.label || selectedCreateUpstreamProxy?.host || upstreamProxyId
+      : formatOvpnDisplayLabel(ovpn);
     const payload = {
       autoGenerateUsername: true,
       username: createProxyUsernamePreview,
-      label: createProxyLabel.trim() || createProxyExternalId.trim() || formatOvpnDisplayLabel(ovpn),
+      label: createProxyLabel.trim() || createProxyExternalId.trim() || fallbackLabel,
       externalId: createProxyExternalId.trim(),
       proxyType: createProxyType === 'socks5' ? 'socks5' : 'http',
       enabled: true,
-      rotationIntervalMinutes: Math.max(0, Math.floor(Number(createProxyRotationMinutes) || 0)),
-      rotationCountry: (createProxyRotationCountry || '').toUpperCase(),
-      egress: { type: 'ovpn', ovpn },
+      rotationIntervalMinutes: isUpstreamCreate
+        ? 0
+        : Math.max(0, Math.floor(Number(createProxyRotationMinutes) || 0)),
+      rotationCountry: isUpstreamCreate ? '' : (createProxyRotationCountry || '').toUpperCase(),
+      egress: isUpstreamCreate ? { type: 'upstream', upstreamProxyId } : { type: 'ovpn', ovpn },
     };
     setCreatingProxy(true);
     setAuthRouteBusy(`create:${createProxyUsernamePreview}`);
@@ -896,7 +923,7 @@ export default function Dashboard() {
         username: route.username || createProxyUsernamePreview,
         label: route.label || payload.label,
         proxyType: route.proxyType || payload.proxyType,
-        ovpn,
+        egress: payload.egress,
       });
       setCreateProxySuffix(randomProxySuffix());
       toast({ title: 'Proxy created', message: route.username || createProxyUsernamePreview, variant: 'success' });
@@ -1287,67 +1314,115 @@ export default function Dashboard() {
               <form className="dashboard-modal-body" onSubmit={handleCreateProxyRoute}>
                 <div className="form-grid">
                   <label className="form-field">
-                    <span>Provider</span>
+                    <span>Egress</span>
                     <select
                       className="input"
-                      value={selectedCreateProvider}
-                      onChange={(e) => handleCreateProxyProviderChange(e.target.value)}
-                      disabled={creatingProxy || providerOptions.length === 0}
+                      value={createProxyEgressType}
+                      onChange={(e) => {
+                        const nextType = e.target.value === 'upstream' ? 'upstream' : 'ovpn';
+                        setCreateProxyEgressType(nextType);
+                        setCreatedProxy(null);
+                        if (nextType === 'upstream') {
+                          setCreateProxyRotationMinutes('0');
+                          setCreateProxyRotationCountry('');
+                        }
+                      }}
+                      disabled={creatingProxy}
                     >
-                      {providerOptions.length === 0 ? (
-                        <option value="">No providers</option>
-                      ) : (
-                        providerOptions.map((provider) => (
-                          <option key={provider} value={provider}>
-                            {provider}
-                          </option>
-                        ))
-                      )}
+                      <option value="ovpn">OpenVPN</option>
+                      <option value="upstream">Upstream proxy</option>
                     </select>
                   </label>
-                  <label className="form-field">
-                    <span>Location</span>
-                    <select
-                      className="input"
-                      value={selectedCreateLocation}
-                      onChange={(e) => handleCreateProxyLocationChange(e.target.value)}
-                      disabled={creatingProxy || locationOptions.length === 0}
-                    >
-                      {locationOptions.length === 0 ? (
-                        <option value="">No locations</option>
-                      ) : (
-                        locationOptions.map((location) => (
-                          <option key={location} value={location}>
-                            {location}
+                  {createProxyEgressType === 'upstream' && (
+                    <label className="form-field">
+                      <span>Saved upstream proxy</span>
+                      <select
+                        className="input"
+                        value={createProxyUpstreamProxyId}
+                        onChange={(e) => {
+                          setCreateProxyUpstreamProxyId(e.target.value);
+                          setCreatedProxy(null);
+                        }}
+                        disabled={creatingProxy}
+                        required
+                      >
+                        <option value="">Select upstream proxy...</option>
+                        {upstreamProxies.map((proxy) => (
+                          <option key={proxy.id} value={proxy.id}>
+                            {proxy.label || proxy.host || proxy.id} ({proxy.scheme}://{proxy.host}:{proxy.port})
                           </option>
-                        ))
-                      )}
-                    </select>
-                  </label>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                 </div>
-                <label className="form-field">
-                  <span>OVPN profile</span>
-                  <select
-                    className="input"
-                    value={selectedCreateOvpn}
-                    onChange={(e) => {
-                      setCreateProxyOvpn(e.target.value);
-                      setCreatedProxy(null);
-                    }}
-                    disabled={creatingProxy || locationRouteRows.length === 0}
-                    required
-                  >
-                    {locationRouteRows.length === 0 ? (
-                      <option value="">No OVPN profiles</option>
-                    ) : (
-                      locationRouteRows.map((row) => (
-                        <option key={row.file} value={row.file}>
-                          {row.file}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </label>
+                {createProxyEgressType === 'ovpn' && (
+                  <>
+                    <div className="form-grid">
+                      <label className="form-field">
+                        <span>Provider</span>
+                        <select
+                          className="input"
+                          value={selectedCreateProvider}
+                          onChange={(e) => handleCreateProxyProviderChange(e.target.value)}
+                          disabled={creatingProxy || providerOptions.length === 0}
+                        >
+                          {providerOptions.length === 0 ? (
+                            <option value="">No providers</option>
+                          ) : (
+                            providerOptions.map((provider) => (
+                              <option key={provider} value={provider}>
+                                {provider}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </label>
+                      <label className="form-field">
+                        <span>Location</span>
+                        <select
+                          className="input"
+                          value={selectedCreateLocation}
+                          onChange={(e) => handleCreateProxyLocationChange(e.target.value)}
+                          disabled={creatingProxy || locationOptions.length === 0}
+                        >
+                          {locationOptions.length === 0 ? (
+                            <option value="">No locations</option>
+                          ) : (
+                            locationOptions.map((location) => (
+                              <option key={location} value={location}>
+                                {location}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </label>
+                    </div>
+                    <label className="form-field">
+                      <span>OVPN profile</span>
+                      <select
+                        className="input"
+                        value={selectedCreateOvpn}
+                        onChange={(e) => {
+                          setCreateProxyOvpn(e.target.value);
+                          setCreatedProxy(null);
+                        }}
+                        disabled={creatingProxy || locationRouteRows.length === 0}
+                        required
+                      >
+                        {locationRouteRows.length === 0 ? (
+                          <option value="">No OVPN profiles</option>
+                        ) : (
+                          locationRouteRows.map((row) => (
+                            <option key={row.file} value={row.file}>
+                              {row.file}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                  </>
+                )}
                 <div className="form-grid">
                   <label className="form-field">
                     <span>Proxy type</span>
@@ -1391,46 +1466,48 @@ export default function Dashboard() {
                     />
                   </label>
                 </div>
-                <fieldset className="dashboard-rotation-fieldset" disabled={creatingProxy}>
-                  <legend className="dashboard-modal-label">OpenVPN Rotation</legend>
-                  <div className="dashboard-rotation-grid">
-                    <label className="form-field">
-                      <span>Interval minutes</span>
-                      <input
-                        type="number"
-                        className="input"
-                        min="0"
-                        step="1"
-                        value={createProxyRotationMinutes}
-                        onChange={(e) => {
-                          setCreateProxyRotationMinutes(e.target.value);
-                          setCreatedProxy(null);
-                        }}
-                        placeholder="0"
-                      />
-                    </label>
-                    <label className="form-field">
-                      <span>Country pool</span>
-                      <select
-                        className="input"
-                        value={createProxyRotationCountry}
-                        onChange={(e) => {
-                          setCreateProxyRotationCountry(e.target.value);
-                          setCreatedProxy(null);
-                        }}
-                        disabled={creatingProxy || Number(createProxyRotationMinutes) <= 0}
-                      >
-                        <option value="">Use global default</option>
-                        {ovpnCountries.map((country) => (
-                          <option key={country.code} value={country.code}>
-                            {country.label}
-                            {typeof country.count === 'number' ? ` (${country.count})` : ''}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </div>
-                </fieldset>
+                {createProxyEgressType === 'ovpn' && (
+                  <fieldset className="dashboard-rotation-fieldset" disabled={creatingProxy}>
+                    <legend className="dashboard-modal-label">OpenVPN Rotation</legend>
+                    <div className="dashboard-rotation-grid">
+                      <label className="form-field">
+                        <span>Interval minutes</span>
+                        <input
+                          type="number"
+                          className="input"
+                          min="0"
+                          step="1"
+                          value={createProxyRotationMinutes}
+                          onChange={(e) => {
+                            setCreateProxyRotationMinutes(e.target.value);
+                            setCreatedProxy(null);
+                          }}
+                          placeholder="0"
+                        />
+                      </label>
+                      <label className="form-field">
+                        <span>Country pool</span>
+                        <select
+                          className="input"
+                          value={createProxyRotationCountry}
+                          onChange={(e) => {
+                            setCreateProxyRotationCountry(e.target.value);
+                            setCreatedProxy(null);
+                          }}
+                          disabled={creatingProxy || Number(createProxyRotationMinutes) <= 0}
+                        >
+                          <option value="">Use global default</option>
+                          {ovpnCountries.map((country) => (
+                            <option key={country.code} value={country.code}>
+                              {country.label}
+                              {typeof country.count === 'number' ? ` (${country.count})` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  </fieldset>
+                )}
                 <div className="dashboard-generated-preview">
                   <span className="dashboard-modal-label">Username preview</span>
                   <code className="text-mono">{createProxyUsernamePreview}</code>
@@ -1472,7 +1549,7 @@ export default function Dashboard() {
                   <button
                     type="submit"
                     className="btn-primary dashboard-modal-submit"
-                    disabled={creatingProxy || !selectedCreateOvpn}
+                    disabled={creatingProxy || !canCreateProxy}
                   >
                     {creatingProxy ? 'Creating...' : 'Create Proxy'}
                   </button>
