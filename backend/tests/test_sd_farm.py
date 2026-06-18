@@ -205,6 +205,30 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type("HTTP"), "http")
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type(""), "http")
 
+    def test_discover_wsl_windows_host_ip_skips_loopback_resolv(self):
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(
+                Path,
+                "read_text",
+                return_value="nameserver 127.0.0.11\n",
+            ),
+            patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.22.192.1"),
+        ):
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "172.22.192.1")
+
+    def test_discover_wsl_windows_host_ip_uses_non_loopback_nameserver(self):
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(
+                Path,
+                "read_text",
+                return_value="nameserver 10.255.255.254\n",
+            ),
+            patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.22.192.1"),
+        ):
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "10.255.255.254")
+
     def test_ovpn_note_from_matched_path_strips_folder_and_extension(self):
         self.assertEqual(
             sd_farm.ovpn_note_from_matched_path("NC/NCVPN-US-NewYork-UDP.ovpn"),

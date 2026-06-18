@@ -38,22 +38,53 @@ def _looks_like_ipv4(value: str) -> bool:
         return False
 
 
+def _is_loopback_ip(value: str) -> bool:
+    return str(value or "").strip().startswith("127.")
+
+
+def _discover_default_gateway_ip() -> Optional[str]:
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if "via" not in parts:
+            continue
+        idx = parts.index("via")
+        if idx + 1 >= len(parts):
+            continue
+        ip = parts[idx + 1].strip()
+        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
+            return ip
+    return None
+
+
 def discover_wsl_windows_host_ip() -> Optional[str]:
     resolv = Path("/etc/resolv.conf")
-    if not resolv.is_file():
-        return None
-    try:
-        for line in resolv.read_text(encoding="utf-8", errors="replace").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if stripped.startswith("nameserver"):
-                parts = stripped.split()
-                if len(parts) >= 2 and _looks_like_ipv4(parts[1]):
-                    return parts[1]
-    except OSError:
-        return None
-    return None
+    if resolv.is_file():
+        try:
+            for line in resolv.read_text(encoding="utf-8", errors="replace").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped.startswith("nameserver"):
+                    parts = stripped.split()
+                    if len(parts) >= 2:
+                        ip = parts[1].strip()
+                        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
+                            return ip
+        except OSError:
+            pass
+    return _discover_default_gateway_ip()
 
 
 def normalize_ixbrowser_api_base(raw: str) -> str:
