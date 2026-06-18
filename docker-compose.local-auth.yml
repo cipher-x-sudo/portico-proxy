@@ -57,17 +57,14 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_STATE_KEY=portico:auth-routing-state
       - DATABASE_URL=postgresql://portico:portico@postgres:5432/portico
-      - SD_FARM_ROOT=${SD_FARM_ROOT:-/sd-farm}
       - IXBROWSER_API_BASE=${IXBROWSER_API_BASE:-http://host.docker.internal:53200/api/v2/}
       - IXBROWSER_PROXY_HOST=${IXBROWSER_PROXY_HOST:-127.0.0.1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ovpn_data:/ovpn
       - sd_farm_data:/data/sd-farm
-      - type: bind
-        source: ${SD_FARM_HOST_PATH:-H:/SD Farm}
-        target: /sd-farm
-        read_only: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:49999:49999"
       - "0.0.0.0:${AUTH_HTTP_PORT:-58680}:${AUTH_HTTP_PORT:-58680}"
