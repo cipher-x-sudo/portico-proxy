@@ -28,6 +28,10 @@ export default function Config() {
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const [uploadResult, setUploadResult] = useState(null);
+  const [deleteOvpnBusy, setDeleteOvpnBusy] = useState(false);
+  const [deleteOvpnError, setDeleteOvpnError] = useState('');
+  const [deleteOvpnIncludeAssets, setDeleteOvpnIncludeAssets] = useState(false);
+  const [ovpnScanPath, setOvpnScanPath] = useState('');
   const [upstreamProxies, setUpstreamProxies] = useState([]);
   const [upstreamBusy, setUpstreamBusy] = useState(false);
   const [upstreamError, setUpstreamError] = useState('');
@@ -56,6 +60,7 @@ export default function Config() {
           ? ovpnPayload.unclassifiedOvpnCount
           : 0,
     });
+    setOvpnScanPath(typeof ovpnPayload.scanPath === 'string' ? ovpnPayload.scanPath : '');
   }, []);
 
   const refreshOvpnMetadata = useCallback(async () => {
@@ -194,6 +199,51 @@ export default function Config() {
       toast({ title: 'Upload failed', message, variant: 'danger' });
     } finally {
       setUploadBusy(false);
+    }
+  };
+
+  const deleteAllOvpnFiles = async () => {
+    const count = ovpnScanMeta.count || 0;
+    const locationHint = config?.useDocker
+      ? `the Docker OVPN volume${ovpnScanPath ? ` at ${ovpnScanPath}` : ''}`
+      : ovpnScanPath || 'the configured OVPN folder';
+    const accepted = await confirmAction({
+      title: 'Delete all OVPN files?',
+      message: `Permanently delete ${count} OVPN profile${count === 1 ? '' : 's'} from ${locationHint}?${
+        deleteOvpnIncludeAssets
+          ? ' Related certificates, keys, and auth.txt files will also be removed.'
+          : ' Provider credentials and certificate files will be kept.'
+      } Active workers may fail until you upload new profiles.`,
+      confirmLabel: 'Delete all OVPN files',
+      variant: 'danger',
+    });
+    if (!accepted) return;
+    setDeleteOvpnBusy(true);
+    setDeleteOvpnError('');
+    try {
+      const res = await fetch('/api/ovpn-delete-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ includeAssets: deleteOvpnIncludeAssets }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || 'Failed to delete OVPN files');
+      }
+      await Promise.all([refreshOvpnMetadata(), refreshProviderAuth()]);
+      toast({
+        title: 'OVPN files deleted',
+        message: `Removed ${data.deletedOvpn || 0} OVPN file${data.deletedOvpn === 1 ? '' : 's'}${
+          data.deletedOther ? ` and ${data.deletedOther} related file${data.deletedOther === 1 ? '' : 's'}` : ''
+        }.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      const message = err.message || 'Failed to delete OVPN files';
+      setDeleteOvpnError(message);
+      toast({ title: 'Delete failed', message, variant: 'danger' });
+    } finally {
+      setDeleteOvpnBusy(false);
     }
   };
 
@@ -831,6 +881,69 @@ export default function Config() {
               </div>
             ) : null}
           </form>
+
+          <div className="ovpn-delete-panel">
+            <div className="ovpn-delete-header">
+              <span className="material-symbols-outlined text-danger">delete_forever</span>
+              <div>
+                <h4 className="ovpn-delete-title">Remove OVPN files from container</h4>
+                <p className="text-muted text-sm mb-0">
+                  Delete every <code className="text-mono">.ovpn</code> profile currently stored on{' '}
+                  {config.useDocker ? (
+                    <>
+                      the gateway <code className="text-mono">/ovpn</code> volume
+                      {ovpnScanPath ? (
+                        <>
+                          {' '}
+                          (<code className="text-mono">{ovpnScanPath}</code>)
+                        </>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>the configured OVPN folder{ovpnScanPath ? ` (${ovpnScanPath})` : ''}</>
+                  )}
+                  . This does not change saved dashboard assignments until you refresh or re-sync routes.
+                </p>
+              </div>
+            </div>
+            <div className="ovpn-delete-meta">
+              <span>
+                <strong>{ovpnScanMeta.count}</strong> OVPN file{ovpnScanMeta.count === 1 ? '' : 's'} on disk
+              </span>
+              {ovpnProviderSummaries.length > 0 && (
+                <span>
+                  {ovpnProviderSummaries.length} provider folder
+                  {ovpnProviderSummaries.length === 1 ? '' : 's'}
+                </span>
+              )}
+            </div>
+            <div className="ovpn-delete-footer">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={deleteOvpnIncludeAssets}
+                  onChange={(e) => setDeleteOvpnIncludeAssets(e.target.checked)}
+                  disabled={deleteOvpnBusy}
+                />
+                <span className="checkbox-custom"></span>
+                Also remove certificates, keys, and auth.txt files
+              </label>
+              <button
+                type="button"
+                className="btn-danger"
+                onClick={deleteAllOvpnFiles}
+                disabled={deleteOvpnBusy || ovpnScanMeta.count === 0}
+              >
+                <span className="material-symbols-outlined">delete</span>
+                {deleteOvpnBusy ? 'Deleting...' : 'Delete all OVPN files'}
+              </button>
+            </div>
+            {deleteOvpnError ? (
+              <div className="config-publish-mismatch-banner" role="alert">
+                <strong>OVPN delete failed.</strong> {deleteOvpnError}
+              </div>
+            ) : null}
+          </div>
         </section>
 
         <section className="card config-card col-span-2">

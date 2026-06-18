@@ -198,6 +198,42 @@
   line-height: 1.45;
 }
 
+.ovpn-delete-panel {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.ovpn-delete-header {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  margin-bottom: 0.75rem;
+}
+
+.ovpn-delete-title {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.ovpn-delete-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  margin-bottom: 1rem;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.ovpn-delete-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
 .config-publish-mismatch-banner {
   margin: 0 0 0.85rem;
   padding: 0.75rem 0.9rem;
@@ -273,6 +309,7 @@
   .config-header-actions > .flex:first-child,
   .config-header-actions > .flex:last-child,
   .ovpn-upload-footer,
+  .ovpn-delete-footer,
   .card .flex.gap-6 {
     align-items: stretch;
     flex-direction: column;

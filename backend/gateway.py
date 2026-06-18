@@ -1799,6 +1799,101 @@ def save_ovpn_upload_batch(
     }
 
 
+def delete_all_ovpn_files(
+    ovpn_root: Path,
+    *,
+    include_assets: bool = False,
+) -> Dict[str, Any]:
+    """
+    Remove all .ovpn files under ovpn_root. When include_assets is True, also remove
+    related OpenVPN assets (certs, keys, auth.txt) and empty provider folders.
+    """
+    root = ovpn_root.resolve()
+    if not root.exists() or not root.is_dir():
+        raise OvpnUploadError(f"ovpnRoot does not exist or is not a directory: {root}")
+
+    deleted_ovpn: List[str] = []
+    deleted_other: List[str] = []
+    errors: List[str] = []
+
+    ovpn_paths = sorted(
+        (p for p in root.rglob("*.ovpn") if p.is_file()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+    for path in ovpn_paths:
+        resolved = path.resolve()
+        if not _is_safe_under_root(resolved, root):
+            errors.append(f"skipped unsafe path: {path}")
+            continue
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        try:
+            path.unlink()
+            deleted_ovpn.append(rel)
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.EROFS or "read-only" in str(exc).lower():
+                raise OvpnUploadError(
+                    "OVPN root is read-only. Ensure the gateway mounts ovpn_data as writable."
+                ) from exc
+            errors.append(f"{rel}: {exc}")
+
+    if include_assets:
+        asset_suffixes = {ext for ext in ALLOWED_ASSET_EXTENSIONS if ext != ".ovpn"}
+        other_paths = sorted(
+            (
+                p
+                for p in root.rglob("*")
+                if p.is_file()
+                and (
+                    p.suffix.lower() in asset_suffixes
+                    or p.name.casefold() == "auth.txt"
+                )
+            ),
+            key=lambda p: len(p.parts),
+            reverse=True,
+        )
+        for path in other_paths:
+            resolved = path.resolve()
+            if not _is_safe_under_root(resolved, root):
+                errors.append(f"skipped unsafe path: {path}")
+                continue
+            rel = str(path.relative_to(root)).replace("\\", "/")
+            try:
+                path.unlink()
+                deleted_other.append(rel)
+            except OSError as exc:
+                if getattr(exc, "errno", None) == errno.EROFS or "read-only" in str(exc).lower():
+                    raise OvpnUploadError(
+                        "OVPN root is read-only. Ensure the gateway mounts ovpn_data as writable."
+                    ) from exc
+                errors.append(f"{rel}: {exc}")
+
+        for path in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            if path == root:
+                continue
+            if not _is_safe_under_root(path.resolve(), root):
+                continue
+            try:
+                if not any(path.iterdir()):
+                    path.rmdir()
+            except OSError:
+                pass
+
+    if errors and not deleted_ovpn and not deleted_other:
+        raise OvpnUploadError("; ".join(errors[:5]))
+
+    return {
+        "ok": True,
+        "deletedOvpn": len(deleted_ovpn),
+        "deletedOther": len(deleted_other),
+        "ovpnFiles": deleted_ovpn,
+        "otherFiles": deleted_other,
+        "errors": errors,
+        "scanPath": str(root),
+        "includeAssets": bool(include_assets),
+    }
+
+
 def list_allowed_ovpn_files(config: Dict[str, Any], config_path: Path, use_docker: bool = False) -> List[str]:
     # Docker mode: list only files that actually exist on the shared volume (same as worker /ovpn).
     if use_docker:
@@ -5979,6 +6074,8 @@ def _control_api_handler_factory(
                 self._handle_post_provider_auth()
             elif path == "/api/ovpn-upload":
                 self._handle_post_ovpn_upload()
+            elif path == "/api/ovpn-delete-all":
+                self._handle_post_ovpn_delete_all()
             elif path == "/api/assign-ovpn":
                 self._handle_post_assign_ovpn(parsed.query)
             elif path == "/api/upstream-proxy":
@@ -6252,6 +6349,35 @@ def _control_api_handler_factory(
                 return
             except Exception as e:
                 self._send_error_body(f"Could not save provider credentials to database: {e}", 500)
+                return
+            files_payload = build_ovpn_files_payload(
+                runtime_config,
+                state["config_path"],
+                bool(state.get("use_docker")),
+            )
+            result["ovpnCount"] = files_payload.get("ovpnCount", 0)
+            result["providers"] = files_payload.get("providers", [])
+            self._send_json(result)
+
+        def _handle_post_ovpn_delete_all(self) -> None:
+            body, body_err = self._read_json_body(4096)
+            if body_err:
+                self._send_error_body(body_err, 400)
+                return
+            include_assets = bool((body or {}).get("includeAssets"))
+            runtime_config, load_err, load_status = self._runtime_config_for_apply()
+            if load_err or runtime_config is None:
+                self._send_error_body(load_err or "Could not load config", load_status)
+                return
+            ovpn_root = _resolve_provider_auth_root(
+                runtime_config,
+                state["config_path"],
+                bool(state.get("use_docker")),
+            )
+            try:
+                result = delete_all_ovpn_files(ovpn_root, include_assets=include_assets)
+            except OvpnUploadError as e:
+                self._send_error_body(str(e), 400)
                 return
             files_payload = build_ovpn_files_payload(
                 runtime_config,

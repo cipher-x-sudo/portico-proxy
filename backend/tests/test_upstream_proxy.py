@@ -650,6 +650,54 @@ class OvpnUploadTests(unittest.TestCase):
             self.assertEqual((root / "NC" / "profile.ovpn").read_bytes(), b"new\n")
             self.assertEqual((root / "NC" / "auth.txt").read_text(encoding="utf-8"), "user\nnew-pass\n")
 
+    def test_delete_all_ovpn_files_removes_profiles_only_by_default(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            gateway.save_ovpn_upload_batch(
+                root,
+                "NC",
+                "user",
+                "pass",
+                [
+                    {"filename": "profile-a.ovpn", "data": b"client\n"},
+                    {"filename": "profile-b.ovpn", "data": b"client\n"},
+                    {"filename": "ca.crt", "data": b"certificate\n"},
+                ],
+            )
+            result = gateway.delete_all_ovpn_files(root)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["deletedOvpn"], 2)
+            self.assertEqual(result["deletedOther"], 0)
+            self.assertFalse((root / "NC" / "profile-a.ovpn").exists())
+            self.assertFalse((root / "NC" / "profile-b.ovpn").exists())
+            self.assertTrue((root / "NC" / "ca.crt").is_file())
+            self.assertTrue((root / "NC" / "auth.txt").is_file())
+            self.assertEqual(
+                gateway.list_allowed_ovpn_files({"ovpnRoot": str(root)}, root / "config.json", False),
+                [],
+            )
+
+    def test_delete_all_ovpn_files_can_include_assets(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            gateway.save_ovpn_upload_batch(
+                root,
+                "NC",
+                "user",
+                "pass",
+                [
+                    {"filename": "profile.ovpn", "data": b"client\n"},
+                    {"filename": "ca.crt", "data": b"certificate\n"},
+                ],
+            )
+            result = gateway.delete_all_ovpn_files(root, include_assets=True)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["deletedOvpn"], 1)
+            self.assertGreaterEqual(result["deletedOther"], 2)
+            self.assertFalse((root / "NC" / "profile.ovpn").exists())
+            self.assertFalse((root / "NC" / "ca.crt").exists())
+            self.assertFalse((root / "NC" / "auth.txt").exists())
+
 
 class OVPNLocationChangeTests(unittest.TestCase):
     @staticmethod
