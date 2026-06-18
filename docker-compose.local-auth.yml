@@ -57,6 +57,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_STATE_KEY=portico:auth-routing-state
       - DATABASE_URL=postgresql://portico:portico@postgres:5432/portico
+      # WSL Docker + ixBrowser on Windows: set IXBROWSER_API_BASE to Windows host IP
+      # from WSL (grep nameserver /etc/resolv.conf), e.g. http://10.255.255.254:53200/api/v2/
       - IXBROWSER_API_BASE=${IXBROWSER_API_BASE:-http://host.docker.internal:53200/api/v2/}
       - IXBROWSER_PROXY_HOST=${IXBROWSER_PROXY_HOST:-127.0.0.1}
     volumes:

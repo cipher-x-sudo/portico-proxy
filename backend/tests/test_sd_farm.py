@@ -331,10 +331,16 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
             self.assertIsNone(gateway._persist_sd_farm_settings(config_path, state, settings))
             gateway._apply_sd_farm_settings(state, settings)
 
+            with patch.object(
+                gateway,
+                "_probe_ixbrowser",
+                return_value={"ok": False, "ixBrowserError": "", "ixBrowserProfileCount": 0, "triedUrls": []},
+            ):
+                payload = gateway._sd_farm_settings_payload(state)
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["sdFarmRoot"], str(root))
             self.assertEqual(saved["ixBrowserProxyType"], "socks5")
-            self.assertEqual(gateway._sd_farm_settings_payload(state)["dbPath"], str(db))
+            self.assertEqual(payload["dbPath"], str(db))
 
     def test_validate_import_label_does_not_require_server_path(self):
         state = {
