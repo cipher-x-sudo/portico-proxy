@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -239,18 +239,37 @@ class SDFarmTests(unittest.TestCase):
     def test_discover_wsl_windows_host_ip_uses_docker_host_network_probe(self):
         sd_farm._windows_host_ip_cache = None
         sd_farm._windows_host_ip_cache_attempted = False
+        mock_client = MagicMock()
+        mock_client.containers.run.return_value = b"172.19.128.1\n"
         with (
             patch.dict(os.environ, {}, clear=True),
             patch.object(sd_farm, "_running_inside_docker", return_value=True),
             patch.object(sd_farm, "_docker_socket_available", return_value=True),
-            patch.object(
-                sd_farm,
-                "_discover_windows_host_via_docker_host_network",
-                return_value="172.19.128.1",
-            ),
+            patch.object(sd_farm, "_docker_client", return_value=mock_client),
             patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.17.0.1"),
         ):
             self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.19.128.1")
+
+    def test_json_post_uses_docker_host_network_inside_container(self):
+        payload = {"page": 1, "limit": 1}
+        with (
+            patch.object(sd_farm, "_should_ixbrowser_use_host_network", return_value=True),
+            patch.object(
+                sd_farm,
+                "_http_post_via_docker_host_network",
+                return_value='{"error":{"code":0,"message":"success"},"data":{"total":1,"data":[]}}',
+            ) as host_post,
+        ):
+            data = sd_farm._json_post("http://host.docker.internal:53200/api/v2/", "profile-list", payload)
+        host_post.assert_called_once()
+        self.assertEqual(data["error"]["code"], 0)
+
+    def test_ixbrowser_url_for_host_network_rewrites_docker_hosts(self):
+        with patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="172.19.128.1"):
+            rewritten = sd_farm._ixbrowser_url_for_host_network(
+                "http://host.docker.internal:53200/api/v2/profile-list"
+            )
+        self.assertEqual(rewritten, "http://172.19.128.1:53200/api/v2/profile-list")
 
     def test_discover_wsl_windows_host_ip_uses_env_override(self):
         with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.19.128.1"}, clear=False):

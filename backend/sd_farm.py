@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -93,43 +95,112 @@ def _docker_socket_available() -> bool:
     return Path("/var/run/docker.sock").exists()
 
 
+def _docker_client():
+    try:
+        import docker
+    except ImportError:
+        return None
+    try:
+        return docker.from_env()
+    except Exception:
+        return None
+
+
+def _should_ixbrowser_use_host_network() -> bool:
+    mode = str(os.environ.get("IXBROWSER_USE_HOST_NETWORK") or "auto").strip().lower()
+    if mode in ("0", "false", "no", "off"):
+        return False
+    if mode in ("1", "true", "yes", "on"):
+        return _running_inside_docker() and _docker_socket_available()
+    return _running_inside_docker() and _docker_socket_available()
+
+
+def _ixbrowser_url_for_host_network(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    port = parsed.port or IXBROWSER_DEFAULT_PORT
+    win_ip = discover_wsl_windows_host_ip()
+    if not win_ip:
+        return url
+    host = (parsed.hostname or "").lower()
+    rewrite_hosts = {
+        "host.docker.internal",
+        "172.17.0.1",
+        "127.0.0.11",
+        "127.0.0.1",
+        "localhost",
+    }
+    if host in rewrite_hosts or host.startswith("172.17."):
+        return urllib.parse.urlunparse(parsed._replace(netloc=f"{win_ip}:{port}"))
+    return url
+
+
+def _http_post_via_docker_host_network(url: str, payload: Dict[str, Any], timeout: float) -> str:
+    client = _docker_client()
+    if client is None:
+        raise IXBrowserError("Docker client is not available for host-network ixBrowser access")
+    target_url = _ixbrowser_url_for_host_network(url)
+    body_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    image = (
+        str(os.environ.get(DOCKER_HOST_NETWORK_PROBE_IMAGE_ENV) or "").strip()
+        or DEFAULT_DOCKER_HOST_NETWORK_PROBE_IMAGE
+    )
+    timeout_seconds = max(1, int(timeout))
+    shell = (
+        "BODY=$(printf %s \"$IXBODY_B64\" | base64 -d) && "
+        f"wget -qO- --timeout={timeout_seconds} "
+        "--header='Content-Type: application/json' "
+        "--post-data=\"$BODY\" \"$IXURL\""
+    )
+    try:
+        output = client.containers.run(
+            image,
+            command=["sh", "-c", shell],
+            environment={"IXBODY_B64": body_b64, "IXURL": target_url},
+            network_mode="host",
+            remove=True,
+            stdout=True,
+            stderr=True,
+            timeout=timeout_seconds + 20,
+        )
+    except Exception as e:
+        detail = str(e).strip() or repr(e)
+        raise IXBrowserError(
+            f"ixBrowser host-network request failed ({target_url}): {detail}"
+        ) from e
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output or "")
+
+
 def _discover_windows_host_via_docker_host_network() -> Optional[str]:
     """
     On WSL Docker, the gateway container only sees the Docker bridge (172.17.0.1).
     Spawn a short-lived host-network container to read the WSL default route gateway,
     which is the Windows host IP where ixBrowser listens.
     """
-    import subprocess
-
     if not _running_inside_docker() or not _docker_socket_available():
+        return None
+    client = _docker_client()
+    if client is None:
         return None
     image = (
         str(os.environ.get(DOCKER_HOST_NETWORK_PROBE_IMAGE_ENV) or "").strip()
         or DEFAULT_DOCKER_HOST_NETWORK_PROBE_IMAGE
     )
     try:
-        proc = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--network",
-                "host",
-                image,
-                "sh",
-                "-c",
-                "ip -4 route show default | awk '{print $3; exit}'",
-            ],
-            capture_output=True,
-            text=True,
+        output = client.containers.run(
+            image,
+            command=["sh", "-c", "ip -4 route show default | awk '{print $3; exit}'"],
+            network_mode="host",
+            remove=True,
+            stdout=True,
+            stderr=False,
             timeout=20,
-            check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except Exception:
         return None
-    if proc.returncode != 0:
-        return None
-    for line in (proc.stdout or "").splitlines():
+    text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output or "")
+    for line in text.splitlines():
         ip = line.strip()
         if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
             return ip
@@ -254,20 +325,23 @@ def probe_ixbrowser_bases(
     candidate_list = [normalize_ixbrowser_api_base(base) for base in candidates if normalize_ixbrowser_api_base(base)]
     wsl_ip = discover_wsl_windows_host_ip()
     recommended_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker else ""
+    host_network = _should_ixbrowser_use_host_network()
 
     for base in candidate_list:
         tried.append(base)
         try:
             profiles = fetch_ixbrowser_profiles(base, page_limit=1, timeout=timeout)
+            working_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker and host_network else base
             return {
                 "ok": True,
-                "ixBrowserApiBase": base,
+                "ixBrowserApiBase": working_base,
                 "ixBrowserError": "",
                 "ixBrowserProfileCount": len(profiles),
                 "triedUrls": tried,
-                "recommendedBase": base,
+                "recommendedBase": working_base,
                 "hint": "",
                 "wslHostIp": wsl_ip or "",
+                "hostNetworkUsed": host_network,
             }
         except IXBrowserError as e:
             last_error = str(e)
@@ -285,6 +359,7 @@ def probe_ixbrowser_bases(
         "recommendedBase": recommended_base,
         "hint": hint,
         "wslHostIp": wsl_ip or "",
+        "hostNetworkUsed": host_network,
     }
 
 
@@ -486,20 +561,28 @@ def route_username_for_uid(uid: str) -> str:
 def _json_post(base_url: str, action: str, payload: Dict[str, Any], timeout: float = 20.0) -> Dict[str, Any]:
     base = (base_url or "").rstrip("/") + "/"
     url = base + action.lstrip("/")
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        raise IXBrowserError(f"ixBrowser request failed: {e}") from e
-    except OSError as e:
-        raise IXBrowserError(f"ixBrowser request failed: {e}") from e
+    if _should_ixbrowser_use_host_network():
+        try:
+            raw = _http_post_via_docker_host_network(url, payload, timeout)
+        except IXBrowserError:
+            raise
+        except Exception as e:
+            raise IXBrowserError(f"ixBrowser request failed: {e}") from e
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as e:
+            raise IXBrowserError(f"ixBrowser request failed: {e}") from e
+        except OSError as e:
+            raise IXBrowserError(f"ixBrowser request failed: {e}") from e
     try:
         data = json.loads(raw or "{}")
     except json.JSONDecodeError as e:
