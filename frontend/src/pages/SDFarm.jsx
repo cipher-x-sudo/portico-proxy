@@ -28,6 +28,10 @@ const defaultSettings = {
   ixBrowserOk: false,
   ixBrowserError: '',
   ixBrowserProfileCount: 0,
+  ixBrowserTriedUrls: [],
+  ixBrowserRecommendedBase: '',
+  ixBrowserHint: '',
+  wslHostIp: '',
   useDocker: false,
   dbPath: '',
   dbError: '',
@@ -85,6 +89,10 @@ export default function SDFarm() {
       ixBrowserOk: Boolean(data.ixBrowserOk),
       ixBrowserError: data.ixBrowserError || '',
       ixBrowserProfileCount: Number(data.ixBrowserProfileCount || 0),
+      ixBrowserTriedUrls: Array.isArray(data.ixBrowserTriedUrls) ? data.ixBrowserTriedUrls : [],
+      ixBrowserRecommendedBase: data.ixBrowserRecommendedBase || '',
+      ixBrowserHint: data.ixBrowserHint || '',
+      wslHostIp: data.wslHostIp || '',
       useDocker: Boolean(data.useDocker),
       dbPath: data.dbPath || '',
       dbError: data.dbError || '',
@@ -237,16 +245,25 @@ export default function SDFarm() {
       const res = await fetch(`/api/sd-farm/ixbrowser-test${query}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'ixBrowser test failed');
+      const workingBase = data.recommendedBase || data.ixBrowserApiBase || settings.ixBrowserApiBase;
       setSettings((current) => ({
         ...current,
         ixBrowserOk: Boolean(data.ok),
         ixBrowserError: data.ixBrowserError || data.error || '',
         ixBrowserProfileCount: Number(data.ixBrowserProfileCount || 0),
+        ixBrowserTriedUrls: Array.isArray(data.triedUrls) ? data.triedUrls : [],
+        ixBrowserRecommendedBase: data.recommendedBase || '',
+        ixBrowserHint: data.hint || '',
+        wslHostIp: data.wslHostIp || current.wslHostIp || '',
+        ...(data.ok && workingBase ? { ixBrowserApiBase: workingBase } : {}),
       }));
+      if (data.ok && workingBase && workingBase !== settings.ixBrowserApiBase) {
+        setSettingsDirty(true);
+      }
       toast({
         title: data.ok ? 'ixBrowser connected' : 'ixBrowser connection failed',
         message: data.ok
-          ? `${data.ixBrowserProfileCount || 0} profiles found.`
+          ? `${data.ixBrowserProfileCount || 0} profiles at ${workingBase}`
           : data.ixBrowserError || data.error || 'Connection refused',
         variant: data.ok ? 'success' : 'danger',
       });
@@ -256,6 +273,17 @@ export default function SDFarm() {
     } finally {
       setIxTesting(false);
     }
+  };
+
+  const useDetectedIxUrl = () => {
+    const next = settings.ixBrowserRecommendedBase;
+    if (!next) return;
+    handleSettingsChange('ixBrowserApiBase', next);
+    toast({
+      title: 'URL applied',
+      message: next,
+      variant: 'success',
+    });
   };
 
   const handlePickFolder = async () => {
@@ -490,7 +518,7 @@ export default function SDFarm() {
                   type="button"
                   className="btn-outline"
                   onClick={testIxBrowser}
-                  disabled={Boolean(busy) || ixTesting || !settings.ixBrowserApiBase}
+                  disabled={Boolean(busy) || ixTesting}
                 >
                   <span className="material-symbols-outlined">
                     {ixTesting ? 'progress_activity' : 'lan'}
@@ -513,7 +541,9 @@ export default function SDFarm() {
                   />
                   <p className="sd-farm-settings-hint">
                     {settings.useDocker
-                      ? 'Docker: use host.docker.internal to reach ixBrowser running on this PC.'
+                      ? (settings.wslHostIp
+                        ? `WSL + Windows: ixBrowser runs on Windows. Try http://${settings.wslHostIp}:53200/api/v2/ if host.docker.internal fails.`
+                        : 'WSL/Docker: use host.docker.internal, or your Windows host IP from /etc/resolv.conf nameserver.')}
                       : 'Local gateway: use http://127.0.0.1:53200/api/v2/ when ixBrowser runs on the same machine.'}
                   </p>
                 </div>
@@ -552,6 +582,24 @@ export default function SDFarm() {
               </div>
               {!settings.ixBrowserOk && settings.ixBrowserError && (
                 <p className="sd-farm-ix-error">{settings.ixBrowserError}</p>
+              )}
+              {!settings.ixBrowserOk && settings.ixBrowserHint && (
+                <p className="sd-farm-settings-hint">{settings.ixBrowserHint}</p>
+              )}
+              {!settings.ixBrowserOk && settings.ixBrowserTriedUrls?.length > 0 && (
+                <p className="sd-farm-settings-hint">
+                  Tried: {settings.ixBrowserTriedUrls.join(', ')}
+                </p>
+              )}
+              {!settings.ixBrowserOk
+                && settings.ixBrowserRecommendedBase
+                && settings.ixBrowserRecommendedBase !== settings.ixBrowserApiBase && (
+                <div className="sd-farm-ix-detected">
+                  <span>Suggested: {settings.ixBrowserRecommendedBase}</span>
+                  <button type="button" className="btn-outline" onClick={useDetectedIxUrl}>
+                    Use detected URL
+                  </button>
+                </div>
               )}
             </div>
 

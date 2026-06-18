@@ -24,6 +24,144 @@ class IXBrowserError(RuntimeError):
     pass
 
 
+IXBROWSER_DEFAULT_PORT = 53200
+IXBROWSER_API_SUFFIX = "/api/v2/"
+
+
+def _looks_like_ipv4(value: str) -> bool:
+    parts = str(value or "").strip().split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(part) <= 255 for part in parts)
+    except ValueError:
+        return False
+
+
+def discover_wsl_windows_host_ip() -> Optional[str]:
+    resolv = Path("/etc/resolv.conf")
+    if not resolv.is_file():
+        return None
+    try:
+        for line in resolv.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("nameserver"):
+                parts = stripped.split()
+                if len(parts) >= 2 and _looks_like_ipv4(parts[1]):
+                    return parts[1]
+    except OSError:
+        return None
+    return None
+
+
+def normalize_ixbrowser_api_base(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if not value.endswith("/"):
+        value += "/"
+    return value
+
+
+def build_ixbrowser_api_base(host: str, port: int = IXBROWSER_DEFAULT_PORT) -> str:
+    host_text = str(host or "").strip().rstrip("/")
+    if host_text.startswith("http://") or host_text.startswith("https://"):
+        return normalize_ixbrowser_api_base(host_text)
+    return normalize_ixbrowser_api_base(f"http://{host_text}:{int(port)}{IXBROWSER_API_SUFFIX}")
+
+
+def ixbrowser_api_candidates(
+    *,
+    use_docker: bool,
+    configured_base: str = "",
+    override_base: Optional[str] = None,
+) -> List[str]:
+    seen: set[str] = set()
+    candidates: List[str] = []
+
+    def add(raw: str) -> None:
+        base = normalize_ixbrowser_api_base(raw)
+        if not base or base in seen:
+            return
+        seen.add(base)
+        candidates.append(base)
+
+    if override_base:
+        add(override_base)
+    configured = normalize_ixbrowser_api_base(configured_base)
+    if configured:
+        add(configured)
+    if use_docker:
+        add(build_ixbrowser_api_base("host.docker.internal"))
+        wsl_ip = discover_wsl_windows_host_ip()
+        if wsl_ip:
+            add(build_ixbrowser_api_base(wsl_ip))
+        add(build_ixbrowser_api_base("172.17.0.1"))
+    else:
+        add(build_ixbrowser_api_base("127.0.0.1"))
+    return candidates
+
+
+def ixbrowser_probe_hint(use_docker: bool, tried_urls: List[str]) -> str:
+    del tried_urls
+    wsl_ip = discover_wsl_windows_host_ip()
+    if use_docker and wsl_ip:
+        return (
+            "ixBrowser usually runs on Windows when using WSL Docker. "
+            f"Try http://{wsl_ip}:53200/api/v2/ or ensure ixBrowser is running and port 53200 is allowed through Windows Firewall."
+        )
+    if use_docker:
+        return "Ensure ixBrowser is running on the host and API port 53200 is reachable from Docker."
+    return "Ensure ixBrowser is running and listening on port 53200."
+
+
+def probe_ixbrowser_bases(
+    candidates: Iterable[str],
+    *,
+    use_docker: bool = False,
+    timeout: float = 4.0,
+) -> Dict[str, Any]:
+    tried: List[str] = []
+    last_error = ""
+    candidate_list = [normalize_ixbrowser_api_base(base) for base in candidates if normalize_ixbrowser_api_base(base)]
+    wsl_ip = discover_wsl_windows_host_ip()
+    recommended_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker else ""
+
+    for base in candidate_list:
+        tried.append(base)
+        try:
+            profiles = fetch_ixbrowser_profiles(base, page_limit=1, timeout=timeout)
+            return {
+                "ok": True,
+                "ixBrowserApiBase": base,
+                "ixBrowserError": "",
+                "ixBrowserProfileCount": len(profiles),
+                "triedUrls": tried,
+                "recommendedBase": base,
+                "hint": "",
+                "wslHostIp": wsl_ip or "",
+            }
+        except IXBrowserError as e:
+            last_error = str(e)
+
+    hint = ixbrowser_probe_hint(use_docker, tried)
+    error_text = last_error or "Could not connect to ixBrowser"
+    if hint and hint not in error_text:
+        error_text = f"{error_text}. {hint}"
+    return {
+        "ok": False,
+        "ixBrowserApiBase": candidate_list[0] if candidate_list else "",
+        "ixBrowserError": error_text,
+        "ixBrowserProfileCount": 0,
+        "triedUrls": tried,
+        "recommendedBase": recommended_base,
+        "hint": hint,
+        "wslHostIp": wsl_ip or "",
+    }
+
+
 def resolve_sd_farm_root(raw: str) -> Path:
     value = (raw or "").strip() or "/sd-farm"
     return Path(value).expanduser()
@@ -255,13 +393,18 @@ def _response_data(raw: Dict[str, Any]) -> Any:
     return data if data is not None else raw
 
 
-def fetch_ixbrowser_profiles(base_url: str, page_limit: int = 100) -> List[Dict[str, Any]]:
+def fetch_ixbrowser_profiles(
+    base_url: str,
+    page_limit: int = 100,
+    *,
+    timeout: float = 20.0,
+) -> List[Dict[str, Any]]:
     limit = max(1, min(500, int(page_limit or 100)))
     page = 1
     profiles: List[Dict[str, Any]] = []
     total: Optional[int] = None
     while True:
-        raw = _json_post(base_url, "profile-list", {"page": page, "limit": limit})
+        raw = _json_post(base_url, "profile-list", {"page": page, "limit": limit}, timeout=timeout)
         payload = _response_data(raw)
         if isinstance(payload, dict):
             if isinstance(payload.get("total"), int):

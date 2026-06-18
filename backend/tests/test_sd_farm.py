@@ -346,10 +346,48 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
 
     def test_probe_ixbrowser_reports_connection_error(self):
         state = {"auth_runtime_config": {}, "use_docker": True}
-        with patch.object(gateway, "fetch_ixbrowser_profiles", side_effect=sd_farm.IXBrowserError("Connection refused")):
+        with (
+            patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="10.255.255.254"),
+            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=sd_farm.IXBrowserError("Connection refused")),
+        ):
             status = gateway._probe_ixbrowser(state, api_base="http://127.0.0.1:53200/api/v2/")
         self.assertFalse(status["ok"])
         self.assertIn("Connection refused", status["ixBrowserError"])
+        self.assertTrue(status.get("triedUrls"))
+        self.assertEqual(status.get("recommendedBase"), "http://10.255.255.254:53200/api/v2/")
+
+    def test_probe_ixbrowser_tries_fallback_url(self):
+        calls = []
+
+        def fake_fetch(base, page_limit=100, timeout=20.0):
+            calls.append(base)
+            if base == "http://10.255.255.254:53200/api/v2/":
+                return [{"profile_id": 1, "name": "fb 111"}]
+            raise sd_farm.IXBrowserError("Connection refused")
+
+        with (
+            patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="10.255.255.254"),
+            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=fake_fetch),
+        ):
+            status = sd_farm.probe_ixbrowser_bases(
+                sd_farm.ixbrowser_api_candidates(
+                    use_docker=True,
+                    configured_base="http://host.docker.internal:53200/api/v2/",
+                ),
+                use_docker=True,
+            )
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["ixBrowserApiBase"], "http://10.255.255.254:53200/api/v2/")
+        self.assertGreater(len(calls), 1)
+
+    def test_ixbrowser_api_candidates_include_wsl_ip(self):
+        with patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="10.255.255.254"):
+            candidates = sd_farm.ixbrowser_api_candidates(
+                use_docker=True,
+                configured_base="http://host.docker.internal:53200/api/v2/",
+            )
+        self.assertIn("http://host.docker.internal:53200/api/v2/", candidates)
+        self.assertIn("http://10.255.255.254:53200/api/v2/", candidates)
 
     def test_build_payload_reads_imported_database(self):
         with TemporaryDirectory() as tmp:
@@ -372,6 +410,7 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
                 patch.object(gateway, "load_disk_config_expanded", return_value=({"locations": []}, None, 200)),
                 patch.object(gateway, "merge_expanded_locations_from_disk", side_effect=lambda cfg, _docker: cfg),
                 patch.object(gateway, "list_allowed_ovpn_files", return_value=[]),
+                patch.object(gateway, "_probe_ixbrowser", return_value={"ok": True, "ixBrowserApiBase": "http://127.0.0.1:53200/api/v2/", "ixBrowserError": "", "ixBrowserProfileCount": 0}),
                 patch.object(gateway, "fetch_ixbrowser_profiles", return_value=[]),
             ):
                 payload, err, status = gateway._build_sd_farm_payload(state)

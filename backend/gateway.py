@@ -64,8 +64,10 @@ from sd_farm import (
     build_account_rows as build_sd_farm_account_rows,
     discover_accounts_db,
     fetch_ixbrowser_profiles,
+    ixbrowser_api_candidates,
     load_accounts as load_sd_farm_accounts,
     normalize_ixbrowser_proxy_type,
+    probe_ixbrowser_bases,
     resolve_sd_farm_root,
     route_username_for_uid,
     save_imported_accounts_db,
@@ -1095,29 +1097,29 @@ def _probe_ixbrowser(
     *,
     api_base: Optional[str] = None,
 ) -> Dict[str, Any]:
-    base = str(api_base or _ixbrowser_api_base_from_state(state)).strip()
-    if not base:
+    configured = str(api_base or _ixbrowser_api_base_from_state(state)).strip()
+    candidates = ixbrowser_api_candidates(
+        use_docker=bool(state.get("use_docker")),
+        configured_base=configured,
+        override_base=api_base,
+    )
+    if not candidates:
         return {
             "ok": False,
-            "ixBrowserApiBase": base,
+            "ixBrowserApiBase": configured,
             "ixBrowserError": "ixBrowser API base URL is required",
             "ixBrowserProfileCount": 0,
+            "triedUrls": [],
+            "recommendedBase": "",
+            "hint": "Enter an ixBrowser API base URL.",
+            "wslHostIp": "",
         }
-    try:
-        profiles = fetch_ixbrowser_profiles(base)
-        return {
-            "ok": True,
-            "ixBrowserApiBase": base,
-            "ixBrowserError": "",
-            "ixBrowserProfileCount": len(profiles),
-        }
-    except IXBrowserError as e:
-        return {
-            "ok": False,
-            "ixBrowserApiBase": base,
-            "ixBrowserError": str(e),
-            "ixBrowserProfileCount": 0,
-        }
+    status = probe_ixbrowser_bases(candidates, use_docker=bool(state.get("use_docker")))
+    if status.get("ok"):
+        return status
+    if configured and not api_base:
+        status["ixBrowserApiBase"] = configured
+    return status
 
 
 def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1156,6 +1158,10 @@ def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
         "ixBrowserOk": bool(ix_status.get("ok")),
         "ixBrowserError": ix_status.get("ixBrowserError") or "",
         "ixBrowserProfileCount": int(ix_status.get("ixBrowserProfileCount") or 0),
+        "ixBrowserTriedUrls": list(ix_status.get("triedUrls") or []),
+        "ixBrowserRecommendedBase": ix_status.get("recommendedBase") or "",
+        "ixBrowserHint": ix_status.get("hint") or "",
+        "wslHostIp": ix_status.get("wslHostIp") or "",
         "useDocker": bool(state.get("use_docker")),
         "dbPath": db_path,
         "dbError": db_error,
@@ -1294,13 +1300,17 @@ def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
     runtime_config = merge_expanded_locations_from_disk(runtime_config, bool(state.get("use_docker")))
     allowed_ovpn = list_allowed_ovpn_files(runtime_config, config_path, bool(state.get("use_docker")))
 
+    ix_status = _probe_ixbrowser(state)
+    ix_base = str(ix_status.get("ixBrowserApiBase") or _ixbrowser_api_base_from_state(state)).strip()
     ix_error = ""
     profiles: List[Dict[str, Any]] = []
-    ix_base = _ixbrowser_api_base_from_state(state)
-    try:
-        profiles = fetch_ixbrowser_profiles(ix_base)
-    except IXBrowserError as e:
-        ix_error = str(e)
+    if ix_status.get("ok"):
+        try:
+            profiles = fetch_ixbrowser_profiles(ix_base)
+        except IXBrowserError as e:
+            ix_error = str(e)
+    else:
+        ix_error = str(ix_status.get("ixBrowserError") or "ixBrowser API is not available")
 
     rows = build_sd_farm_account_rows(accounts, allowed_ovpn, profiles)
     valid_count = sum(1 for row in rows if row.get("valid"))
