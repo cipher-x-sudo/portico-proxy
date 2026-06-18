@@ -629,8 +629,8 @@ export default function SDFarm() {
                   <p className="sd-farm-settings-hint">
                     {settings.useDocker
                       ? (settings.wslHostIp
-                        ? `Auto-detect tries host.docker.internal and your Windows host IP (${settings.wslHostIp}). Docker Desktop usually needs host.docker.internal; WSL Docker usually needs the Windows IP.`
-                        : 'Auto-detect tries host.docker.internal first (Docker Desktop). On WSL Docker, the Windows host IP is detected automatically when possible.')
+                        ? `Auto-detect tries host.docker.internal (Docker Desktop) and your Windows host IP (${settings.wslHostIp}, WSL Docker). Test connection picks the first URL that responds.`
+                        : 'Auto-detect tries host.docker.internal (Docker Desktop). On WSL Docker, the Windows host IP is detected automatically when possible.')
                       : 'Local gateway: use http://127.0.0.1:53200/api/v2/ when ixBrowser runs on the same machine.'}
                   </p>
                 </div>

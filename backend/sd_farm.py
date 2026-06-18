@@ -52,9 +52,24 @@ def _is_docker_bridge_ip(value: str) -> bool:
     return parts[0] == "172" and parts[1] == "17"
 
 
+def _is_docker_desktop_internal_ip(value: str) -> bool:
+    ip = str(value or "").strip()
+    if not _looks_like_ipv4(ip):
+        return False
+    parts = ip.split(".")
+    # Docker Desktop VM network (host.docker.internal is usually 192.168.65.254).
+    return parts[0] == "192" and parts[1] == "168" and parts[2] == "65"
+
+
 def _is_plausible_windows_host_ip(value: str) -> bool:
     ip = str(value or "").strip()
-    return bool(ip) and _looks_like_ipv4(ip) and not _is_loopback_ip(ip) and not _is_docker_bridge_ip(ip)
+    return (
+        bool(ip)
+        and _looks_like_ipv4(ip)
+        and not _is_loopback_ip(ip)
+        and not _is_docker_bridge_ip(ip)
+        and not _is_docker_desktop_internal_ip(ip)
+    )
 
 
 def _windows_host_ip_from_env() -> Optional[str]:
@@ -204,10 +219,10 @@ def ixbrowser_api_candidates(
     if configured:
         add(configured)
     if use_docker:
+        add(build_ixbrowser_api_base("host.docker.internal"))
         wsl_ip = discover_wsl_windows_host_ip()
         if wsl_ip:
             add(build_ixbrowser_api_base(wsl_ip))
-        add(build_ixbrowser_api_base("host.docker.internal"))
         add(build_ixbrowser_api_base("172.17.0.1"))
     else:
         add(build_ixbrowser_api_base("127.0.0.1"))
@@ -221,14 +236,27 @@ def ixbrowser_probe_hint(use_docker: bool, tried_urls: List[str]) -> str:
     wsl_ip = discover_wsl_windows_host_ip()
     if wsl_ip:
         return (
-            "Docker Desktop usually works with host.docker.internal. "
-            f"WSL Docker usually needs the Windows host IP (detected: {wsl_ip}). "
+            f"WSL Docker: use the Windows host IP (detected: {wsl_ip}). "
             "Ensure ixBrowser is running on Windows and port 53200 is allowed through Windows Firewall."
         )
     return (
-        "Ensure ixBrowser is running on the host. "
-        "Docker Desktop should use host.docker.internal; WSL Docker may need IXBROWSER_WINDOWS_HOST in .env."
+        "Docker Desktop: use host.docker.internal. "
+        "Ensure ixBrowser is running on Windows and port 53200 is allowed through Windows Firewall."
     )
+
+
+def _ping_ixbrowser_base(base_url: str, *, timeout: float = 4.0) -> int:
+    """Single-page profile-list check for connectivity probes (no full pagination)."""
+    raw = _json_post(base_url, "profile-list", {"page": 1, "limit": 1}, timeout=timeout)
+    payload = _response_data(raw)
+    if isinstance(payload, dict):
+        total = payload.get("total")
+        if isinstance(total, int):
+            return total
+        items = payload.get("data")
+        if isinstance(items, list):
+            return len(items)
+    raise IXBrowserError("ixBrowser profile-list response did not include profile data")
 
 
 def probe_ixbrowser_bases(
@@ -241,17 +269,23 @@ def probe_ixbrowser_bases(
     last_error = ""
     candidate_list = [normalize_ixbrowser_api_base(base) for base in candidates if normalize_ixbrowser_api_base(base)]
     wsl_ip = discover_wsl_windows_host_ip()
-    recommended_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker else ""
+    recommended_base = ""
+    if use_docker:
+        recommended_base = (
+            build_ixbrowser_api_base(wsl_ip)
+            if wsl_ip
+            else build_ixbrowser_api_base("host.docker.internal")
+        )
 
     for base in candidate_list:
         tried.append(base)
         try:
-            profiles = fetch_ixbrowser_profiles(base, page_limit=1, timeout=timeout)
+            profile_count = _ping_ixbrowser_base(base, timeout=timeout)
             return {
                 "ok": True,
                 "ixBrowserApiBase": base,
                 "ixBrowserError": "",
-                "ixBrowserProfileCount": len(profiles),
+                "ixBrowserProfileCount": profile_count,
                 "triedUrls": tried,
                 "recommendedBase": base,
                 "hint": "",

@@ -212,6 +212,24 @@ class SDFarmTests(unittest.TestCase):
         self.assertFalse(sd_farm._is_docker_bridge_ip("172.19.128.1"))
         self.assertFalse(sd_farm._is_docker_bridge_ip("10.255.255.254"))
 
+    def test_is_docker_desktop_internal_ip(self):
+        self.assertTrue(sd_farm._is_docker_desktop_internal_ip("192.168.65.1"))
+        self.assertTrue(sd_farm._is_docker_desktop_internal_ip("192.168.65.254"))
+        self.assertFalse(sd_farm._is_docker_desktop_internal_ip("172.19.128.1"))
+
+    def test_discover_wsl_windows_host_ip_rejects_docker_desktop_internal_probe(self):
+        sd_farm._windows_host_ip_cache = None
+        sd_farm._windows_host_ip_cache_attempted = False
+        mock_client = MagicMock()
+        mock_client.containers.run.return_value = b"192.168.65.1\n"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sd_farm, "_running_inside_docker", return_value=True),
+            patch.object(sd_farm, "_docker_socket_available", return_value=True),
+            patch.object(sd_farm, "_docker_client", return_value=mock_client),
+        ):
+            self.assertIsNone(sd_farm.discover_wsl_windows_host_ip(force_refresh=True))
+
     def test_discover_wsl_windows_host_ip_skips_loopback_resolv(self):
         sd_farm._windows_host_ip_cache = None
         sd_farm._windows_host_ip_cache_attempted = False
@@ -290,15 +308,15 @@ class SDFarmTests(unittest.TestCase):
     def test_probe_ixbrowser_host_docker_internal_wins_on_docker_desktop(self):
         calls = []
 
-        def fake_fetch(base, page_limit=100, timeout=20.0):
+        def fake_ping(base, timeout=4.0):
             calls.append(base)
             if base == "http://host.docker.internal:53200/api/v2/":
-                return [{"profile_id": 1, "name": "fb 111"}]
+                return 18
             raise sd_farm.IXBrowserError("Connection refused")
 
         with (
             patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value=None),
-            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=fake_fetch),
+            patch.object(sd_farm, "_ping_ixbrowser_base", side_effect=fake_ping),
         ):
             status = sd_farm.probe_ixbrowser_bases(
                 sd_farm.ixbrowser_api_candidates(
@@ -314,15 +332,15 @@ class SDFarmTests(unittest.TestCase):
     def test_probe_ixbrowser_wsl_ip_wins_when_host_docker_internal_fails(self):
         calls = []
 
-        def fake_fetch(base, page_limit=100, timeout=20.0):
+        def fake_ping(base, timeout=4.0):
             calls.append(base)
             if base == "http://172.19.128.1:53200/api/v2/":
-                return [{"profile_id": 1, "name": "fb 111"}]
+                return 18
             raise sd_farm.IXBrowserError("Connection refused")
 
         with (
             patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="172.19.128.1"),
-            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=fake_fetch),
+            patch.object(sd_farm, "_ping_ixbrowser_base", side_effect=fake_ping),
         ):
             status = sd_farm.probe_ixbrowser_bases(
                 sd_farm.ixbrowser_api_candidates(
@@ -519,7 +537,7 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
         state = {"auth_runtime_config": {}, "use_docker": True}
         with (
             patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="10.255.255.254"),
-            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=sd_farm.IXBrowserError("Connection refused")),
+            patch.object(sd_farm, "_ping_ixbrowser_base", side_effect=sd_farm.IXBrowserError("Connection refused")),
         ):
             status = gateway._probe_ixbrowser(state, api_base="http://127.0.0.1:53200/api/v2/")
         self.assertFalse(status["ok"])
@@ -530,15 +548,15 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
     def test_probe_ixbrowser_tries_fallback_url(self):
         calls = []
 
-        def fake_fetch(base, page_limit=100, timeout=20.0):
+        def fake_ping(base, timeout=4.0):
             calls.append(base)
             if base == "http://10.255.255.254:53200/api/v2/":
-                return [{"profile_id": 1, "name": "fb 111"}]
+                return 1
             raise sd_farm.IXBrowserError("Connection refused")
 
         with (
             patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="10.255.255.254"),
-            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=fake_fetch),
+            patch.object(sd_farm, "_ping_ixbrowser_base", side_effect=fake_ping),
         ):
             status = sd_farm.probe_ixbrowser_bases(
                 sd_farm.ixbrowser_api_candidates(
