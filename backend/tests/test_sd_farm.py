@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -206,7 +207,10 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type(""), "http")
 
     def test_discover_wsl_windows_host_ip_skips_loopback_resolv(self):
+        sd_farm._windows_host_ip_cache = None
+        sd_farm._windows_host_ip_cache_attempted = False
         with (
+            patch.object(sd_farm, "_discover_windows_host_via_docker_host_network", return_value=None),
             patch.object(Path, "is_file", return_value=True),
             patch.object(
                 Path,
@@ -215,10 +219,13 @@ class SDFarmTests(unittest.TestCase):
             ),
             patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.22.192.1"),
         ):
-            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "172.22.192.1")
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.22.192.1")
 
     def test_discover_wsl_windows_host_ip_uses_non_loopback_nameserver(self):
+        sd_farm._windows_host_ip_cache = None
+        sd_farm._windows_host_ip_cache_attempted = False
         with (
+            patch.object(sd_farm, "_discover_windows_host_via_docker_host_network", return_value=None),
             patch.object(Path, "is_file", return_value=True),
             patch.object(
                 Path,
@@ -227,7 +234,23 @@ class SDFarmTests(unittest.TestCase):
             ),
             patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.22.192.1"),
         ):
-            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "10.255.255.254")
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "10.255.255.254")
+
+    def test_discover_wsl_windows_host_ip_uses_docker_host_network_probe(self):
+        sd_farm._windows_host_ip_cache = None
+        sd_farm._windows_host_ip_cache_attempted = False
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sd_farm, "_running_inside_docker", return_value=True),
+            patch.object(sd_farm, "_docker_socket_available", return_value=True),
+            patch.object(
+                sd_farm,
+                "_discover_windows_host_via_docker_host_network",
+                return_value="172.19.128.1",
+            ),
+            patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.17.0.1"),
+        ):
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.19.128.1")
 
     def test_discover_wsl_windows_host_ip_uses_env_override(self):
         with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.19.128.1"}, clear=False):

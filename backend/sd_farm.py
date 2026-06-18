@@ -76,10 +76,84 @@ def _windows_host_ip_from_env() -> Optional[str]:
     return None
 
 
-def discover_wsl_windows_host_ip() -> Optional[str]:
+IXBROWSER_DEFAULT_PORT = 53200
+IXBROWSER_API_SUFFIX = "/api/v2/"
+DOCKER_HOST_NETWORK_PROBE_IMAGE_ENV = "DOCKER_HOST_NETWORK_PROBE_IMAGE"
+DEFAULT_DOCKER_HOST_NETWORK_PROBE_IMAGE = "alpine:3.20"
+
+_windows_host_ip_cache: Optional[str] = None
+_windows_host_ip_cache_attempted = False
+
+
+def _running_inside_docker() -> bool:
+    return Path("/.dockerenv").is_file()
+
+
+def _docker_socket_available() -> bool:
+    return Path("/var/run/docker.sock").exists()
+
+
+def _discover_windows_host_via_docker_host_network() -> Optional[str]:
+    """
+    On WSL Docker, the gateway container only sees the Docker bridge (172.17.0.1).
+    Spawn a short-lived host-network container to read the WSL default route gateway,
+    which is the Windows host IP where ixBrowser listens.
+    """
+    import subprocess
+
+    if not _running_inside_docker() or not _docker_socket_available():
+        return None
+    image = (
+        str(os.environ.get(DOCKER_HOST_NETWORK_PROBE_IMAGE_ENV) or "").strip()
+        or DEFAULT_DOCKER_HOST_NETWORK_PROBE_IMAGE
+    )
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "host",
+                image,
+                "sh",
+                "-c",
+                "ip -4 route show default | awk '{print $3; exit}'",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        ip = line.strip()
+        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
+            return ip
+    return None
+
+
+def discover_wsl_windows_host_ip(*, force_refresh: bool = False) -> Optional[str]:
+    global _windows_host_ip_cache, _windows_host_ip_cache_attempted
+
     env_ip = _windows_host_ip_from_env()
     if env_ip:
         return env_ip
+
+    if not force_refresh and _windows_host_ip_cache_attempted:
+        return _windows_host_ip_cache
+
+    _windows_host_ip_cache_attempted = True
+    resolved: Optional[str] = None
+
+    resolved = _discover_windows_host_via_docker_host_network()
+    if resolved:
+        _windows_host_ip_cache = resolved
+        return resolved
+
     resolv = Path("/etc/resolv.conf")
     if resolv.is_file():
         try:
@@ -92,10 +166,16 @@ def discover_wsl_windows_host_ip() -> Optional[str]:
                     if len(parts) >= 2:
                         ip = parts[1].strip()
                         if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
-                            return ip
+                            resolved = ip
+                            break
         except OSError:
             pass
-    return _discover_default_gateway_ip()
+
+    if not resolved:
+        resolved = _discover_default_gateway_ip()
+
+    _windows_host_ip_cache = resolved
+    return resolved
 
 
 def normalize_ixbrowser_api_base(raw: str) -> str:
@@ -157,9 +237,8 @@ def ixbrowser_probe_hint(use_docker: bool, tried_urls: List[str]) -> str:
     if use_docker:
         return (
             "ixBrowser usually runs on Windows when using WSL Docker. "
-            "Set IXBROWSER_WINDOWS_HOST in .env to the Windows host IP from WSL "
-            "(ip route show default | awk '{print $3}'), or enter "
-            "http://<that-ip>:53200/api/v2/ in the API base field."
+            "Ensure ixBrowser is running and port 53200 is allowed through Windows Firewall. "
+            "You can set IXBROWSER_WINDOWS_HOST in .env as a fallback."
         )
     return "Ensure ixBrowser is running and listening on port 53200."
 
