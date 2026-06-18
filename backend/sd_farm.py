@@ -370,6 +370,11 @@ def _coerce_ixbrowser_profile_id(profile_id_value: Any) -> int:
         raise IXBrowserError(f"ixBrowser profile id must be numeric: {profile_id_value}") from e
 
 
+def ovpn_note_from_matched_path(matched_ovpn: str) -> str:
+    leaf = Path(str(matched_ovpn or "").replace("\\", "/")).name
+    return leaf[:-5] if leaf.lower().endswith(".ovpn") else leaf
+
+
 def update_ixbrowser_profile_proxy(
     base_url: str,
     profile_id_value: str,
@@ -395,3 +400,42 @@ def update_ixbrowser_profile_proxy(
     }
     raw = _json_post(base_url, "profile-update-proxy-for-custom-proxy", payload)
     return {"ok": True, "response": _response_data(raw)}
+
+
+def update_ixbrowser_profile_note(
+    base_url: str,
+    profile_id_value: str,
+    note: str,
+) -> Dict[str, Any]:
+    profile_id_number = _coerce_ixbrowser_profile_id(profile_id_value)
+    payload = {
+        "profile_id": profile_id_number,
+        "note": str(note or "").strip(),
+    }
+    raw = _json_post(base_url, "profile-update", payload)
+    return {"ok": True, "response": _response_data(raw)}
+
+
+def sync_ixbrowser_profile(
+    base_url: str,
+    profile_id_value: str,
+    proxy_host: str,
+    proxy_port: int,
+    proxy_user: str,
+    proxy_password: str,
+    matched_ovpn: str,
+    *,
+    proxy_type: str = "http",
+) -> Dict[str, Any]:
+    update_ixbrowser_profile_proxy(
+        base_url,
+        profile_id_value,
+        proxy_host,
+        proxy_port,
+        proxy_user,
+        proxy_password,
+        proxy_type=proxy_type,
+    )
+    note = ovpn_note_from_matched_path(matched_ovpn)
+    update_ixbrowser_profile_note(base_url, profile_id_value, note)
+    return {"ok": True, "note": note}

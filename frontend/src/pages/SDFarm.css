@@ -318,6 +318,50 @@
 
 .sd-farm-search {
   width: min(28rem, 100%);
+  align-items: flex-start;
+}
+
+.sd-farm-search .material-symbols-outlined {
+  margin-top: 0.65rem;
+}
+
+.sd-farm-search textarea {
+  width: 100%;
+  min-height: 4.5rem;
+  max-height: 12rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-md);
+  outline: none;
+  background: var(--control-bg);
+  color: var(--text-main);
+  font: inherit;
+  line-height: 1.35;
+  resize: vertical;
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+
+.sd-farm-search textarea:hover:not(:disabled) {
+  border-color: var(--control-border-strong);
+}
+
+.sd-farm-search textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(79, 140, 255, 0.16);
+}
+
+.sd-farm-search textarea::placeholder {
+  color: rgba(149, 163, 181, 0.78);
+}
+
+.sd-farm-bulk-search-hint {
+  align-self: center;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-muted);
 }
 
 .sd-farm-actions {

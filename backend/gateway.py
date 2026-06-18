@@ -71,7 +71,7 @@ from sd_farm import (
     save_imported_accounts_db,
     sd_farm_browse_roots,
     sd_farm_source_value,
-    update_ixbrowser_profile_proxy,
+    sync_ixbrowser_profile,
 )
 from upstream_proxy import (
     UpstreamProxyError,
@@ -5913,13 +5913,14 @@ def _control_api_handler_factory(
             for row in rows:
                 username = str(row.get("routeUsername") or route_username_for_uid(str(row.get("uid") or "")))
                 try:
-                    update_ixbrowser_profile_proxy(
+                    sync_result = sync_ixbrowser_profile(
                         ix_base,
                         str(row.get("browserProfileId") or ""),
                         proxy_host,
                         proxy_port,
                         username,
                         proxy_password,
+                        str(row.get("matchedOvpn") or ""),
                         proxy_type=proxy_type,
                     )
                     results.append(
@@ -5929,6 +5930,7 @@ def _control_api_handler_factory(
                             "routeUsername": username,
                             "browserProfileId": row.get("browserProfileId") or "",
                             "matchedOvpn": row.get("matchedOvpn") or "",
+                            "note": sync_result.get("note") or "",
                             "error": "",
                         }
                     )
@@ -5940,6 +5942,7 @@ def _control_api_handler_factory(
                             "routeUsername": username,
                             "browserProfileId": row.get("browserProfileId") or "",
                             "matchedOvpn": row.get("matchedOvpn") or "",
+                            "note": "",
                             "error": str(e),
                         }
                     )

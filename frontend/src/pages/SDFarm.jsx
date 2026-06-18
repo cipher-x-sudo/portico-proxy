@@ -44,6 +44,15 @@ function rowIssue(row) {
   return warnings.length ? warnings.join('; ') : 'Ready';
 }
 
+function parseSearchQuery(raw) {
+  const lines = String(raw || '')
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (lines.length > 1) return { mode: 'bulkUid', uids: new Set(lines) };
+  return { mode: 'text', needle: (lines[0] || '').toLowerCase() };
+}
+
 export default function SDFarm() {
   const toast = useToast();
   const folderInputRef = useRef(null);
@@ -263,18 +272,22 @@ export default function SDFarm() {
     }
   };
 
+  const searchParsed = useMemo(() => parseSearchQuery(query), [query]);
+
   const filteredRows = useMemo(() => {
-    const needle = query.trim().toLowerCase();
     return rows.filter((row) => {
       if (filter === 'valid' && !row.valid) return false;
       if (filter === 'missing' && row.browserStatus !== 'missing') return false;
       if (filter === 'ovpn' && row.ovpnStatus === 'matched') return false;
       if (filter === 'duplicate' && row.browserStatus !== 'duplicate' && row.ovpnStatus !== 'duplicate_ovpn') return false;
-      if (!needle) return true;
+      if (searchParsed.mode === 'bulkUid') {
+        return searchParsed.uids.has(String(row.uid || '').trim());
+      }
+      if (!searchParsed.needle) return true;
       return [row.uid, row.name, row.openvpn, row.browserProfileName, row.routeUsername]
-        .some((value) => String(value || '').toLowerCase().includes(needle));
+        .some((value) => String(value || '').toLowerCase().includes(searchParsed.needle));
     });
-  }, [filter, query, rows]);
+  }, [filter, rows, searchParsed]);
 
   const visibleValidUids = filteredRows.filter((row) => row.valid).map((row) => row.uid);
   const selectedValidCount = selectedUids.filter((uid) => validRows.some((row) => row.uid === uid)).length;
@@ -565,9 +578,9 @@ export default function SDFarm() {
         <div className="sd-farm-controls-row">
           <div className="search-box sd-farm-search">
             <span className="material-symbols-outlined">search</span>
-            <input
-              type="text"
-              placeholder="Search UID, name, OVPN, profile"
+            <textarea
+              rows={3}
+              placeholder="Search UID, name, OVPN… or paste one UID per line"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -612,6 +625,11 @@ export default function SDFarm() {
               {item.label}
             </button>
           ))}
+          {searchParsed.mode === 'bulkUid' && (
+            <span className="sd-farm-bulk-search-hint">
+              Matching {searchParsed.uids.size} UIDs · {filteredRows.length} found
+            </span>
+          )}
         </div>
         <div className="sd-farm-paths">
           <span>{payload?.dbPath || ''}</span>

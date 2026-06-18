@@ -205,6 +205,90 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type("HTTP"), "http")
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type(""), "http")
 
+    def test_ovpn_note_from_matched_path_strips_folder_and_extension(self):
+        self.assertEqual(
+            sd_farm.ovpn_note_from_matched_path("NC/NCVPN-US-NewYork-UDP.ovpn"),
+            "NCVPN-US-NewYork-UDP",
+        )
+        self.assertEqual(
+            sd_farm.ovpn_note_from_matched_path("NCVPN-US-Phoenix-UDP.ovpn"),
+            "NCVPN-US-Phoenix-UDP",
+        )
+        self.assertEqual(sd_farm.ovpn_note_from_matched_path(""), "")
+
+    def test_ixbrowser_update_note_sends_profile_update_payload(self):
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"error": {"code": 0}, "data": True}).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            calls.append(
+                {
+                    "url": req.full_url,
+                    "payload": json.loads(req.data.decode("utf-8")),
+                }
+            )
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.update_ixbrowser_profile_note(
+                "http://127.0.0.1:53200/api/v2/",
+                "99",
+                "NCVPN-US-NewYork-UDP",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["url"], "http://127.0.0.1:53200/api/v2/profile-update")
+        self.assertEqual(calls[0]["payload"]["profile_id"], 99)
+        self.assertEqual(calls[0]["payload"]["note"], "NCVPN-US-NewYork-UDP")
+
+    def test_sync_ixbrowser_profile_updates_proxy_and_note(self):
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"error": {"code": 0}, "data": True}).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            calls.append(req.full_url)
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.sync_ixbrowser_profile(
+                "http://127.0.0.1:53200/api/v2/",
+                "99",
+                "127.0.0.1",
+                58680,
+                "sd_99",
+                "secret",
+                "NC/NCVPN-US-NewYork-UDP.ovpn",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["note"], "NCVPN-US-NewYork-UDP")
+        self.assertEqual(
+            calls,
+            [
+                "http://127.0.0.1:53200/api/v2/profile-update-proxy-for-custom-proxy",
+                "http://127.0.0.1:53200/api/v2/profile-update",
+            ],
+        )
+
 
 class SDFarmGatewaySyncTests(unittest.TestCase):
     def test_sd_farm_root_prefers_config_over_env(self):
