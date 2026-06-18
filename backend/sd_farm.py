@@ -355,6 +355,16 @@ def build_account_rows(
     return rows
 
 
+def _coerce_ixbrowser_profile_id(profile_id_value: Any) -> int:
+    text = str(profile_id_value or "").strip()
+    if not text:
+        raise IXBrowserError("Missing ixBrowser profile id")
+    try:
+        return int(text)
+    except (TypeError, ValueError) as e:
+        raise IXBrowserError(f"ixBrowser profile id must be numeric: {profile_id_value}") from e
+
+
 def update_ixbrowser_profile_proxy(
     base_url: str,
     profile_id_value: str,
@@ -363,10 +373,9 @@ def update_ixbrowser_profile_proxy(
     proxy_user: str,
     proxy_password: str,
 ) -> Dict[str, Any]:
-    if not str(profile_id_value or "").strip():
-        raise IXBrowserError("Missing ixBrowser profile id")
+    profile_id_number = _coerce_ixbrowser_profile_id(profile_id_value)
     payload = {
-        "profile_id": profile_id_value,
+        "profile_id": profile_id_number,
         "proxy_info": {
             "proxy_mode": 2,
             "proxy_type": "http",

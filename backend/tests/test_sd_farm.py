@@ -148,7 +148,7 @@ class SDFarmTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(calls["url"], "http://127.0.0.1:53200/api/v2/profile-update-proxy-for-custom-proxy")
-        self.assertEqual(calls["payload"]["profile_id"], "99")
+        self.assertEqual(calls["payload"]["profile_id"], 99)
         self.assertEqual(calls["payload"]["proxy_info"]["proxy_mode"], 2)
         self.assertEqual(calls["payload"]["proxy_info"]["proxy_user"], "sd_99")
 
