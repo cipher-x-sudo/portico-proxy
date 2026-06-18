@@ -99,6 +99,23 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(matched, "NC/NCVPN-US-Phoenix-UDP.ovpn")
         self.assertEqual(err, "")
 
+    def test_matches_sd_farm_openvpn_to_compact_portico_filename(self):
+        matched, err = sd_farm.match_ovpn(
+            "NCVPN-US-NewYork-UDP",
+            ["NC/NCVPN-US-NewYork-UDP.ovpn", "NC/NCVPN-US-NewOrleans-UDP.ovpn"],
+        )
+
+        self.assertEqual(matched, "NC/NCVPN-US-NewYork-UDP.ovpn")
+        self.assertEqual(err, "")
+
+        matched, err = sd_farm.match_ovpn(
+            "NCVPN-US-NewOrleans-TCP",
+            ["NC/NCVPN-US-NewYork-UDP.ovpn", "NC/NCVPN-US-NewOrleans-TCP.ovpn"],
+        )
+
+        self.assertEqual(matched, "NC/NCVPN-US-NewOrleans-TCP.ovpn")
+        self.assertEqual(err, "")
+
     def test_account_rows_flag_duplicate_and_missing_browser_profiles(self):
         accounts = [
             {"UID": "111", "Name": "One", "OpenVPN": "NCVPN-US-Phoenix-UDP"},

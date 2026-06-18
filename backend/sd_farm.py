@@ -196,7 +196,7 @@ def _ovpn_key(value: str) -> str:
     text = str(value or "").strip().replace("\\", "/")
     leaf = text.rsplit("/", 1)[-1]
     stem = leaf[:-5] if leaf.lower().endswith(".ovpn") else leaf
-    return re.sub(r"\s+", " ", stem).casefold()
+    return re.sub(r"\s+", "", stem).casefold()
 
 
 def match_ovpn(openvpn: str, allowed_files: Iterable[str]) -> Tuple[str, str]:
