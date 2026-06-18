@@ -199,11 +199,18 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
 
     def test_validate_import_label_does_not_require_server_path(self):
         state = {
-            "auth_runtime_config": {"sdFarmSource": "import"},
+            "auth_runtime_config": {"sdFarmSource": "import", "sdFarmRoot": r"D:\WORK\SD Farm"},
             "use_docker": True,
         }
-        settings = {"sdFarmRoot": r"D:\WORK\SD Farm"}
+        settings = {"ixBrowserApiBase": "http://127.0.0.1:53200/api/v2/"}
         self.assertIsNone(gateway._validate_sd_farm_settings(state, settings))
+
+    def test_probe_ixbrowser_reports_connection_error(self):
+        state = {"auth_runtime_config": {}, "use_docker": True}
+        with patch.object(gateway, "fetch_ixbrowser_profiles", side_effect=sd_farm.IXBrowserError("Connection refused")):
+            status = gateway._probe_ixbrowser(state, api_base="http://127.0.0.1:53200/api/v2/")
+        self.assertFalse(status["ok"])
+        self.assertIn("Connection refused", status["ixBrowserError"])
 
     def test_build_payload_reads_imported_database(self):
         with TemporaryDirectory() as tmp:

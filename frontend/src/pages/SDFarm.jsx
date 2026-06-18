@@ -24,6 +24,9 @@ const defaultSettings = {
   hasImportedDb: false,
   ixBrowserApiBase: '',
   ixBrowserProxyHost: '127.0.0.1',
+  ixBrowserOk: false,
+  ixBrowserError: '',
+  ixBrowserProfileCount: 0,
   useDocker: false,
   dbPath: '',
   dbError: '',
@@ -55,6 +58,7 @@ export default function SDFarm() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [ixTesting, setIxTesting] = useState(false);
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
@@ -67,6 +71,9 @@ export default function SDFarm() {
       hasImportedDb: Boolean(data.hasImportedDb),
       ixBrowserApiBase: data.ixBrowserApiBase || '',
       ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
+      ixBrowserOk: Boolean(data.ixBrowserOk),
+      ixBrowserError: data.ixBrowserError || '',
+      ixBrowserProfileCount: Number(data.ixBrowserProfileCount || 0),
       useDocker: Boolean(data.useDocker),
       dbPath: data.dbPath || '',
       dbError: data.dbError || '',
@@ -193,9 +200,11 @@ export default function SDFarm() {
       if (!res.ok) throw new Error(data.error || 'Failed to save SD Farm settings');
       applySettingsPayload(data);
       toast({
-        title: 'SD Farm settings saved',
-        message: data.dbPath ? `Using ${data.dbPath}` : 'Settings updated.',
-        variant: 'success',
+        title: 'Settings saved',
+        message: data.ixBrowserOk
+          ? `ixBrowser connected (${data.ixBrowserProfileCount || 0} profiles).`
+          : data.ixBrowserError || 'Settings updated.',
+        variant: data.ixBrowserOk ? 'success' : 'warning',
       });
       await loadAccounts();
     } catch (err) {
@@ -203,6 +212,37 @@ export default function SDFarm() {
       toast({ title: 'Save failed', message: err.message || 'Failed to save SD Farm settings', variant: 'danger' });
     } finally {
       setBusy('');
+    }
+  };
+
+  const testIxBrowser = async () => {
+    setIxTesting(true);
+    setError('');
+    try {
+      const query = settings.ixBrowserApiBase
+        ? `?ixBrowserApiBase=${encodeURIComponent(settings.ixBrowserApiBase)}`
+        : '';
+      const res = await fetch(`/api/sd-farm/ixbrowser-test${query}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'ixBrowser test failed');
+      setSettings((current) => ({
+        ...current,
+        ixBrowserOk: Boolean(data.ok),
+        ixBrowserError: data.ixBrowserError || data.error || '',
+        ixBrowserProfileCount: Number(data.ixBrowserProfileCount || 0),
+      }));
+      toast({
+        title: data.ok ? 'ixBrowser connected' : 'ixBrowser connection failed',
+        message: data.ok
+          ? `${data.ixBrowserProfileCount || 0} profiles found.`
+          : data.ixBrowserError || data.error || 'Connection refused',
+        variant: data.ok ? 'success' : 'danger',
+      });
+    } catch (err) {
+      setError(err.message || 'ixBrowser test failed');
+      toast({ title: 'ixBrowser test failed', message: err.message || 'ixBrowser test failed', variant: 'danger' });
+    } finally {
+      setIxTesting(false);
     }
   };
 
@@ -415,30 +455,69 @@ export default function SDFarm() {
                 </p>
               )}
             </div>
-            <div className="sd-farm-settings-grid">
-              <div className="form-group">
-                <label htmlFor="sd-farm-ix-api">ixBrowser API base</label>
-                <input
-                  id="sd-farm-ix-api"
-                  type="text"
-                  className="premium-input"
-                  placeholder="http://127.0.0.1:53200/api/v2/"
-                  value={settings.ixBrowserApiBase}
-                  onChange={(event) => handleSettingsChange('ixBrowserApiBase', event.target.value)}
-                />
+
+            <div className="sd-farm-settings-section sd-farm-ix-section">
+              <div className="sd-farm-settings-section-header">
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-primary">travel_explore</span>
+                  <h4 className="font-bold">ixBrowser</h4>
+                  <span className={`sd-farm-ix-status ${settings.ixBrowserOk ? 'ok' : 'error'}`}>
+                    {settings.ixBrowserOk
+                      ? `${settings.ixBrowserProfileCount} profiles`
+                      : 'Offline'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn-outline"
+                  onClick={testIxBrowser}
+                  disabled={Boolean(busy) || ixTesting || !settings.ixBrowserApiBase}
+                >
+                  <span className="material-symbols-outlined">
+                    {ixTesting ? 'progress_activity' : 'lan'}
+                  </span>
+                  Test connection
+                </button>
               </div>
-              <div className="form-group">
-                <label htmlFor="sd-farm-ix-host">ixBrowser proxy host</label>
-                <input
-                  id="sd-farm-ix-host"
-                  type="text"
-                  className="premium-input"
-                  placeholder="127.0.0.1"
-                  value={settings.ixBrowserProxyHost}
-                  onChange={(event) => handleSettingsChange('ixBrowserProxyHost', event.target.value)}
-                />
+              <div className="sd-farm-settings-grid">
+                <div className="form-group">
+                  <label htmlFor="sd-farm-ix-api">API base URL</label>
+                  <input
+                    id="sd-farm-ix-api"
+                    type="text"
+                    className="premium-input"
+                    placeholder={settings.useDocker
+                      ? 'http://host.docker.internal:53200/api/v2/'
+                      : 'http://127.0.0.1:53200/api/v2/'}
+                    value={settings.ixBrowserApiBase}
+                    onChange={(event) => handleSettingsChange('ixBrowserApiBase', event.target.value)}
+                  />
+                  <p className="sd-farm-settings-hint">
+                    {settings.useDocker
+                      ? 'Docker: use host.docker.internal to reach ixBrowser running on this PC.'
+                      : 'Local gateway: use http://127.0.0.1:53200/api/v2/ when ixBrowser runs on the same machine.'}
+                  </p>
+                </div>
+                <div className="form-group">
+                  <label htmlFor="sd-farm-ix-host">Proxy host for profiles</label>
+                  <input
+                    id="sd-farm-ix-host"
+                    type="text"
+                    className="premium-input"
+                    placeholder="127.0.0.1"
+                    value={settings.ixBrowserProxyHost}
+                    onChange={(event) => handleSettingsChange('ixBrowserProxyHost', event.target.value)}
+                  />
+                  <p className="sd-farm-settings-hint">
+                    Address written into ixBrowser profile proxy settings during sync (usually 127.0.0.1).
+                  </p>
+                </div>
               </div>
+              {!settings.ixBrowserOk && settings.ixBrowserError && (
+                <p className="sd-farm-ix-error">{settings.ixBrowserError}</p>
+              )}
             </div>
+
             <div className="sd-farm-settings-footer">
               <div className="sd-farm-paths">
                 <span>{settings.dbPath || settings.sdFarmRoot || 'No database selected'}</span>
@@ -451,7 +530,7 @@ export default function SDFarm() {
                 disabled={Boolean(busy) || importing || !settingsDirty}
               >
                 <span className="material-symbols-outlined">save</span>
-                Save label
+                Save settings
               </button>
             </div>
           </div>

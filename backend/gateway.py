@@ -939,6 +939,36 @@ def _ixbrowser_proxy_host_from_state(state: Dict[str, Any]) -> str:
     )
 
 
+def _probe_ixbrowser(
+    state: Dict[str, Any],
+    *,
+    api_base: Optional[str] = None,
+) -> Dict[str, Any]:
+    base = str(api_base or _ixbrowser_api_base_from_state(state)).strip()
+    if not base:
+        return {
+            "ok": False,
+            "ixBrowserApiBase": base,
+            "ixBrowserError": "ixBrowser API base URL is required",
+            "ixBrowserProfileCount": 0,
+        }
+    try:
+        profiles = fetch_ixbrowser_profiles(base)
+        return {
+            "ok": True,
+            "ixBrowserApiBase": base,
+            "ixBrowserError": "",
+            "ixBrowserProfileCount": len(profiles),
+        }
+    except IXBrowserError as e:
+        return {
+            "ok": False,
+            "ixBrowserApiBase": base,
+            "ixBrowserError": str(e),
+            "ixBrowserProfileCount": 0,
+        }
+
+
 def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
     source = _sd_farm_source_from_state(state)
     label = _sd_farm_root_label_from_state(state)
@@ -963,6 +993,7 @@ def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
             db_path = str(found)
         except SDFarmError as e:
             db_error = str(e)
+    ix_status = _probe_ixbrowser(state)
     return {
         "sdFarmRoot": label or str(root),
         "sdFarmSource": source,
@@ -970,6 +1001,9 @@ def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
         "hasImportedDb": has_imported_db,
         "ixBrowserApiBase": _ixbrowser_api_base_from_state(state),
         "ixBrowserProxyHost": _ixbrowser_proxy_host_from_state(state),
+        "ixBrowserOk": bool(ix_status.get("ok")),
+        "ixBrowserError": ix_status.get("ixBrowserError") or "",
+        "ixBrowserProfileCount": int(ix_status.get("ixBrowserProfileCount") or 0),
         "useDocker": bool(state.get("use_docker")),
         "dbPath": db_path,
         "dbError": db_error,
@@ -1051,12 +1085,18 @@ def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings
 
 
 def _validate_sd_farm_settings(state: Dict[str, Any], settings: Dict[str, str]) -> Optional[str]:
+    source = sd_farm_source_value(settings.get("sdFarmSource")) if settings.get("sdFarmSource") else _sd_farm_source_from_state(state)
     root_text = settings.get("sdFarmRoot") or ""
+    existing_label = _sd_farm_root_label_from_state(state)
+    api_base = str(settings.get("ixBrowserApiBase") or "").strip()
+    if api_base and not (api_base.startswith("http://") or api_base.startswith("https://")):
+        return "ixBrowser API base must start with http:// or https://"
+    if source == "import":
+        if not root_text and not existing_label:
+            return "SD Farm folder label is required"
+        return None
     if not root_text:
         return "SD Farm folder label is required"
-    source = sd_farm_source_value(settings.get("sdFarmSource")) if settings.get("sdFarmSource") else _sd_farm_source_from_state(state)
-    if source == "import":
-        return None
     root = resolve_sd_farm_root(root_text)
     if not root.exists():
         return f"SD Farm root does not exist: {root}"
@@ -4484,6 +4524,8 @@ def _control_api_handler_factory(
                 self._handle_get_sd_farm_settings()
             elif path == "/api/sd-farm/browse":
                 self._handle_get_sd_farm_browse(parsed.query)
+            elif path == "/api/sd-farm/ixbrowser-test":
+                self._handle_get_sd_farm_ixbrowser_test(parsed.query)
             elif path == "/api/sd-farm/preview-sync":
                 self._handle_get_sd_farm_preview_sync()
             elif path == "/api/provider-auth":
@@ -4802,6 +4844,12 @@ def _control_api_handler_factory(
                 self._send_json(browse_directory(resolve_sd_farm_root(raw_path)))
             except SDFarmError as e:
                 self._send_error_body(str(e), 400)
+
+        def _handle_get_sd_farm_ixbrowser_test(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query or "")
+            api_base = (params.get("ixBrowserApiBase") or params.get("ixbrowser_api_base") or [""])[0].strip()
+            status = _probe_ixbrowser(state, api_base=api_base or None)
+            self._send_json(status)
 
         def _handle_get_sd_farm_preview_sync(self) -> None:
             payload, err, status_code = _build_sd_farm_payload(state)

@@ -151,6 +151,53 @@
   font-size: 0.85rem;
 }
 
+.sd-farm-settings-section {
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.sd-farm-settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.sd-farm-settings-section-header h4 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.sd-farm-ix-section {
+  margin-top: 0.25rem;
+}
+
+.sd-farm-ix-status {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: 999px;
+  padding: 0.15rem 0.5rem;
+}
+
+.sd-farm-ix-status.ok {
+  color: var(--success, #22c55e);
+  border: 1px solid color-mix(in srgb, var(--success, #22c55e) 35%, transparent);
+}
+
+.sd-farm-ix-status.error {
+  color: var(--danger, #f59e0b);
+  border: 1px solid color-mix(in srgb, var(--danger, #f59e0b) 35%, transparent);
+}
+
+.sd-farm-ix-error {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--danger, #f59e0b);
+}
+
 .sd-farm-settings {
   display: flex;
   flex-direction: column;
