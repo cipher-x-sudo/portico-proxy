@@ -7,6 +7,7 @@ import {
   labelFromWebkitFile,
   supportsDirectoryPicker,
 } from './sdFarmImport.js';
+import { copyToClipboard } from '../utils/copyToClipboard.js';
 import './SDFarm.css';
 
 const filters = [
@@ -49,6 +50,13 @@ function rowIssue(row) {
   return warnings.length ? warnings.join('; ') : 'Ready';
 }
 
+function cookiesLabel(value) {
+  const text = String(value || '').trim();
+  if (!text) return '-';
+  const leaf = text.replace(/\\/g, '/').split('/').pop();
+  return leaf || text;
+}
+
 function parseSearchQuery(raw) {
   const lines = String(raw || '')
     .split(/\r?\n/)
@@ -75,6 +83,7 @@ export default function SDFarm() {
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [importing, setImporting] = useState(false);
   const [ixTesting, setIxTesting] = useState(false);
+  const [copiedToken, setCopiedToken] = useState('');
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
@@ -315,7 +324,7 @@ export default function SDFarm() {
         return searchParsed.uids.has(String(row.uid || '').trim());
       }
       if (!searchParsed.needle) return true;
-      return [row.uid, row.name, row.openvpn, row.browserProfileName, row.routeUsername]
+      return [row.uid, row.name, row.cookies, row.openvpn, row.browserProfileName, row.routeUsername]
         .some((value) => String(value || '').toLowerCase().includes(searchParsed.needle));
     });
   }, [filter, rows, searchParsed]);
@@ -397,6 +406,21 @@ export default function SDFarm() {
       toast({ title: 'Sync failed', message: err.message || 'Sync failed', variant: 'danger' });
     } finally {
       setBusy('');
+    }
+  };
+
+  const copyCookiesValue = async (value, token) => {
+    const text = String(value || '').trim();
+    if (!text) return;
+    try {
+      await copyToClipboard(text);
+      setCopiedToken(token);
+      window.setTimeout(() => {
+        setCopiedToken((current) => (current === token ? '' : current));
+      }, 1800);
+      toast({ title: 'Copied', message: 'Cookies path copied to clipboard.', variant: 'success', duration: 1800 });
+    } catch (err) {
+      toast({ title: 'Copy failed', message: err?.message || 'Could not copy cookies path.', variant: 'danger' });
     }
   };
 
@@ -845,6 +869,7 @@ export default function SDFarm() {
                 </th>
                 <th>UID</th>
                 <th>Name</th>
+                <th>Cookies</th>
                 <th>SD Farm OVPN</th>
                 <th>Portico OVPN</th>
                 <th>ixBrowser</th>
@@ -870,6 +895,23 @@ export default function SDFarm() {
                     </td>
                     <td className="text-mono">{row.uid || '-'}</td>
                     <td>{row.name || '-'}</td>
+                    <td>
+                      {row.cookies ? (
+                        <button
+                          type="button"
+                          className="sd-farm-copy-line text-mono"
+                          title={`Click to copy: ${row.cookies}`}
+                          onClick={() => copyCookiesValue(row.cookies, `cookies-${row.uid}`)}
+                        >
+                          <span className="sd-farm-copy-code">{cookiesLabel(row.cookies)}</span>
+                          {copiedToken === `cookies-${row.uid}` && (
+                            <span className="sd-farm-copy-toast">Copied</span>
+                          )}
+                        </button>
+                      ) : (
+                        '-'
+                      )}
+                    </td>
                     <td>{row.openvpn || '-'}</td>
                     <td>{row.matchedOvpn || '-'}</td>
                     <td>
@@ -906,7 +948,7 @@ export default function SDFarm() {
               })}
               {filteredRows.length === 0 && (
                 <tr>
-                  <td colSpan="9" className="sd-farm-empty">
+                  <td colSpan="10" className="sd-farm-empty">
                     No accounts match the current view.
                   </td>
                 </tr>

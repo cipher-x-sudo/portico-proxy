@@ -60,6 +60,51 @@ class SDFarmTests(unittest.TestCase):
             self.assertEqual(rows[0]["UID"], "61560173093090")
             self.assertEqual(rows[0]["OpenVPN"], "NCVPN-US-Phoenix-UDP")
 
+    def test_loads_optional_cookies_column_when_present(self):
+        with TemporaryDirectory() as tmp:
+            db = Path(tmp) / "accounts.sqlite"
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE accounts (
+                        Current_Status TEXT,
+                        Name TEXT,
+                        UID TEXT PRIMARY KEY,
+                        Status TEXT,
+                        Proxy TEXT,
+                        OpenVPN TEXT,
+                        Cookies TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO accounts (UID, Name, OpenVPN, Proxy, Status, Current_Status, Cookies)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "61560173093090",
+                        "Ali Khan",
+                        "NCVPN-US-Phoenix-UDP",
+                        "",
+                        "Live",
+                        "Success",
+                        r"D:\WORK\SD Farm\Cookies\61560173093090.json",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            rows = sd_farm.load_accounts(db)
+            built = sd_farm.build_account_rows(rows, [], [])
+            self.assertEqual(rows[0]["Cookies"], r"D:\WORK\SD Farm\Cookies\61560173093090.json")
+            self.assertEqual(
+                built[0]["cookies"],
+                r"D:\WORK\SD Farm\Cookies\61560173093090.json",
+            )
+
     def test_browse_directory_lists_child_folders_and_db_hint(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

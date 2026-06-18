@@ -14,7 +14,22 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 DEFAULT_DB_RELATIVE_PATH = Path("DB") / "data" / "accounts.sqlite"
 IMPORTED_DB_PATH = Path("/data/sd-farm/accounts.sqlite")
 SD_FARM_IMPORT_MAX_BYTES = 64 * 1024 * 1024
-ACCOUNT_COLUMNS = ("UID", "Name", "OpenVPN", "Proxy", "Status", "Current_Status")
+BASE_ACCOUNT_COLUMNS = ("UID", "Name", "OpenVPN", "Proxy", "Status", "Current_Status")
+OPTIONAL_ACCOUNT_COLUMNS = ("Cookies",)
+ACCOUNT_COLUMNS = BASE_ACCOUNT_COLUMNS + OPTIONAL_ACCOUNT_COLUMNS
+
+
+def account_columns_for_table(conn: sqlite3.Connection) -> Tuple[str, ...]:
+    cur = conn.cursor()
+    cur.execute('PRAGMA table_info("accounts")')
+    existing = {str(row[1]) for row in cur.fetchall()}
+    cols = [col for col in BASE_ACCOUNT_COLUMNS if col in existing]
+    for col in OPTIONAL_ACCOUNT_COLUMNS:
+        if col in existing:
+            cols.append(col)
+    if not cols:
+        raise SDFarmError('accounts table has no recognizable columns')
+    return tuple(cols)
 
 
 class SDFarmError(RuntimeError):
@@ -462,15 +477,16 @@ def load_accounts(db_path: Path, limit: int = 5000) -> List[Dict[str, str]]:
         conn.row_factory = sqlite3.Row
         try:
             cur = conn.cursor()
+            columns = account_columns_for_table(conn)
             cur.execute(
                 "SELECT "
-                + ", ".join([f'"{col}"' for col in ACCOUNT_COLUMNS])
+                + ", ".join([f'"{col}"' for col in columns])
                 + ' FROM "accounts" ORDER BY "UID" LIMIT ?',
                 (max_rows,),
             )
             rows = []
             for row in cur.fetchall():
-                rows.append({col: "" if row[col] is None else str(row[col]) for col in ACCOUNT_COLUMNS})
+                rows.append({col: "" if row[col] is None else str(row[col]) for col in columns})
             return rows
         finally:
             conn.close()
@@ -784,10 +800,12 @@ def build_account_rows(
         profile = matches[0] if len(matches) == 1 else {}
         route_username = route_username_for_uid(uid)
         valid = bool(uid and matched_ovpn and len(matches) == 1)
+        cookies = (account.get("Cookies") or "").strip()
         rows.append(
             {
                 "uid": uid,
                 "name": name,
+                "cookies": cookies,
                 "openvpn": openvpn,
                 "proxy": account.get("Proxy") or "",
                 "status": account.get("Status") or "",

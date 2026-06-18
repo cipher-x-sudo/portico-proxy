@@ -436,7 +436,49 @@
 }
 
 .sd-farm-table {
-  min-width: 82rem;
+  min-width: 90rem;
+}
+
+.sd-farm-copy-line {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-height: 2rem;
+  margin: 0;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text-main);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sd-farm-copy-line:hover {
+  border-color: rgba(79, 140, 255, 0.48);
+  background: rgba(79, 140, 255, 0.08);
+}
+
+.sd-farm-copy-code {
+  display: block;
+  min-width: 0;
+  max-width: 14rem;
+  color: var(--text-main);
+  font-size: 0.76rem;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sd-farm-copy-toast {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.35rem;
+  color: var(--success);
+  font-size: 0.64rem;
+  font-weight: 900;
+  text-transform: uppercase;
 }
 
 .sd-farm-table th,
