@@ -48,12 +48,8 @@ def _is_docker_bridge_ip(value: str) -> bool:
     if not _looks_like_ipv4(ip):
         return False
     parts = ip.split(".")
-    try:
-        second = int(parts[1])
-    except (IndexError, ValueError):
-        return False
-    # Default Docker bridge and common compose bridge ranges are not the Windows host.
-    return parts[0] == "172" and 17 <= second <= 31
+    # Default docker0 bridge only — WSL Windows host is often 172.19.x.x or similar.
+    return parts[0] == "172" and parts[1] == "17"
 
 
 def _is_plausible_windows_host_ip(value: str) -> bool:

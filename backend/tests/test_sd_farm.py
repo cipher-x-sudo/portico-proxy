@@ -208,7 +208,7 @@ class SDFarmTests(unittest.TestCase):
 
     def test_is_docker_bridge_ip(self):
         self.assertTrue(sd_farm._is_docker_bridge_ip("172.17.0.1"))
-        self.assertTrue(sd_farm._is_docker_bridge_ip("172.22.192.1"))
+        self.assertFalse(sd_farm._is_docker_bridge_ip("172.22.192.1"))
         self.assertFalse(sd_farm._is_docker_bridge_ip("172.19.128.1"))
         self.assertFalse(sd_farm._is_docker_bridge_ip("10.255.255.254"))
 
@@ -337,8 +337,10 @@ class SDFarmTests(unittest.TestCase):
         self.assertIn("http://172.19.128.1:53200/api/v2/", calls)
 
     def test_discover_wsl_windows_host_ip_uses_env_override(self):
+        sd_farm._windows_host_ip_cache = None
+        sd_farm._windows_host_ip_cache_attempted = False
         with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.19.128.1"}, clear=False):
-            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "172.19.128.1")
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.19.128.1")
 
     def test_resolve_route_username_uses_map(self):
         route_map = {"61560173093090": "rose_selma"}
