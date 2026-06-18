@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -44,36 +43,28 @@ def _is_loopback_ip(value: str) -> bool:
     return str(value or "").strip().startswith("127.")
 
 
-def _discover_default_gateway_ip() -> Optional[str]:
-    import subprocess
-
+def _is_docker_bridge_ip(value: str) -> bool:
+    ip = str(value or "").strip()
+    if not _looks_like_ipv4(ip):
+        return False
+    parts = ip.split(".")
     try:
-        proc = subprocess.run(
-            ["ip", "route", "show", "default"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for line in (proc.stdout or "").splitlines():
-        parts = line.split()
-        if "via" not in parts:
-            continue
-        idx = parts.index("via")
-        if idx + 1 >= len(parts):
-            continue
-        ip = parts[idx + 1].strip()
-        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
-            return ip
-    return None
+        second = int(parts[1])
+    except (IndexError, ValueError):
+        return False
+    # Default Docker bridge and common compose bridge ranges are not the Windows host.
+    return parts[0] == "172" and 17 <= second <= 31
+
+
+def _is_plausible_windows_host_ip(value: str) -> bool:
+    ip = str(value or "").strip()
+    return bool(ip) and _looks_like_ipv4(ip) and not _is_loopback_ip(ip) and not _is_docker_bridge_ip(ip)
 
 
 def _windows_host_ip_from_env() -> Optional[str]:
     for key in ("IXBROWSER_WINDOWS_HOST", "WSL_WINDOWS_HOST_IP"):
         ip = str(os.environ.get(key) or "").strip()
-        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
+        if _is_plausible_windows_host_ip(ip):
             return ip
     return None
 
@@ -106,77 +97,6 @@ def _docker_client():
         return None
 
 
-def _should_ixbrowser_use_host_network() -> bool:
-    mode = str(os.environ.get("IXBROWSER_USE_HOST_NETWORK") or "auto").strip().lower()
-    if mode in ("0", "false", "no", "off"):
-        return False
-    if mode in ("1", "true", "yes", "on"):
-        return _running_inside_docker() and _docker_socket_available()
-    return _running_inside_docker() and _docker_socket_available()
-
-
-def _ixbrowser_url_for_host_network(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    port = parsed.port or IXBROWSER_DEFAULT_PORT
-    win_ip = discover_wsl_windows_host_ip()
-    if not win_ip:
-        return url
-    host = (parsed.hostname or "").lower()
-    rewrite_hosts = {
-        "host.docker.internal",
-        "172.17.0.1",
-        "127.0.0.11",
-        "127.0.0.1",
-        "localhost",
-    }
-    if host in rewrite_hosts or host.startswith("172.17."):
-        return urllib.parse.urlunparse(parsed._replace(netloc=f"{win_ip}:{port}"))
-    return url
-
-
-def _ixbrowser_request_url(url: str) -> str:
-    if not _running_inside_docker():
-        return url
-    return _ixbrowser_url_for_host_network(url)
-
-
-def _http_post_via_docker_host_network(url: str, payload: Dict[str, Any], timeout: float) -> str:
-    client = _docker_client()
-    if client is None:
-        raise IXBrowserError("Docker client is not available for host-network ixBrowser access")
-    target_url = _ixbrowser_url_for_host_network(url)
-    body_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
-    image = (
-        str(os.environ.get(DOCKER_HOST_NETWORK_PROBE_IMAGE_ENV) or "").strip()
-        or DEFAULT_DOCKER_HOST_NETWORK_PROBE_IMAGE
-    )
-    timeout_seconds = max(1, int(timeout))
-    shell = (
-        "BODY=$(printf %s \"$IXBODY_B64\" | base64 -d) && "
-        f"wget -qO- --timeout={timeout_seconds} "
-        "--header='Content-Type: application/json' "
-        "--post-data=\"$BODY\" \"$IXURL\""
-    )
-    try:
-        output = client.containers.run(
-            image,
-            command=["sh", "-c", shell],
-            environment={"IXBODY_B64": body_b64, "IXURL": target_url},
-            network_mode="host",
-            remove=True,
-            stdout=True,
-            stderr=True,
-        )
-    except Exception as e:
-        detail = str(e).strip() or repr(e)
-        raise IXBrowserError(
-            f"ixBrowser host-network request failed ({target_url}): {detail}"
-        ) from e
-    if isinstance(output, bytes):
-        return output.decode("utf-8", errors="replace")
-    return str(output or "")
-
-
 def _discover_windows_host_via_docker_host_network() -> Optional[str]:
     """
     On WSL Docker, the gateway container only sees the Docker bridge (172.17.0.1).
@@ -206,7 +126,7 @@ def _discover_windows_host_via_docker_host_network() -> Optional[str]:
     text = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output or "")
     for line in text.splitlines():
         ip = line.strip()
-        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
+        if _is_plausible_windows_host_ip(ip):
             return ip
     return None
 
@@ -240,14 +160,11 @@ def discover_wsl_windows_host_ip(*, force_refresh: bool = False) -> Optional[str
                     parts = stripped.split()
                     if len(parts) >= 2:
                         ip = parts[1].strip()
-                        if _looks_like_ipv4(ip) and not _is_loopback_ip(ip):
+                        if _is_plausible_windows_host_ip(ip):
                             resolved = ip
                             break
         except OSError:
             pass
-
-    if not resolved:
-        resolved = _discover_default_gateway_ip()
 
     _windows_host_ip_cache = resolved
     return resolved
@@ -303,19 +220,19 @@ def ixbrowser_api_candidates(
 
 def ixbrowser_probe_hint(use_docker: bool, tried_urls: List[str]) -> str:
     del tried_urls
+    if not use_docker:
+        return "Ensure ixBrowser is running and listening on port 53200."
     wsl_ip = discover_wsl_windows_host_ip()
-    if use_docker and wsl_ip:
+    if wsl_ip:
         return (
-            "ixBrowser usually runs on Windows when using WSL Docker. "
-            f"Try http://{wsl_ip}:53200/api/v2/ or ensure ixBrowser is running and port 53200 is allowed through Windows Firewall."
+            "Docker Desktop usually works with host.docker.internal. "
+            f"WSL Docker usually needs the Windows host IP (detected: {wsl_ip}). "
+            "Ensure ixBrowser is running on Windows and port 53200 is allowed through Windows Firewall."
         )
-    if use_docker:
-        return (
-            "ixBrowser usually runs on Windows when using WSL Docker. "
-            "Ensure ixBrowser is running and port 53200 is allowed through Windows Firewall. "
-            "You can set IXBROWSER_WINDOWS_HOST in .env as a fallback."
-        )
-    return "Ensure ixBrowser is running and listening on port 53200."
+    return (
+        "Ensure ixBrowser is running on the host. "
+        "Docker Desktop should use host.docker.internal; WSL Docker may need IXBROWSER_WINDOWS_HOST in .env."
+    )
 
 
 def probe_ixbrowser_bases(
@@ -334,14 +251,13 @@ def probe_ixbrowser_bases(
         tried.append(base)
         try:
             profiles = fetch_ixbrowser_profiles(base, page_limit=1, timeout=timeout)
-            working_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker else base
             return {
                 "ok": True,
-                "ixBrowserApiBase": working_base,
+                "ixBrowserApiBase": base,
                 "ixBrowserError": "",
                 "ixBrowserProfileCount": len(profiles),
                 "triedUrls": tried,
-                "recommendedBase": working_base,
+                "recommendedBase": base,
                 "hint": "",
                 "wslHostIp": wsl_ip or "",
             }
@@ -720,7 +636,7 @@ def merge_route_map(
 
 def _json_post(base_url: str, action: str, payload: Dict[str, Any], timeout: float = 20.0) -> Dict[str, Any]:
     base = (base_url or "").rstrip("/") + "/"
-    url = _ixbrowser_request_url(base + action.lstrip("/"))
+    url = base + action.lstrip("/")
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,

@@ -206,6 +206,12 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type("HTTP"), "http")
         self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type(""), "http")
 
+    def test_is_docker_bridge_ip(self):
+        self.assertTrue(sd_farm._is_docker_bridge_ip("172.17.0.1"))
+        self.assertTrue(sd_farm._is_docker_bridge_ip("172.22.192.1"))
+        self.assertFalse(sd_farm._is_docker_bridge_ip("172.19.128.1"))
+        self.assertFalse(sd_farm._is_docker_bridge_ip("10.255.255.254"))
+
     def test_discover_wsl_windows_host_ip_skips_loopback_resolv(self):
         sd_farm._windows_host_ip_cache = None
         sd_farm._windows_host_ip_cache_attempted = False
@@ -217,9 +223,8 @@ class SDFarmTests(unittest.TestCase):
                 "read_text",
                 return_value="nameserver 127.0.0.11\n",
             ),
-            patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.22.192.1"),
         ):
-            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.22.192.1")
+            self.assertIsNone(sd_farm.discover_wsl_windows_host_ip(force_refresh=True))
 
     def test_discover_wsl_windows_host_ip_uses_non_loopback_nameserver(self):
         sd_farm._windows_host_ip_cache = None
@@ -232,7 +237,6 @@ class SDFarmTests(unittest.TestCase):
                 "read_text",
                 return_value="nameserver 10.255.255.254\n",
             ),
-            patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.22.192.1"),
         ):
             self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "10.255.255.254")
 
@@ -246,11 +250,14 @@ class SDFarmTests(unittest.TestCase):
             patch.object(sd_farm, "_running_inside_docker", return_value=True),
             patch.object(sd_farm, "_docker_socket_available", return_value=True),
             patch.object(sd_farm, "_docker_client", return_value=mock_client),
-            patch.object(sd_farm, "_discover_default_gateway_ip", return_value="172.17.0.1"),
         ):
             self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.19.128.1")
 
-    def test_json_post_rewrites_docker_url_and_uses_direct_http(self):
+    def test_discover_wsl_windows_host_ip_rejects_bridge_env_override(self):
+        with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.17.0.1"}, clear=False):
+            self.assertIsNone(sd_farm.discover_wsl_windows_host_ip(force_refresh=True))
+
+    def test_json_post_uses_url_literally_without_rewrite(self):
         payload = {"page": 1, "limit": 1}
         captured = {}
 
@@ -277,15 +284,57 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(data["error"]["code"], 0)
         self.assertEqual(
             captured["url"],
-            "http://172.19.128.1:53200/api/v2/profile-list",
+            "http://host.docker.internal:53200/api/v2/profile-list",
         )
 
-    def test_ixbrowser_url_for_host_network_rewrites_docker_hosts(self):
-        with patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="172.19.128.1"):
-            rewritten = sd_farm._ixbrowser_url_for_host_network(
-                "http://host.docker.internal:53200/api/v2/profile-list"
+    def test_probe_ixbrowser_host_docker_internal_wins_on_docker_desktop(self):
+        calls = []
+
+        def fake_fetch(base, page_limit=100, timeout=20.0):
+            calls.append(base)
+            if base == "http://host.docker.internal:53200/api/v2/":
+                return [{"profile_id": 1, "name": "fb 111"}]
+            raise sd_farm.IXBrowserError("Connection refused")
+
+        with (
+            patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value=None),
+            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=fake_fetch),
+        ):
+            status = sd_farm.probe_ixbrowser_bases(
+                sd_farm.ixbrowser_api_candidates(
+                    use_docker=True,
+                    configured_base="http://host.docker.internal:53200/api/v2/",
+                ),
+                use_docker=True,
             )
-        self.assertEqual(rewritten, "http://172.19.128.1:53200/api/v2/profile-list")
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["ixBrowserApiBase"], "http://host.docker.internal:53200/api/v2/")
+        self.assertEqual(calls[0], "http://host.docker.internal:53200/api/v2/")
+
+    def test_probe_ixbrowser_wsl_ip_wins_when_host_docker_internal_fails(self):
+        calls = []
+
+        def fake_fetch(base, page_limit=100, timeout=20.0):
+            calls.append(base)
+            if base == "http://172.19.128.1:53200/api/v2/":
+                return [{"profile_id": 1, "name": "fb 111"}]
+            raise sd_farm.IXBrowserError("Connection refused")
+
+        with (
+            patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="172.19.128.1"),
+            patch.object(sd_farm, "fetch_ixbrowser_profiles", side_effect=fake_fetch),
+        ):
+            status = sd_farm.probe_ixbrowser_bases(
+                sd_farm.ixbrowser_api_candidates(
+                    use_docker=True,
+                    configured_base="http://host.docker.internal:53200/api/v2/",
+                ),
+                use_docker=True,
+            )
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["ixBrowserApiBase"], "http://172.19.128.1:53200/api/v2/")
+        self.assertIn("http://host.docker.internal:53200/api/v2/", calls)
+        self.assertIn("http://172.19.128.1:53200/api/v2/", calls)
 
     def test_discover_wsl_windows_host_ip_uses_env_override(self):
         with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.19.128.1"}, clear=False):
