@@ -275,6 +275,34 @@ class SDFarmTests(unittest.TestCase):
         with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.19.128.1"}, clear=False):
             self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "172.19.128.1")
 
+    def test_resolve_route_username_uses_map(self):
+        route_map = {"61560173093090": "rose_selma"}
+        self.assertEqual(sd_farm.resolve_route_username("61560173093090", route_map), "rose_selma")
+        self.assertEqual(sd_farm.resolve_route_username("999", route_map), "sd_999")
+
+    def test_parse_route_import_text_csv(self):
+        mapping, errors = sd_farm.parse_route_import_text(
+            "uid,routeUsername,name\n61560173093090,rose_selma,Rose\n"
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(mapping["61560173093090"], "rose_selma")
+
+    def test_merge_route_map_rejects_duplicate_routes(self):
+        merged, errors = sd_farm.merge_route_map(
+            {},
+            {"1": "same_route", "2": "same_route"},
+            mode="merge",
+        )
+        self.assertIn("duplicate routeUsername", errors[0])
+        self.assertEqual(merged.get("1"), "same_route")
+        self.assertNotIn("2", merged)
+
+    def test_export_route_map_csv(self):
+        csv_text = sd_farm.export_route_map_csv(
+            [{"uid": "61560173093090", "routeUsername": "rose_selma", "name": "Rose"}]
+        )
+        self.assertIn("61560173093090,rose_selma", csv_text)
+
     def test_ovpn_note_from_matched_path_strips_folder_and_extension(self):
         self.assertEqual(
             sd_farm.ovpn_note_from_matched_path("NC/NCVPN-US-NewYork-UDP.ovpn"),
@@ -545,6 +573,33 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
         self.assertIn("sd_61560173093090", changed)
         persist_mock.assert_called_once()
         stop_mock.assert_any_call(state, "old_name", "both")
+
+    def test_upsert_uses_custom_route_username(self):
+        state = {
+            "lock": threading.Lock(),
+            "auth_routes": [],
+            "config_path": BACKEND_DIR / "openvpn-proxy-config.example.json",
+            "auth_runtime_config": {},
+            "auth_http_port": 58680,
+            "auth_socks_port": 58681,
+        }
+        rows = [
+            {
+                "uid": "61560173093090",
+                "name": "Ali Khan",
+                "routeUsername": "rose_selma",
+                "matchedOvpn": "NC/NCVPN-US-Phoenix-UDP.ovpn",
+                "valid": True,
+            }
+        ]
+        with (
+            patch.object(gateway, "_persist_auth_routes_config", return_value=None),
+            patch.object(gateway, "_stop_auth_route_backends", return_value=True),
+            patch.object(gateway, "_ixbrowser_proxy_type_from_state", return_value="http"),
+        ):
+            routes, err, _changed = gateway._upsert_sd_farm_auth_routes(state, rows)
+        self.assertIsNone(err)
+        self.assertEqual(routes[0]["username"], "rose_selma")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ const defaultSettings = {
   ixBrowserRecommendedBase: '',
   ixBrowserHint: '',
   wslHostIp: '',
+  routeMapCount: 0,
   useDocker: false,
   dbPath: '',
   dbError: '',
@@ -60,6 +61,7 @@ function parseSearchQuery(raw) {
 export default function SDFarm() {
   const toast = useToast();
   const folderInputRef = useRef(null);
+  const routeImportInputRef = useRef(null);
   const [payload, setPayload] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
@@ -93,6 +95,7 @@ export default function SDFarm() {
       ixBrowserRecommendedBase: data.ixBrowserRecommendedBase || '',
       ixBrowserHint: data.ixBrowserHint || '',
       wslHostIp: data.wslHostIp || '',
+      routeMapCount: typeof data.routeMapCount === 'number' ? data.routeMapCount : 0,
       useDocker: Boolean(data.useDocker),
       dbPath: data.dbPath || '',
       dbError: data.dbError || '',
@@ -370,7 +373,13 @@ export default function SDFarm() {
           proxyType: settings.ixBrowserProxyType,
         }),
       });
-      const data = await res.json();
+      const raw = await res.text();
+      let data;
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(raw.slice(0, 160) || 'Sync failed: server returned non-JSON response');
+      }
       if (!res.ok && res.status !== 207) throw new Error(data.error || 'Sync failed');
       const nextResults = {};
       (data.results || []).forEach((item) => {
@@ -388,6 +397,84 @@ export default function SDFarm() {
       toast({ title: 'Sync failed', message: err.message || 'Sync failed', variant: 'danger' });
     } finally {
       setBusy('');
+    }
+  };
+
+  const downloadTextFile = (filename, text, mimeType = 'application/json') => {
+    const blob = new Blob([text], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportRoutes = async (format = 'json') => {
+    setBusy('export-routes');
+    setError('');
+    try {
+      const res = await fetch(`/api/sd-farm/export-routes?format=${encodeURIComponent(format)}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'Export failed');
+      }
+      if (format === 'csv') {
+        downloadTextFile('sd-farm-routes.csv', await res.text(), 'text/csv');
+      } else {
+        const data = await res.json();
+        downloadTextFile(
+          'sd-farm-routes.json',
+          `${JSON.stringify(data, null, 2)}\n`,
+          'application/json',
+        );
+      }
+      toast({
+        title: 'Routes exported',
+        message: 'Copy this file to your other PC and use Import routes.',
+        variant: 'success',
+      });
+    } catch (err) {
+      setError(err.message || 'Export failed');
+      toast({ title: 'Export failed', message: err.message || 'Export failed', variant: 'danger' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const importRoutesText = async (text, mode = 'merge') => {
+    setBusy('import-routes');
+    setError('');
+    try {
+      const res = await fetch('/api/sd-farm/import-routes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, mode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Import failed');
+      await Promise.all([loadSettings(), loadAccounts()]);
+      toast({
+        title: 'Routes imported',
+        message: `${data.imported || 0} route mapping${data.imported === 1 ? '' : 's'} applied (${data.routeMapCount || 0} total).`,
+        variant: 'success',
+      });
+    } catch (err) {
+      setError(err.message || 'Import failed');
+      toast({ title: 'Import failed', message: err.message || 'Import failed', variant: 'danger' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const handleRouteImportFile = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      await importRoutesText(await file.text(), 'merge');
+    } catch (err) {
+      setError(err.message || 'Import failed');
     }
   };
 
@@ -638,6 +725,31 @@ export default function SDFarm() {
               <span className="material-symbols-outlined">refresh</span>
               Refresh
             </button>
+            <button
+              type="button"
+              className="btn-outline"
+              onClick={() => exportRoutes('json')}
+              disabled={Boolean(busy) || rows.length === 0}
+            >
+              <span className="material-symbols-outlined">download</span>
+              Export routes
+            </button>
+            <button
+              type="button"
+              className="btn-outline"
+              onClick={() => routeImportInputRef.current?.click()}
+              disabled={Boolean(busy)}
+            >
+              <span className="material-symbols-outlined">upload</span>
+              Import routes
+            </button>
+            <input
+              ref={routeImportInputRef}
+              type="file"
+              accept=".json,.csv,.txt,application/json,text/csv,text/plain"
+              className="sd-farm-folder-input"
+              onChange={handleRouteImportFile}
+            />
             <button type="button" className="btn-outline" onClick={previewSync} disabled={Boolean(busy)}>
               <span className="material-symbols-outlined">rule</span>
               Preview
@@ -681,6 +793,9 @@ export default function SDFarm() {
         </div>
         <div className="sd-farm-paths">
           <span>{payload?.dbPath || ''}</span>
+          {settings.routeMapCount > 0 && (
+            <span>{settings.routeMapCount} saved route mapping{settings.routeMapCount === 1 ? '' : 's'}</span>
+          )}
           {!payload?.ixBrowserOk && <strong>{payload?.ixBrowserError || 'ixBrowser unavailable'}</strong>}
         </div>
       </section>
@@ -741,7 +856,10 @@ export default function SDFarm() {
                         {row.browserProfileId && <small>{row.browserProfileId}</small>}
                       </div>
                     </td>
-                    <td className="text-mono">{row.routeUsername || '-'}</td>
+                    <td className="text-mono">
+                      {row.routeUsername || '-'}
+                      {row.routeUsernameCustom ? <span className="sd-farm-route-custom" title="Imported route name"> *</span> : null}
+                    </td>
                     <td>
                       <span className={`sd-farm-status sd-farm-status-${badgeClass}`}>
                         {result ? (result.ok ? 'Synced' : 'Failed') : row.valid ? 'Ready' : 'Warning'}

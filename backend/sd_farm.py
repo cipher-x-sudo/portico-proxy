@@ -558,6 +558,165 @@ def route_username_for_uid(uid: str) -> str:
     return f"sd_{cleaned}" if cleaned else "sd_account"
 
 
+def normalize_route_username(raw: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(raw or "").lower()).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    return slug[:64].strip("_")
+
+
+def validate_route_username(raw: str) -> Optional[str]:
+    username = normalize_route_username(raw)
+    if not username:
+        return "route username is required"
+    if len(username) < 2:
+        return "route username is too short"
+    return None
+
+
+def resolve_route_username(uid: str, route_map: Optional[Dict[str, str]] = None) -> str:
+    uid_text = str(uid or "").strip()
+    custom = normalize_route_username(str((route_map or {}).get(uid_text) or ""))
+    if custom:
+        return custom
+    return route_username_for_uid(uid_text)
+
+
+def apply_route_map(rows: Iterable[Dict[str, Any]], route_map: Optional[Dict[str, str]] = None) -> None:
+    mapping = route_map or {}
+    for row in rows:
+        uid = str(row.get("uid") or "").strip()
+        row["routeUsername"] = resolve_route_username(uid, mapping)
+        row["routeUsernameCustom"] = bool(uid and mapping.get(uid))
+
+
+def export_route_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, str]]:
+    exported: List[Dict[str, str]] = []
+    for row in rows:
+        uid = str(row.get("uid") or "").strip()
+        if not uid:
+            continue
+        exported.append(
+            {
+                "uid": uid,
+                "routeUsername": str(row.get("routeUsername") or resolve_route_username(uid, {})),
+                "name": str(row.get("name") or "").strip(),
+            }
+        )
+    return exported
+
+
+def export_route_map_csv(rows: Iterable[Dict[str, Any]]) -> str:
+    lines = ["uid,routeUsername,name"]
+    for item in export_route_rows(rows):
+        name = item["name"].replace('"', '""')
+        lines.append(f'{item["uid"]},{item["routeUsername"]},"{name}"')
+    return "\n".join(lines) + "\n"
+
+
+def _parse_route_import_json(payload: Any) -> Tuple[Dict[str, str], List[str]]:
+    mapping: Dict[str, str] = {}
+    errors: List[str] = []
+    if isinstance(payload, dict):
+        routes = payload.get("routes")
+        if isinstance(routes, list):
+            for index, item in enumerate(routes, start=1):
+                if not isinstance(item, dict):
+                    errors.append(f"routes[{index - 1}] must be an object")
+                    continue
+                uid = str(item.get("uid") or "").strip()
+                route = str(item.get("routeUsername") or item.get("route") or "").strip()
+                if not uid:
+                    errors.append(f"routes[{index - 1}] missing uid")
+                    continue
+                err = validate_route_username(route)
+                if err:
+                    errors.append(f"routes[{index - 1}] {err}")
+                    continue
+                mapping[uid] = normalize_route_username(route)
+            return mapping, errors
+        for uid, route in payload.items():
+            if str(uid) in ("version", "exportedAt", "routes", "mode"):
+                continue
+            uid_text = str(uid).strip()
+            route_text = str(route or "").strip()
+            if not uid_text:
+                continue
+            err = validate_route_username(route_text)
+            if err:
+                errors.append(f"{uid_text}: {err}")
+                continue
+            mapping[uid_text] = normalize_route_username(route_text)
+        return mapping, errors
+    if isinstance(payload, list):
+        return _parse_route_import_json({"routes": payload})
+    errors.append("import payload must be a JSON object or routes array")
+    return mapping, errors
+
+
+def parse_route_import_text(text: str) -> Tuple[Dict[str, str], List[str]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}, ["import text is empty"]
+    if raw.startswith("{") or raw.startswith("["):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return {}, [f"invalid JSON: {e}"]
+        return _parse_route_import_json(payload)
+
+    mapping: Dict[str, str] = {}
+    errors: List[str] = []
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.lower().startswith("uid,") and "route" in stripped.lower():
+            continue
+        if "," in stripped:
+            parts = [part.strip().strip('"') for part in stripped.split(",", 2)]
+        elif "\t" in stripped:
+            parts = [part.strip() for part in stripped.split("\t", 2)]
+        else:
+            parts = stripped.split(None, 1)
+        if len(parts) < 2:
+            errors.append(f"line {line_no}: expected uid and routeUsername")
+            continue
+        uid = parts[0].strip()
+        route = parts[1].strip()
+        err = validate_route_username(route)
+        if not uid:
+            errors.append(f"line {line_no}: missing uid")
+            continue
+        if err:
+            errors.append(f"line {line_no}: {err}")
+            continue
+        mapping[uid] = normalize_route_username(route)
+    return mapping, errors
+
+
+def merge_route_map(
+    existing: Dict[str, str],
+    incoming: Dict[str, str],
+    *,
+    mode: str = "merge",
+) -> Tuple[Dict[str, str], List[str]]:
+    errors: List[str] = []
+    route_to_uid: Dict[str, str] = {}
+    for uid, route in incoming.items():
+        prior = route_to_uid.get(route)
+        if prior and prior != uid:
+            errors.append(f"duplicate routeUsername '{route}' for uids {prior} and {uid}")
+            continue
+        route_to_uid[route] = uid
+
+    base = {} if mode == "replace" else dict(existing or {})
+    for uid, route in incoming.items():
+        if route in route_to_uid and route_to_uid[route] != uid:
+            continue
+        base[uid] = route
+    return base, errors
+
+
 def _json_post(base_url: str, action: str, payload: Dict[str, Any], timeout: float = 20.0) -> Dict[str, Any]:
     base = (base_url or "").rstrip("/") + "/"
     url = base + action.lstrip("/")

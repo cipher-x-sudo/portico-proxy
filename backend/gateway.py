@@ -60,15 +60,22 @@ from sd_farm import (
     SDFarmError,
     IMPORTED_DB_PATH,
     SD_FARM_IMPORT_MAX_BYTES,
+    apply_route_map,
     browse_directory,
     build_account_rows as build_sd_farm_account_rows,
     discover_accounts_db,
+    export_route_map_csv,
+    export_route_rows,
     fetch_ixbrowser_profiles,
     ixbrowser_api_candidates,
     load_accounts as load_sd_farm_accounts,
+    merge_route_map,
     normalize_ixbrowser_proxy_type,
+    normalize_route_username,
+    parse_route_import_text,
     probe_ixbrowser_bases,
     resolve_sd_farm_root,
+    resolve_route_username,
     route_username_for_uid,
     save_imported_accounts_db,
     sd_farm_browse_roots,
@@ -1050,6 +1057,35 @@ def _sd_farm_imported_at_from_state(state: Dict[str, Any]) -> str:
     return str(cfg.get("sdFarmImportedAt") or cfg.get("sd_farm_imported_at") or "").strip()
 
 
+def _sd_farm_route_map_from_state(state: Dict[str, Any]) -> Dict[str, str]:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    raw = cfg.get("sdFarmRouteMap") or cfg.get("sd_farm_route_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    mapping: Dict[str, str] = {}
+    for uid, route in raw.items():
+        uid_text = str(uid or "").strip()
+        route_text = normalize_route_username(str(route or ""))
+        if uid_text and route_text:
+            mapping[uid_text] = route_text
+    return mapping
+
+
+def _apply_sd_farm_route_map_state(state: Dict[str, Any], route_map: Dict[str, str]) -> None:
+    with state["lock"]:
+        runtime = dict(state.get("auth_runtime_config") or {})
+        runtime["sdFarmRouteMap"] = dict(route_map)
+        state["auth_runtime_config"] = runtime
+
+
+def _persist_sd_farm_route_map(config_path: Path, state: Dict[str, Any], route_map: Dict[str, str]) -> Optional[str]:
+    err = _persist_sd_farm_config_fields(config_path, state, {"sdFarmRouteMap": dict(route_map)})
+    if err:
+        return err
+    _apply_sd_farm_route_map_state(state, route_map)
+    return None
+
+
 def _ixbrowser_api_base_from_state(state: Dict[str, Any]) -> str:
     cfg = dict(state.get("auth_runtime_config") or {})
     configured = (
@@ -1162,6 +1198,7 @@ def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
         "ixBrowserRecommendedBase": ix_status.get("recommendedBase") or "",
         "ixBrowserHint": ix_status.get("hint") or "",
         "wslHostIp": ix_status.get("wslHostIp") or "",
+        "routeMapCount": len(_sd_farm_route_map_from_state(state)),
         "useDocker": bool(state.get("use_docker")),
         "dbPath": db_path,
         "dbError": db_error,
@@ -1313,6 +1350,7 @@ def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
         ix_error = str(ix_status.get("ixBrowserError") or "ixBrowser API is not available")
 
     rows = build_sd_farm_account_rows(accounts, allowed_ovpn, profiles)
+    apply_route_map(rows, _sd_farm_route_map_from_state(state))
     valid_count = sum(1 for row in rows if row.get("valid"))
     return {
         "root": root_label,
@@ -1344,7 +1382,7 @@ def _upsert_sd_farm_auth_routes(
     changed_usernames: List[str] = []
     for row in target_rows:
         uid = str(row.get("uid") or "").strip()
-        username = route_username_for_uid(uid)
+        username = str(row.get("routeUsername") or route_username_for_uid(uid))
         route = {
             "index": 0,
             "username": username,
@@ -4795,6 +4833,8 @@ def _control_api_handler_factory(
                 self._handle_get_sd_farm_ixbrowser_test(parsed.query)
             elif path == "/api/sd-farm/preview-sync":
                 self._handle_get_sd_farm_preview_sync()
+            elif path == "/api/sd-farm/export-routes":
+                self._handle_get_sd_farm_export_routes(parsed.query)
             elif path == "/api/export-auth-routes":
                 self._handle_get_export_auth_routes()
             elif path == "/api/provider-auth":
@@ -5138,6 +5178,74 @@ def _control_api_handler_factory(
                 for row in rows
             ]
             self._send_json(payload)
+
+        def _handle_get_sd_farm_export_routes(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query or "")
+            export_format = (params.get("format") or ["json"])[0].strip().lower()
+            payload, err, status_code = _build_sd_farm_payload(state)
+            if err or payload is None:
+                self._send_error_body(err or "Could not export SD Farm routes", status_code)
+                return
+            rows = list(payload.get("rows") or [])
+            routes = export_route_rows(rows)
+            if export_format == "csv":
+                csv_text = export_route_map_csv(rows)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="sd-farm-routes.csv"',
+                )
+                self.end_headers()
+                self.wfile.write(csv_text.encode("utf-8"))
+                return
+            self._send_json(
+                {
+                    "version": 1,
+                    "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "routeMapCount": len(_sd_farm_route_map_from_state(state)),
+                    "routes": routes,
+                }
+            )
+
+        def _handle_post_sd_farm_import_routes(self) -> None:
+            body, body_err = self._read_json_body(1024 * 1024)
+            if body_err or body is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            mode = str(body.get("mode") or "merge").strip().lower()
+            if mode not in ("merge", "replace"):
+                mode = "merge"
+            if isinstance(body.get("text"), str) and str(body.get("text") or "").strip():
+                incoming, errors = parse_route_import_text(str(body.get("text") or ""))
+            elif isinstance(body.get("routes"), list):
+                incoming, errors = parse_route_import_text(json.dumps({"routes": body.get("routes")}))
+            elif isinstance(body.get("map"), dict):
+                incoming, errors = parse_route_import_text(json.dumps(dict(body.get("map") or {})))
+            else:
+                incoming, errors = parse_route_import_text(json.dumps(body))
+            if errors and not incoming:
+                self._send_error_body("; ".join(errors[:8]), 400)
+                return
+            existing = _sd_farm_route_map_from_state(state)
+            merged, merge_errors = merge_route_map(existing, incoming, mode=mode)
+            all_errors = [*errors, *merge_errors]
+            if merge_errors and not merged:
+                self._send_error_body("; ".join(all_errors[:8]), 400)
+                return
+            save_err = _persist_sd_farm_route_map(state["config_path"], state, merged)
+            if save_err:
+                self._send_error_body(save_err, 500)
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "mode": mode,
+                    "imported": len(incoming),
+                    "routeMapCount": len(merged),
+                    "errors": all_errors,
+                }
+            )
 
         def _read_json_body(self, max_bytes: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             try:
@@ -6128,6 +6236,8 @@ def _control_api_handler_factory(
                 self._handle_post_sd_farm_import()
             elif path == "/api/sd-farm/sync":
                 self._handle_post_sd_farm_sync()
+            elif path == "/api/sd-farm/import-routes":
+                self._handle_post_sd_farm_import_routes()
             else:
                 self.send_error(404)
 
