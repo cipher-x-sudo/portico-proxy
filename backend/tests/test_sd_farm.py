@@ -105,6 +105,91 @@ class SDFarmTests(unittest.TestCase):
                 r"D:\WORK\SD Farm\Cookies\61560173093090.json",
             )
 
+    def test_loads_singular_cookie_column_with_token_string(self):
+        with TemporaryDirectory() as tmp:
+            db = Path(tmp) / "accounts.sqlite"
+            conn = sqlite3.connect(db)
+            cookie_value = "uid=100009548499800; token=EAAAAUaZA8jlABREztGiy"
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE accounts (
+                        Current_Status TEXT,
+                        Name TEXT,
+                        UID TEXT PRIMARY KEY,
+                        Status TEXT,
+                        Proxy TEXT,
+                        OpenVPN TEXT,
+                        Cookie TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO accounts (UID, Name, OpenVPN, Proxy, Status, Current_Status, Cookie)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "100009548499800",
+                        "Junaid Zafar",
+                        "NCVPN-US-Phoenix-UDP",
+                        "",
+                        "Live",
+                        "Success",
+                        cookie_value,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            rows = sd_farm.load_accounts(db)
+            built = sd_farm.build_account_rows(rows, [], [])
+            self.assertEqual(rows[0]["Cookie"], cookie_value)
+            self.assertEqual(built[0]["cookies"], cookie_value)
+
+    def test_loads_lowercase_cookies_column(self):
+        with TemporaryDirectory() as tmp:
+            db = Path(tmp) / "accounts.sqlite"
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE accounts (
+                        Current_Status TEXT,
+                        Name TEXT,
+                        UID TEXT PRIMARY KEY,
+                        Status TEXT,
+                        Proxy TEXT,
+                        OpenVPN TEXT,
+                        cookies TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO accounts (UID, Name, OpenVPN, Proxy, Status, Current_Status, cookies)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "61569750060983",
+                        "Rose Selma",
+                        "NCVPN-US-NewYork-UDP",
+                        "",
+                        "Live",
+                        "Success",
+                        r"D:\SD Farm\Cookies\61569750060983.json",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            rows = sd_farm.load_accounts(db)
+            built = sd_farm.build_account_rows(rows, [], [])
+            self.assertEqual(rows[0]["cookies"], r"D:\SD Farm\Cookies\61569750060983.json")
+            self.assertEqual(built[0]["cookies"], r"D:\SD Farm\Cookies\61569750060983.json")
+
     def test_browse_directory_lists_child_folders_and_db_hint(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

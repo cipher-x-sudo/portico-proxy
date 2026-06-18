@@ -53,6 +53,9 @@ function rowIssue(row) {
 function cookiesLabel(value) {
   const text = String(value || '').trim();
   if (!text) return '-';
+  if (text.includes('=') && !text.includes('\\') && !text.includes('/')) {
+    return text.length > 36 ? `${text.slice(0, 36)}…` : text;
+  }
   const leaf = text.replace(/\\/g, '/').split('/').pop();
   return leaf || text;
 }
@@ -418,9 +421,9 @@ export default function SDFarm() {
       window.setTimeout(() => {
         setCopiedToken((current) => (current === token ? '' : current));
       }, 1800);
-      toast({ title: 'Copied', message: 'Cookies path copied to clipboard.', variant: 'success', duration: 1800 });
+      toast({ title: 'Copied', message: 'Cookie copied to clipboard.', variant: 'success', duration: 1800 });
     } catch (err) {
-      toast({ title: 'Copy failed', message: err?.message || 'Could not copy cookies path.', variant: 'danger' });
+      toast({ title: 'Copy failed', message: err?.message || 'Could not copy cookie.', variant: 'danger' });
     }
   };
 

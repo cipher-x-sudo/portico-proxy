@@ -15,18 +15,73 @@ DEFAULT_DB_RELATIVE_PATH = Path("DB") / "data" / "accounts.sqlite"
 IMPORTED_DB_PATH = Path("/data/sd-farm/accounts.sqlite")
 SD_FARM_IMPORT_MAX_BYTES = 64 * 1024 * 1024
 BASE_ACCOUNT_COLUMNS = ("UID", "Name", "OpenVPN", "Proxy", "Status", "Current_Status")
-OPTIONAL_ACCOUNT_COLUMNS = ("Cookies",)
-ACCOUNT_COLUMNS = BASE_ACCOUNT_COLUMNS + OPTIONAL_ACCOUNT_COLUMNS
+COOKIES_COLUMN_ALIASES = (
+    "Cookie",
+    "cookie",
+    "Cookies",
+    "cookies",
+    "COOKIES",
+    "CookiePath",
+    "cookie_path",
+    "CookiesPath",
+    "cookies_path",
+)
+ACCOUNT_COLUMNS = BASE_ACCOUNT_COLUMNS + ("Cookies",)
+
+
+def _table_column_names(conn: sqlite3.Connection) -> Tuple[str, ...]:
+    cur = conn.cursor()
+    cur.execute('PRAGMA table_info("accounts")')
+    return tuple(str(row[1]) for row in cur.fetchall())
+
+
+def _find_column_by_aliases(existing: Iterable[str], aliases: Iterable[str]) -> Optional[str]:
+    lookup = {name.casefold(): name for name in existing}
+    for alias in aliases:
+        found = lookup.get(str(alias).casefold())
+        if found:
+            return found
+    return None
+
+
+def _find_cookies_column(existing: Iterable[str]) -> Optional[str]:
+    found = _find_column_by_aliases(existing, COOKIES_COLUMN_ALIASES)
+    if found:
+        return found
+    for name in existing:
+        if "cookie" in name.casefold():
+            return name
+    return None
+
+
+def account_field(account: Dict[str, str], *names: str) -> str:
+    for name in names:
+        if name in account and account[name] is not None:
+            value = str(account[name]).strip()
+            if value:
+                return value
+    lookup = {key.casefold(): key for key in account}
+    for name in names:
+        actual = lookup.get(name.casefold())
+        if actual is None or account[actual] is None:
+            continue
+        value = str(account[actual]).strip()
+        if value:
+            return value
+    return ""
 
 
 def account_columns_for_table(conn: sqlite3.Connection) -> Tuple[str, ...]:
-    cur = conn.cursor()
-    cur.execute('PRAGMA table_info("accounts")')
-    existing = {str(row[1]) for row in cur.fetchall()}
-    cols = [col for col in BASE_ACCOUNT_COLUMNS if col in existing]
-    for col in OPTIONAL_ACCOUNT_COLUMNS:
-        if col in existing:
-            cols.append(col)
+    existing = _table_column_names(conn)
+    existing_set = set(existing)
+    cols: List[str] = []
+    for col in BASE_ACCOUNT_COLUMNS:
+        resolved = _find_column_by_aliases(existing_set, (col,))
+        if resolved and resolved not in cols:
+            cols.append(resolved)
+    cookies_col = _find_cookies_column(existing_set)
+    if cookies_col and cookies_col not in cols:
+        cols.append(cookies_col)
     if not cols:
         raise SDFarmError('accounts table has no recognizable columns')
     return tuple(cols)
@@ -800,7 +855,7 @@ def build_account_rows(
         profile = matches[0] if len(matches) == 1 else {}
         route_username = route_username_for_uid(uid)
         valid = bool(uid and matched_ovpn and len(matches) == 1)
-        cookies = (account.get("Cookies") or "").strip()
+        cookies = account_field(account, *COOKIES_COLUMN_ALIASES)
         rows.append(
             {
                 "uid": uid,
