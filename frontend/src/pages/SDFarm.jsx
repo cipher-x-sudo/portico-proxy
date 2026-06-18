@@ -543,7 +543,7 @@ export default function SDFarm() {
                     {settings.useDocker
                       ? (settings.wslHostIp
                         ? `WSL + Windows: ixBrowser runs on Windows. Try http://${settings.wslHostIp}:53200/api/v2/ if host.docker.internal fails.`
-                        : 'WSL/Docker: use host.docker.internal, or your Windows host IP from /etc/resolv.conf nameserver.')}
+                        : 'WSL/Docker: use host.docker.internal, or your Windows host IP from /etc/resolv.conf nameserver.')
                       : 'Local gateway: use http://127.0.0.1:53200/api/v2/ when ixBrowser runs on the same machine.'}
                   </p>
                 </div>
