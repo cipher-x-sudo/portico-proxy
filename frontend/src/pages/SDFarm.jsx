@@ -10,6 +10,15 @@ const filters = [
   { id: 'duplicate', label: 'Duplicates' },
 ];
 
+const defaultSettings = {
+  sdFarmRoot: '',
+  ixBrowserApiBase: '',
+  ixBrowserProxyHost: '127.0.0.1',
+  useDocker: false,
+  dbPath: '',
+  dbError: '',
+};
+
 function statusClass(row) {
   if (row.valid) return 'success';
   if (row.browserStatus === 'duplicate' || row.ovpnStatus === 'duplicate_ovpn') return 'warning';
@@ -31,9 +40,35 @@ export default function SDFarm() {
   const [query, setQuery] = useState('');
   const [selectedUids, setSelectedUids] = useState([]);
   const [syncResults, setSyncResults] = useState({});
+  const [settings, setSettings] = useState(defaultSettings);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseData, setBrowseData] = useState(null);
+  const [browseError, setBrowseError] = useState('');
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
+
+  const loadSettings = useCallback(async () => {
+    try {
+      const res = await fetch('/api/sd-farm/settings');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to load SD Farm settings');
+      setSettings({
+        sdFarmRoot: data.sdFarmRoot || '',
+        ixBrowserApiBase: data.ixBrowserApiBase || '',
+        ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
+        useDocker: Boolean(data.useDocker),
+        dbPath: data.dbPath || '',
+        dbError: data.dbError || '',
+      });
+      setSettingsDirty(false);
+    } catch (err) {
+      setError(err.message || 'Failed to load SD Farm settings');
+    }
+  }, []);
 
   const loadAccounts = useCallback(async () => {
     setLoading(true);
@@ -52,8 +87,108 @@ export default function SDFarm() {
   }, []);
 
   useEffect(() => {
+    loadSettings();
     loadAccounts();
-  }, [loadAccounts]);
+  }, [loadAccounts, loadSettings]);
+
+  const handleSettingsChange = (field, value) => {
+    setSettings((current) => ({ ...current, [field]: value }));
+    setSettingsDirty(true);
+  };
+
+  const loadBrowse = useCallback(async (path) => {
+    setBrowseLoading(true);
+    setBrowseError('');
+    try {
+      const query = path ? `?path=${encodeURIComponent(path)}` : '';
+      const res = await fetch(`/api/sd-farm/browse${query}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to browse folders');
+      setBrowseData(data);
+    } catch (err) {
+      setBrowseError(err.message || 'Failed to browse folders');
+    } finally {
+      setBrowseLoading(false);
+    }
+  }, []);
+
+  const openBrowse = async () => {
+    setBrowseOpen(true);
+    await loadBrowse(settings.sdFarmRoot || '');
+  };
+
+  const selectBrowseFolder = (path) => {
+    handleSettingsChange('sdFarmRoot', path);
+    setBrowseOpen(false);
+    toast({
+      title: 'Folder selected',
+      message: path,
+      variant: 'success',
+    });
+  };
+
+  const browseBreadcrumbs = useMemo(() => {
+    const current = browseData?.path || '';
+    if (!current) return [];
+    const normalized = current.replace(/\\/g, '/');
+    if (normalized === '/') return [{ label: '/', path: '/' }];
+    const isWindowsDrive = /^[A-Za-z]:\//.test(normalized);
+    const parts = normalized.split('/').filter(Boolean);
+    const crumbs = [];
+    if (isWindowsDrive && parts.length > 0) {
+      let acc = `${parts[0]}/`;
+      crumbs.push({ label: parts[0], path: acc });
+      for (let i = 1; i < parts.length; i += 1) {
+        acc = `${acc.replace(/\/$/, '')}/${parts[i]}`;
+        crumbs.push({ label: parts[i], path: acc });
+      }
+      return crumbs;
+    }
+    let acc = '';
+    for (const part of parts) {
+      acc = `${acc}/${part}`;
+      crumbs.push({ label: part, path: acc });
+    }
+    return crumbs;
+  }, [browseData?.path]);
+
+  const saveSettings = async () => {
+    setBusy('settings');
+    setError('');
+    try {
+      const res = await fetch('/api/sd-farm/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdFarmRoot: settings.sdFarmRoot,
+          ixBrowserApiBase: settings.ixBrowserApiBase,
+          ixBrowserProxyHost: settings.ixBrowserProxyHost,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save SD Farm settings');
+      setSettings({
+        sdFarmRoot: data.sdFarmRoot || '',
+        ixBrowserApiBase: data.ixBrowserApiBase || '',
+        ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
+        useDocker: Boolean(data.useDocker),
+        dbPath: data.dbPath || '',
+        dbError: data.dbError || '',
+      });
+      setSettingsDirty(false);
+      toast({
+        title: 'SD Farm settings saved',
+        message: data.dbPath ? `Using ${data.dbPath}` : 'Settings updated.',
+        variant: 'success',
+      });
+      await loadAccounts();
+    } catch (err) {
+      setError(err.message || 'Failed to save SD Farm settings');
+      toast({ title: 'Save failed', message: err.message || 'Failed to save SD Farm settings', variant: 'danger' });
+    } finally {
+      setBusy('');
+    }
+  };
 
   const filteredRows = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -181,6 +316,180 @@ export default function SDFarm() {
             <small>ixBrowser</small>
           </div>
         </div>
+      </section>
+
+      <section className="card sd-farm-settings">
+        <div className="sd-farm-settings-header">
+          <div className="flex items-center gap-2">
+            <span className="material-symbols-outlined text-primary">folder_open</span>
+            <h3 className="font-bold">Data source</h3>
+            {settingsDirty && <span className="dirty-badge">Unsaved</span>}
+          </div>
+          <button
+            type="button"
+            className="btn-outline"
+            onClick={() => setSettingsOpen((open) => !open)}
+            aria-expanded={settingsOpen}
+          >
+            <span className="material-symbols-outlined">{settingsOpen ? 'expand_less' : 'expand_more'}</span>
+            {settingsOpen ? 'Hide' : 'Configure'}
+          </button>
+        </div>
+        {settingsOpen && (
+          <div className="sd-farm-settings-body">
+            <div className="form-group">
+              <label htmlFor="sd-farm-root">SD Farm root folder</label>
+              <div className="sd-farm-root-row">
+                <input
+                  id="sd-farm-root"
+                  type="text"
+                  className="premium-input"
+                  placeholder={settings.useDocker ? '/sd-farm' : 'H:/SD Farm'}
+                  value={settings.sdFarmRoot}
+                  onChange={(event) => handleSettingsChange('sdFarmRoot', event.target.value)}
+                />
+                <button
+                  type="button"
+                  className="btn-outline sd-farm-browse-btn"
+                  onClick={openBrowse}
+                  disabled={Boolean(busy)}
+                >
+                  <span className="material-symbols-outlined">folder_open</span>
+                  Browse
+                </button>
+              </div>
+              {browseOpen && (
+                <div className="sd-farm-browse-panel">
+                  <div className="sd-farm-browse-toolbar">
+                    <div className="sd-farm-browse-crumbs">
+                      {browseBreadcrumbs.map((crumb) => (
+                        <button
+                          key={crumb.path}
+                          type="button"
+                          className="sd-farm-browse-crumb"
+                          onClick={() => loadBrowse(crumb.path)}
+                        >
+                          {crumb.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="sd-farm-browse-toolbar-actions">
+                      {browseData?.parent && (
+                        <button
+                          type="button"
+                          className="btn-outline"
+                          onClick={() => loadBrowse(browseData.parent)}
+                          disabled={browseLoading}
+                        >
+                          <span className="material-symbols-outlined">arrow_upward</span>
+                          Up
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        onClick={() => selectBrowseFolder(browseData?.path || settings.sdFarmRoot)}
+                        disabled={browseLoading || !browseData?.path}
+                      >
+                        Select folder
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-outline"
+                        onClick={() => setBrowseOpen(false)}
+                      >
+                        Close
+                      </button>
+                    </div>
+                  </div>
+                  {browseError && <p className="sd-farm-browse-error">{browseError}</p>}
+                  {browseLoading && (
+                    <div className="sd-farm-browse-loading">
+                      <span className="material-symbols-outlined loading-spinner">progress_activity</span>
+                      Loading folders...
+                    </div>
+                  )}
+                  {!browseLoading && browseData && (
+                    <>
+                      {browseData.hasAccountsDb && (
+                        <p className="sd-farm-browse-db-hint">
+                          Database found here: <strong>{browseData.accountsDbPath}</strong>
+                        </p>
+                      )}
+                      <ul className="sd-farm-browse-list">
+                        {(browseData.entries || []).map((entry) => (
+                          <li key={entry.path}>
+                            <button
+                              type="button"
+                              className="sd-farm-browse-item"
+                              onClick={() => loadBrowse(entry.path)}
+                            >
+                              <span className="material-symbols-outlined">folder</span>
+                              <span className="sd-farm-browse-item-name">{entry.name}</span>
+                              {entry.hasAccountsDb && (
+                                <span className="sd-farm-browse-badge">accounts.sqlite</span>
+                              )}
+                            </button>
+                          </li>
+                        ))}
+                        {(browseData.entries || []).length === 0 && (
+                          <li className="sd-farm-browse-empty">No subfolders here.</li>
+                        )}
+                      </ul>
+                      {browseData.truncated && (
+                        <p className="sd-farm-settings-hint">Showing the first folders only.</p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+              <p className="sd-farm-settings-hint">
+                {settings.useDocker
+                  ? 'Use the container path (usually /sd-farm). Mount your host folder in docker-compose with SD_FARM_HOST_PATH.'
+                  : 'Folder that contains DB/data/accounts.sqlite, or any folder with accounts.sqlite inside it.'}
+              </p>
+            </div>
+            <div className="sd-farm-settings-grid">
+              <div className="form-group">
+                <label htmlFor="sd-farm-ix-api">ixBrowser API base</label>
+                <input
+                  id="sd-farm-ix-api"
+                  type="text"
+                  className="premium-input"
+                  placeholder="http://127.0.0.1:53200/api/v2/"
+                  value={settings.ixBrowserApiBase}
+                  onChange={(event) => handleSettingsChange('ixBrowserApiBase', event.target.value)}
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="sd-farm-ix-host">ixBrowser proxy host</label>
+                <input
+                  id="sd-farm-ix-host"
+                  type="text"
+                  className="premium-input"
+                  placeholder="127.0.0.1"
+                  value={settings.ixBrowserProxyHost}
+                  onChange={(event) => handleSettingsChange('ixBrowserProxyHost', event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="sd-farm-settings-footer">
+              <div className="sd-farm-paths">
+                <span>{settings.dbPath || settings.sdFarmRoot || 'No database selected'}</span>
+                {settings.dbError && <strong>{settings.dbError}</strong>}
+              </div>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={saveSettings}
+                disabled={Boolean(busy) || !settingsDirty}
+              >
+                <span className="material-symbols-outlined">save</span>
+                Save path
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="card sd-farm-controls">

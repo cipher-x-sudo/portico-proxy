@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import urllib.error
@@ -24,6 +25,98 @@ class IXBrowserError(RuntimeError):
 def resolve_sd_farm_root(raw: str) -> Path:
     value = (raw or "").strip() or "/sd-farm"
     return Path(value).expanduser()
+
+
+def _path_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def sd_farm_browse_roots(current_root: Optional[Path] = None) -> List[Path]:
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for raw in (
+        current_root,
+        Path("/sd-farm"),
+        Path.home(),
+        Path("/"),
+    ):
+        if raw is None:
+            continue
+        try:
+            candidate = raw.expanduser().resolve()
+        except OSError:
+            continue
+        if not candidate.is_dir():
+            continue
+        key = _path_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(candidate)
+    if os.name == "nt":
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = Path(f"{letter}:/")
+            if not drive.is_dir():
+                continue
+            key = _path_key(drive)
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(drive)
+    return roots
+
+
+def _accounts_db_hint(path: Path) -> Tuple[bool, str]:
+    try:
+        found, _candidates = discover_accounts_db(path)
+        return True, str(found)
+    except SDFarmError:
+        return False, ""
+
+
+def browse_directory(path: Path, *, limit: int = 200) -> Dict[str, Any]:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError as e:
+        raise SDFarmError(f"Invalid path: {e}") from e
+    if not resolved.is_dir():
+        raise SDFarmError(f"Not a directory: {resolved}")
+    parent = resolved.parent
+    parent_path = "" if parent == resolved else parent.as_posix()
+    entries: List[Dict[str, Any]] = []
+    truncated = False
+    try:
+        children = sorted(
+            [child for child in resolved.iterdir() if child.is_dir() and not child.name.startswith(".")],
+            key=lambda child: child.name.lower(),
+        )
+    except OSError as e:
+        raise SDFarmError(f"Could not read directory: {e}") from e
+    if len(children) > limit:
+        truncated = True
+        children = children[:limit]
+    for child in children:
+        has_db, db_path = _accounts_db_hint(child)
+        entries.append(
+            {
+                "name": child.name,
+                "path": child.as_posix(),
+                "hasAccountsDb": has_db,
+                "accountsDbPath": db_path,
+            }
+        )
+    has_db, db_path = _accounts_db_hint(resolved)
+    return {
+        "path": resolved.as_posix(),
+        "parent": parent_path,
+        "entries": entries,
+        "hasAccountsDb": has_db,
+        "accountsDbPath": db_path,
+        "truncated": truncated,
+    }
 
 
 def discover_accounts_db(root: Path) -> Tuple[Path, List[Path]]:

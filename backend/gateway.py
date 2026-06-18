@@ -58,12 +58,14 @@ from provider_auth import load_provider_auth
 from sd_farm import (
     IXBrowserError,
     SDFarmError,
+    browse_directory,
     build_account_rows as build_sd_farm_account_rows,
     discover_accounts_db,
     fetch_ixbrowser_profiles,
     load_accounts as load_sd_farm_accounts,
     resolve_sd_farm_root,
     route_username_for_uid,
+    sd_farm_browse_roots,
     update_ixbrowser_profile_proxy,
 )
 from upstream_proxy import (
@@ -885,9 +887,9 @@ def _persist_auth_routes_config(config_path: Path, state: Dict[str, Any], routes
 def _sd_farm_root_from_state(state: Dict[str, Any]) -> Path:
     cfg = dict(state.get("auth_runtime_config") or {})
     configured = (
-        os.environ.get("SD_FARM_ROOT")
-        or cfg.get("sdFarmRoot")
+        cfg.get("sdFarmRoot")
         or cfg.get("sd_farm_root")
+        or os.environ.get("SD_FARM_ROOT")
         or "/sd-farm"
     )
     return resolve_sd_farm_root(str(configured))
@@ -896,9 +898,9 @@ def _sd_farm_root_from_state(state: Dict[str, Any]) -> Path:
 def _ixbrowser_api_base_from_state(state: Dict[str, Any]) -> str:
     cfg = dict(state.get("auth_runtime_config") or {})
     configured = (
-        os.environ.get("IXBROWSER_API_BASE")
-        or cfg.get("ixBrowserApiBase")
+        cfg.get("ixBrowserApiBase")
         or cfg.get("ixbrowser_api_base")
+        or os.environ.get("IXBROWSER_API_BASE")
     )
     if configured:
         return str(configured).strip()
@@ -909,13 +911,106 @@ def _ixbrowser_proxy_host_from_state(state: Dict[str, Any]) -> str:
     cfg = dict(state.get("auth_runtime_config") or {})
     return (
         str(
-            os.environ.get("IXBROWSER_PROXY_HOST")
-            or cfg.get("ixBrowserProxyHost")
+            cfg.get("ixBrowserProxyHost")
             or cfg.get("ixbrowser_proxy_host")
+            or os.environ.get("IXBROWSER_PROXY_HOST")
             or "127.0.0.1"
         ).strip()
         or "127.0.0.1"
     )
+
+
+def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    root = _sd_farm_root_from_state(state)
+    db_path = ""
+    db_error = ""
+    try:
+        found, _candidates = discover_accounts_db(root)
+        db_path = str(found)
+    except SDFarmError as e:
+        db_error = str(e)
+    return {
+        "sdFarmRoot": str(root),
+        "ixBrowserApiBase": _ixbrowser_api_base_from_state(state),
+        "ixBrowserProxyHost": _ixbrowser_proxy_host_from_state(state),
+        "useDocker": bool(state.get("use_docker")),
+        "dbPath": db_path,
+        "dbError": db_error,
+    }
+
+
+def _normalize_sd_farm_settings(payload: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "sdFarmRoot": str(payload.get("sdFarmRoot") or payload.get("sd_farm_root") or "").strip(),
+        "ixBrowserApiBase": str(payload.get("ixBrowserApiBase") or payload.get("ixbrowser_api_base") or "").strip(),
+        "ixBrowserProxyHost": str(
+            payload.get("ixBrowserProxyHost") or payload.get("ixbrowser_proxy_host") or ""
+        ).strip(),
+    }
+
+
+def _apply_sd_farm_settings(state: Dict[str, Any], settings: Dict[str, str]) -> None:
+    with state["lock"]:
+        runtime = dict(state.get("auth_runtime_config") or {})
+        if settings.get("sdFarmRoot"):
+            runtime["sdFarmRoot"] = settings["sdFarmRoot"]
+        if settings.get("ixBrowserApiBase"):
+            runtime["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
+        if settings.get("ixBrowserProxyHost"):
+            runtime["ixBrowserProxyHost"] = settings["ixBrowserProxyHost"]
+        state["auth_runtime_config"] = runtime
+
+
+def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings: Dict[str, str]) -> Optional[str]:
+    store = state.get("db_store")
+    if store is not None:
+        try:
+            cfg = dict(store.load_config())
+        except Exception as e:
+            return f"Could not read config from database: {e}"
+    else:
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            return f"Could not read config: {e}"
+    if not isinstance(cfg, dict):
+        return "Config root must be an object"
+    if settings.get("sdFarmRoot"):
+        cfg["sdFarmRoot"] = settings["sdFarmRoot"]
+    if settings.get("ixBrowserApiBase"):
+        cfg["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
+    if settings.get("ixBrowserProxyHost"):
+        cfg["ixBrowserProxyHost"] = settings["ixBrowserProxyHost"]
+    to_save = _prepare_config_for_disk(cfg)
+    if store is not None:
+        try:
+            store.save_config(to_save)
+            return None
+        except Exception as e:
+            return str(e)
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(to_save, f, indent=2)
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def _validate_sd_farm_settings(settings: Dict[str, str]) -> Optional[str]:
+    root_text = settings.get("sdFarmRoot") or ""
+    if not root_text:
+        return "SD Farm root path is required"
+    root = resolve_sd_farm_root(root_text)
+    if not root.exists():
+        return f"SD Farm root does not exist: {root}"
+    if not root.is_dir():
+        return f"SD Farm root is not a directory: {root}"
+    try:
+        discover_accounts_db(root)
+    except SDFarmError as e:
+        return str(e)
+    return None
 
 
 def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
@@ -4317,6 +4412,10 @@ def _control_api_handler_factory(
                 self._handle_get_upstream_proxies()
             elif path == "/api/sd-farm/accounts":
                 self._handle_get_sd_farm_accounts()
+            elif path == "/api/sd-farm/settings":
+                self._handle_get_sd_farm_settings()
+            elif path == "/api/sd-farm/browse":
+                self._handle_get_sd_farm_browse(parsed.query)
             elif path == "/api/sd-farm/preview-sync":
                 self._handle_get_sd_farm_preview_sync()
             elif path == "/api/provider-auth":
@@ -4611,6 +4710,30 @@ def _control_api_handler_factory(
                 self._send_error_body(err or "Could not load SD Farm accounts", status_code)
                 return
             self._send_json(payload)
+
+        def _handle_get_sd_farm_settings(self) -> None:
+            self._send_json(_sd_farm_settings_payload(state))
+
+        def _handle_get_sd_farm_browse(self, query: str) -> None:
+            params = urllib.parse.parse_qs(query or "")
+            raw_path = (params.get("path") or [""])[0].strip()
+            current_root = _sd_farm_root_from_state(state)
+            if not raw_path:
+                roots = sd_farm_browse_roots(current_root)
+                payload = {
+                    "roots": [root.as_posix() for root in roots],
+                    "path": current_root.as_posix(),
+                }
+                try:
+                    payload.update(browse_directory(current_root))
+                except SDFarmError as e:
+                    payload["error"] = str(e)
+                self._send_json(payload)
+                return
+            try:
+                self._send_json(browse_directory(resolve_sd_farm_root(raw_path)))
+            except SDFarmError as e:
+                self._send_error_body(str(e), 400)
 
         def _handle_get_sd_farm_preview_sync(self) -> None:
             payload, err, status_code = _build_sd_farm_payload(state)
@@ -5313,6 +5436,23 @@ def _control_api_handler_factory(
                 state["auth_routes"] = routes
             self._send_json({"ok": True, "username": username})
 
+        def _handle_post_sd_farm_settings(self) -> None:
+            payload, err = self._read_json_body(64 * 1024)
+            if err or payload is None:
+                self._send_error_body(err or "Invalid request body", 400)
+                return
+            settings = _normalize_sd_farm_settings(payload)
+            validation_err = _validate_sd_farm_settings(settings)
+            if validation_err:
+                self._send_error_body(validation_err, 400)
+                return
+            save_err = _persist_sd_farm_settings(state["config_path"], state, settings)
+            if save_err:
+                self._send_error_body(save_err, 500)
+                return
+            _apply_sd_farm_settings(state, settings)
+            self._send_json({"ok": True, **_sd_farm_settings_payload(state)})
+
         def _handle_post_sd_farm_sync(self) -> None:
             if not self._require_auth_routing():
                 return
@@ -5451,6 +5591,8 @@ def _control_api_handler_factory(
                 self._handle_post_auth_route_restart(parsed.query)
             elif path == "/api/auth-route-delete":
                 self._handle_post_auth_route_delete(parsed.query)
+            elif path == "/api/sd-farm/settings":
+                self._handle_post_sd_farm_settings()
             elif path == "/api/sd-farm/sync":
                 self._handle_post_sd_farm_sync()
             else:
