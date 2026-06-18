@@ -134,6 +134,12 @@ def _ixbrowser_url_for_host_network(url: str) -> str:
     return url
 
 
+def _ixbrowser_request_url(url: str) -> str:
+    if not _running_inside_docker():
+        return url
+    return _ixbrowser_url_for_host_network(url)
+
+
 def _http_post_via_docker_host_network(url: str, payload: Dict[str, Any], timeout: float) -> str:
     client = _docker_client()
     if client is None:
@@ -160,7 +166,6 @@ def _http_post_via_docker_host_network(url: str, payload: Dict[str, Any], timeou
             remove=True,
             stdout=True,
             stderr=True,
-            timeout=timeout_seconds + 20,
         )
     except Exception as e:
         detail = str(e).strip() or repr(e)
@@ -195,7 +200,6 @@ def _discover_windows_host_via_docker_host_network() -> Optional[str]:
             remove=True,
             stdout=True,
             stderr=False,
-            timeout=20,
         )
     except Exception:
         return None
@@ -325,13 +329,12 @@ def probe_ixbrowser_bases(
     candidate_list = [normalize_ixbrowser_api_base(base) for base in candidates if normalize_ixbrowser_api_base(base)]
     wsl_ip = discover_wsl_windows_host_ip()
     recommended_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker else ""
-    host_network = _should_ixbrowser_use_host_network()
 
     for base in candidate_list:
         tried.append(base)
         try:
             profiles = fetch_ixbrowser_profiles(base, page_limit=1, timeout=timeout)
-            working_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker and host_network else base
+            working_base = build_ixbrowser_api_base(wsl_ip) if wsl_ip and use_docker else base
             return {
                 "ok": True,
                 "ixBrowserApiBase": working_base,
@@ -341,7 +344,6 @@ def probe_ixbrowser_bases(
                 "recommendedBase": working_base,
                 "hint": "",
                 "wslHostIp": wsl_ip or "",
-                "hostNetworkUsed": host_network,
             }
         except IXBrowserError as e:
             last_error = str(e)
@@ -359,7 +361,6 @@ def probe_ixbrowser_bases(
         "recommendedBase": recommended_base,
         "hint": hint,
         "wslHostIp": wsl_ip or "",
-        "hostNetworkUsed": host_network,
     }
 
 
@@ -719,29 +720,21 @@ def merge_route_map(
 
 def _json_post(base_url: str, action: str, payload: Dict[str, Any], timeout: float = 20.0) -> Dict[str, Any]:
     base = (base_url or "").rstrip("/") + "/"
-    url = base + action.lstrip("/")
-    if _should_ixbrowser_use_host_network():
-        try:
-            raw = _http_post_via_docker_host_network(url, payload, timeout)
-        except IXBrowserError:
-            raise
-        except Exception as e:
-            raise IXBrowserError(f"ixBrowser request failed: {e}") from e
-    else:
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.URLError as e:
-            raise IXBrowserError(f"ixBrowser request failed: {e}") from e
-        except OSError as e:
-            raise IXBrowserError(f"ixBrowser request failed: {e}") from e
+    url = _ixbrowser_request_url(base + action.lstrip("/"))
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        raise IXBrowserError(f"ixBrowser request failed: {e}") from e
+    except OSError as e:
+        raise IXBrowserError(f"ixBrowser request failed: {e}") from e
     try:
         data = json.loads(raw or "{}")
     except json.JSONDecodeError as e:

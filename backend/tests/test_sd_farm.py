@@ -250,19 +250,35 @@ class SDFarmTests(unittest.TestCase):
         ):
             self.assertEqual(sd_farm.discover_wsl_windows_host_ip(force_refresh=True), "172.19.128.1")
 
-    def test_json_post_uses_docker_host_network_inside_container(self):
+    def test_json_post_rewrites_docker_url_and_uses_direct_http(self):
         payload = {"page": 1, "limit": 1}
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"error": {"code": 0}, "data": {"total": 0, "data": []}}).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            return FakeResponse()
+
         with (
-            patch.object(sd_farm, "_should_ixbrowser_use_host_network", return_value=True),
-            patch.object(
-                sd_farm,
-                "_http_post_via_docker_host_network",
-                return_value='{"error":{"code":0,"message":"success"},"data":{"total":1,"data":[]}}',
-            ) as host_post,
+            patch.object(sd_farm, "_running_inside_docker", return_value=True),
+            patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="172.19.128.1"),
+            patch("urllib.request.urlopen", fake_urlopen),
         ):
             data = sd_farm._json_post("http://host.docker.internal:53200/api/v2/", "profile-list", payload)
-        host_post.assert_called_once()
         self.assertEqual(data["error"]["code"], 0)
+        self.assertEqual(
+            captured["url"],
+            "http://172.19.128.1:53200/api/v2/profile-list",
+        )
 
     def test_ixbrowser_url_for_host_network_rewrites_docker_hosts(self):
         with patch.object(sd_farm, "discover_wsl_windows_host_ip", return_value="172.19.128.1"):
