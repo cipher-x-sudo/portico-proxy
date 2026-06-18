@@ -1,5 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useToast } from '../components/ui/feedback-hooks.js';
+import {
+  findAccountsDbInDirectoryHandle,
+  findAccountsDbInWebkitFiles,
+  importAccountsFile,
+  labelFromWebkitFile,
+  supportsDirectoryPicker,
+} from './sdFarmImport.js';
 import './SDFarm.css';
 
 const filters = [
@@ -12,6 +19,9 @@ const filters = [
 
 const defaultSettings = {
   sdFarmRoot: '',
+  sdFarmSource: 'import',
+  sdFarmImportedAt: '',
+  hasImportedDb: false,
   ixBrowserApiBase: '',
   ixBrowserProxyHost: '127.0.0.1',
   useDocker: false,
@@ -32,6 +42,7 @@ function rowIssue(row) {
 
 export default function SDFarm() {
   const toast = useToast();
+  const folderInputRef = useRef(null);
   const [payload, setPayload] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
@@ -43,32 +54,36 @@ export default function SDFarm() {
   const [settings, setSettings] = useState(defaultSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
-  const [browseOpen, setBrowseOpen] = useState(false);
-  const [browseLoading, setBrowseLoading] = useState(false);
-  const [browseData, setBrowseData] = useState(null);
-  const [browseError, setBrowseError] = useState('');
+  const [importing, setImporting] = useState(false);
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
+
+  const applySettingsPayload = useCallback((data) => {
+    setSettings({
+      sdFarmRoot: data.sdFarmRoot || '',
+      sdFarmSource: data.sdFarmSource || 'import',
+      sdFarmImportedAt: data.sdFarmImportedAt || '',
+      hasImportedDb: Boolean(data.hasImportedDb),
+      ixBrowserApiBase: data.ixBrowserApiBase || '',
+      ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
+      useDocker: Boolean(data.useDocker),
+      dbPath: data.dbPath || '',
+      dbError: data.dbError || '',
+    });
+    setSettingsDirty(false);
+  }, []);
 
   const loadSettings = useCallback(async () => {
     try {
       const res = await fetch('/api/sd-farm/settings');
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to load SD Farm settings');
-      setSettings({
-        sdFarmRoot: data.sdFarmRoot || '',
-        ixBrowserApiBase: data.ixBrowserApiBase || '',
-        ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
-        useDocker: Boolean(data.useDocker),
-        dbPath: data.dbPath || '',
-        dbError: data.dbError || '',
-      });
-      setSettingsDirty(false);
+      applySettingsPayload(data);
     } catch (err) {
       setError(err.message || 'Failed to load SD Farm settings');
     }
-  }, []);
+  }, [applySettingsPayload]);
 
   const loadAccounts = useCallback(async () => {
     setLoading(true);
@@ -96,61 +111,70 @@ export default function SDFarm() {
     setSettingsDirty(true);
   };
 
-  const loadBrowse = useCallback(async (path) => {
-    setBrowseLoading(true);
-    setBrowseError('');
+  const runImport = useCallback(async (file, label, fallbackLabel = '') => {
+    const folderLabel = (label || settings.sdFarmRoot || fallbackLabel || '').trim();
+    if (!folderLabel) {
+      throw new Error('Enter a folder label such as D:\\WORK\\SD Farm');
+    }
+    setImporting(true);
+    setError('');
     try {
-      const query = path ? `?path=${encodeURIComponent(path)}` : '';
-      const res = await fetch(`/api/sd-farm/browse${query}`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to browse folders');
-      setBrowseData(data);
-    } catch (err) {
-      setBrowseError(err.message || 'Failed to browse folders');
+      const data = await importAccountsFile(file, folderLabel);
+      applySettingsPayload(data);
+      toast({
+        title: 'SD Farm imported',
+        message: `${data.accountCount || 0} accounts from ${folderLabel}`,
+        variant: 'success',
+      });
+      await loadAccounts();
+      return data;
     } finally {
-      setBrowseLoading(false);
+      setImporting(false);
     }
-  }, []);
+  }, [applySettingsPayload, loadAccounts, settings.sdFarmRoot, toast]);
 
-  const openBrowse = async () => {
-    setBrowseOpen(true);
-    await loadBrowse(settings.sdFarmRoot || '');
-  };
+  const pickFolderWithDirectoryPicker = useCallback(async () => {
+    const dirHandle = await window.showDirectoryPicker();
+    const file = await findAccountsDbInDirectoryHandle(dirHandle);
+    if (!file) {
+      throw new Error('Could not find accounts.sqlite in the selected folder');
+    }
+    const label = settings.sdFarmRoot.trim() || dirHandle.name;
+    return runImport(file, label, dirHandle.name);
+  }, [runImport, settings.sdFarmRoot]);
 
-  const selectBrowseFolder = (path) => {
-    handleSettingsChange('sdFarmRoot', path);
-    setBrowseOpen(false);
-    toast({
-      title: 'Folder selected',
-      message: path,
-      variant: 'success',
-    });
-  };
-
-  const browseBreadcrumbs = useMemo(() => {
-    const current = browseData?.path || '';
-    if (!current) return [];
-    const normalized = current.replace(/\\/g, '/');
-    if (normalized === '/') return [{ label: '/', path: '/' }];
-    const isWindowsDrive = /^[A-Za-z]:\//.test(normalized);
-    const parts = normalized.split('/').filter(Boolean);
-    const crumbs = [];
-    if (isWindowsDrive && parts.length > 0) {
-      let acc = `${parts[0]}/`;
-      crumbs.push({ label: parts[0], path: acc });
-      for (let i = 1; i < parts.length; i += 1) {
-        acc = `${acc.replace(/\/$/, '')}/${parts[i]}`;
-        crumbs.push({ label: parts[i], path: acc });
+  const pickFolder = useCallback(async () => {
+    if (supportsDirectoryPicker()) {
+      try {
+        await pickFolderWithDirectoryPicker();
+      } catch (err) {
+        if (err?.name === 'AbortError') return;
+        throw err;
       }
-      return crumbs;
+      return;
     }
-    let acc = '';
-    for (const part of parts) {
-      acc = `${acc}/${part}`;
-      crumbs.push({ label: part, path: acc });
+    folderInputRef.current?.click();
+  }, [pickFolderWithDirectoryPicker]);
+
+  const handleFolderInputChange = async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (!files.length) return;
+    const file = findAccountsDbInWebkitFiles(files);
+    if (!file) {
+      setError('Could not find accounts.sqlite in the selected folder');
+      toast({ title: 'Import failed', message: 'Could not find accounts.sqlite in the selected folder', variant: 'danger' });
+      return;
     }
-    return crumbs;
-  }, [browseData?.path]);
+    const derivedLabel = labelFromWebkitFile(file);
+    const label = settings.sdFarmRoot.trim() || derivedLabel;
+    try {
+      await runImport(file, label, derivedLabel);
+    } catch (err) {
+      setError(err.message || 'Import failed');
+      toast({ title: 'Import failed', message: err.message || 'Import failed', variant: 'danger' });
+    }
+  };
 
   const saveSettings = async () => {
     setBusy('settings');
@@ -167,15 +191,7 @@ export default function SDFarm() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to save SD Farm settings');
-      setSettings({
-        sdFarmRoot: data.sdFarmRoot || '',
-        ixBrowserApiBase: data.ixBrowserApiBase || '',
-        ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
-        useDocker: Boolean(data.useDocker),
-        dbPath: data.dbPath || '',
-        dbError: data.dbError || '',
-      });
-      setSettingsDirty(false);
+      applySettingsPayload(data);
       toast({
         title: 'SD Farm settings saved',
         message: data.dbPath ? `Using ${data.dbPath}` : 'Settings updated.',
@@ -185,6 +201,20 @@ export default function SDFarm() {
     } catch (err) {
       setError(err.message || 'Failed to save SD Farm settings');
       toast({ title: 'Save failed', message: err.message || 'Failed to save SD Farm settings', variant: 'danger' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const handlePickFolder = async () => {
+    setBusy('import');
+    setError('');
+    try {
+      await pickFolder();
+    } catch (err) {
+      if (err?.name === 'AbortError') return;
+      setError(err.message || 'Folder import failed');
+      toast({ title: 'Import failed', message: err.message || 'Folder import failed', variant: 'danger' });
     } finally {
       setBusy('');
     }
@@ -337,117 +367,53 @@ export default function SDFarm() {
         </div>
         {settingsOpen && (
           <div className="sd-farm-settings-body">
+            <input
+              ref={folderInputRef}
+              type="file"
+              className="sd-farm-folder-input"
+              webkitdirectory=""
+              directory=""
+              onChange={handleFolderInputChange}
+            />
             <div className="form-group">
-              <label htmlFor="sd-farm-root">SD Farm root folder</label>
+              <label htmlFor="sd-farm-root">SD Farm folder label</label>
               <div className="sd-farm-root-row">
                 <input
                   id="sd-farm-root"
                   type="text"
                   className="premium-input"
-                  placeholder={settings.useDocker ? '/sd-farm' : 'H:/SD Farm'}
+                  placeholder="D:\WORK\SD Farm"
                   value={settings.sdFarmRoot}
                   onChange={(event) => handleSettingsChange('sdFarmRoot', event.target.value)}
                 />
                 <button
                   type="button"
                   className="btn-outline sd-farm-browse-btn"
-                  onClick={openBrowse}
-                  disabled={Boolean(busy)}
+                  onClick={handlePickFolder}
+                  disabled={Boolean(busy) || importing}
                 >
                   <span className="material-symbols-outlined">folder_open</span>
-                  Browse
+                  Select folder
+                </button>
+                <button
+                  type="button"
+                  className="btn-outline sd-farm-browse-btn"
+                  onClick={handlePickFolder}
+                  disabled={Boolean(busy) || importing || !settings.hasImportedDb}
+                >
+                  <span className="material-symbols-outlined">sync</span>
+                  Re-import
                 </button>
               </div>
-              {browseOpen && (
-                <div className="sd-farm-browse-panel">
-                  <div className="sd-farm-browse-toolbar">
-                    <div className="sd-farm-browse-crumbs">
-                      {browseBreadcrumbs.map((crumb) => (
-                        <button
-                          key={crumb.path}
-                          type="button"
-                          className="sd-farm-browse-crumb"
-                          onClick={() => loadBrowse(crumb.path)}
-                        >
-                          {crumb.label}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="sd-farm-browse-toolbar-actions">
-                      {browseData?.parent && (
-                        <button
-                          type="button"
-                          className="btn-outline"
-                          onClick={() => loadBrowse(browseData.parent)}
-                          disabled={browseLoading}
-                        >
-                          <span className="material-symbols-outlined">arrow_upward</span>
-                          Up
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        onClick={() => selectBrowseFolder(browseData?.path || settings.sdFarmRoot)}
-                        disabled={browseLoading || !browseData?.path}
-                      >
-                        Select folder
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-outline"
-                        onClick={() => setBrowseOpen(false)}
-                      >
-                        Close
-                      </button>
-                    </div>
-                  </div>
-                  {browseError && <p className="sd-farm-browse-error">{browseError}</p>}
-                  {browseLoading && (
-                    <div className="sd-farm-browse-loading">
-                      <span className="material-symbols-outlined loading-spinner">progress_activity</span>
-                      Loading folders...
-                    </div>
-                  )}
-                  {!browseLoading && browseData && (
-                    <>
-                      {browseData.hasAccountsDb && (
-                        <p className="sd-farm-browse-db-hint">
-                          Database found here: <strong>{browseData.accountsDbPath}</strong>
-                        </p>
-                      )}
-                      <ul className="sd-farm-browse-list">
-                        {(browseData.entries || []).map((entry) => (
-                          <li key={entry.path}>
-                            <button
-                              type="button"
-                              className="sd-farm-browse-item"
-                              onClick={() => loadBrowse(entry.path)}
-                            >
-                              <span className="material-symbols-outlined">folder</span>
-                              <span className="sd-farm-browse-item-name">{entry.name}</span>
-                              {entry.hasAccountsDb && (
-                                <span className="sd-farm-browse-badge">accounts.sqlite</span>
-                              )}
-                            </button>
-                          </li>
-                        ))}
-                        {(browseData.entries || []).length === 0 && (
-                          <li className="sd-farm-browse-empty">No subfolders here.</li>
-                        )}
-                      </ul>
-                      {browseData.truncated && (
-                        <p className="sd-farm-settings-hint">Showing the first folders only.</p>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
               <p className="sd-farm-settings-hint">
-                {settings.useDocker
-                  ? 'Use the container path (usually /sd-farm). Mount your host folder in docker-compose with SD_FARM_HOST_PATH.'
-                  : 'Folder that contains DB/data/accounts.sqlite, or any folder with accounts.sqlite inside it.'}
+                Pick your SD Farm folder on this PC. The path is saved as a label only; Portico imports
+                accounts.sqlite into its own storage. Use Re-import when SD Farm updates the database.
               </p>
+              {settings.sdFarmImportedAt && (
+                <p className="sd-farm-settings-hint">
+                  Last imported: {settings.sdFarmImportedAt}
+                </p>
+              )}
             </div>
             <div className="sd-farm-settings-grid">
               <div className="form-group">
@@ -482,10 +448,10 @@ export default function SDFarm() {
                 type="button"
                 className="btn-primary"
                 onClick={saveSettings}
-                disabled={Boolean(busy) || !settingsDirty}
+                disabled={Boolean(busy) || importing || !settingsDirty}
               >
                 <span className="material-symbols-outlined">save</span>
-                Save path
+                Save label
               </button>
             </div>
           </div>

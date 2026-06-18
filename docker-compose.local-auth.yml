@@ -63,6 +63,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ovpn_data:/ovpn
+      - sd_farm_data:/data/sd-farm
       - type: bind
         source: ${SD_FARM_HOST_PATH:-H:/SD Farm}
         target: /sd-farm
@@ -104,3 +105,4 @@ volumes:
   postgres_auth_data:
   ovpn_data:
     name: ovpn_data
+  sd_farm_data:

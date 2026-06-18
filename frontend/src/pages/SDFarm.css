@@ -1,7 +1,12 @@
+.sd-farm-folder-input {
+  display: none;
+}
+
 .sd-farm-root-row {
   display: flex;
   gap: 0.65rem;
   align-items: stretch;
+  flex-wrap: wrap;
 }
 
 .sd-farm-root-row .premium-input {

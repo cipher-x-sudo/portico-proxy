@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 DEFAULT_DB_RELATIVE_PATH = Path("DB") / "data" / "accounts.sqlite"
+IMPORTED_DB_PATH = Path("/data/sd-farm/accounts.sqlite")
+SD_FARM_IMPORT_MAX_BYTES = 64 * 1024 * 1024
 ACCOUNT_COLUMNS = ("UID", "Name", "OpenVPN", "Proxy", "Status", "Current_Status")
 
 
@@ -25,6 +27,36 @@ class IXBrowserError(RuntimeError):
 def resolve_sd_farm_root(raw: str) -> Path:
     value = (raw or "").strip() or "/sd-farm"
     return Path(value).expanduser()
+
+
+def sd_farm_source_value(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return "import" if value == "import" else "server"
+
+
+def save_imported_accounts_db(data: bytes, dest: Path = IMPORTED_DB_PATH) -> int:
+    if not data:
+        raise SDFarmError("Empty database file")
+    if len(data) > SD_FARM_IMPORT_MAX_BYTES:
+        raise SDFarmError(f"Database file is too large (max {SD_FARM_IMPORT_MAX_BYTES // (1024 * 1024)} MB)")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f"{dest.name}.tmp")
+    try:
+        tmp.write_bytes(data)
+        load_accounts(tmp, limit=1)
+        account_count = len(load_accounts(tmp))
+    except SDFarmError:
+        tmp.unlink(missing_ok=True)
+        raise
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise SDFarmError(f"Could not save imported database: {e}") from e
+    try:
+        tmp.replace(dest)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise SDFarmError(f"Could not save imported database: {e}") from e
+    return account_count
 
 
 def _path_key(path: Path) -> str:

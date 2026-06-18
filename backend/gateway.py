@@ -58,6 +58,8 @@ from provider_auth import load_provider_auth
 from sd_farm import (
     IXBrowserError,
     SDFarmError,
+    IMPORTED_DB_PATH,
+    SD_FARM_IMPORT_MAX_BYTES,
     browse_directory,
     build_account_rows as build_sd_farm_account_rows,
     discover_accounts_db,
@@ -65,7 +67,9 @@ from sd_farm import (
     load_accounts as load_sd_farm_accounts,
     resolve_sd_farm_root,
     route_username_for_uid,
+    save_imported_accounts_db,
     sd_farm_browse_roots,
+    sd_farm_source_value,
     update_ixbrowser_profile_proxy,
 )
 from upstream_proxy import (
@@ -895,6 +899,21 @@ def _sd_farm_root_from_state(state: Dict[str, Any]) -> Path:
     return resolve_sd_farm_root(str(configured))
 
 
+def _sd_farm_root_label_from_state(state: Dict[str, Any]) -> str:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    return str(cfg.get("sdFarmRoot") or cfg.get("sd_farm_root") or "").strip()
+
+
+def _sd_farm_source_from_state(state: Dict[str, Any]) -> str:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    return sd_farm_source_value(cfg.get("sdFarmSource") or cfg.get("sd_farm_source"))
+
+
+def _sd_farm_imported_at_from_state(state: Dict[str, Any]) -> str:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    return str(cfg.get("sdFarmImportedAt") or cfg.get("sd_farm_imported_at") or "").strip()
+
+
 def _ixbrowser_api_base_from_state(state: Dict[str, Any]) -> str:
     cfg = dict(state.get("auth_runtime_config") or {})
     configured = (
@@ -921,16 +940,34 @@ def _ixbrowser_proxy_host_from_state(state: Dict[str, Any]) -> str:
 
 
 def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    source = _sd_farm_source_from_state(state)
+    label = _sd_farm_root_label_from_state(state)
     root = _sd_farm_root_from_state(state)
     db_path = ""
     db_error = ""
-    try:
-        found, _candidates = discover_accounts_db(root)
-        db_path = str(found)
-    except SDFarmError as e:
-        db_error = str(e)
+    has_imported_db = IMPORTED_DB_PATH.is_file()
+    if source == "import":
+        if has_imported_db:
+            db_path = str(IMPORTED_DB_PATH)
+            try:
+                load_sd_farm_accounts(IMPORTED_DB_PATH, limit=1)
+            except SDFarmError as e:
+                db_error = str(e)
+        elif not label:
+            db_error = "No SD Farm folder imported yet"
+        else:
+            db_error = "Imported database file is missing"
+    else:
+        try:
+            found, _candidates = discover_accounts_db(root)
+            db_path = str(found)
+        except SDFarmError as e:
+            db_error = str(e)
     return {
-        "sdFarmRoot": str(root),
+        "sdFarmRoot": label or str(root),
+        "sdFarmSource": source,
+        "sdFarmImportedAt": _sd_farm_imported_at_from_state(state),
+        "hasImportedDb": has_imported_db,
         "ixBrowserApiBase": _ixbrowser_api_base_from_state(state),
         "ixBrowserProxyHost": _ixbrowser_proxy_host_from_state(state),
         "useDocker": bool(state.get("use_docker")),
@@ -954,6 +991,10 @@ def _apply_sd_farm_settings(state: Dict[str, Any], settings: Dict[str, str]) -> 
         runtime = dict(state.get("auth_runtime_config") or {})
         if settings.get("sdFarmRoot"):
             runtime["sdFarmRoot"] = settings["sdFarmRoot"]
+        if settings.get("sdFarmSource"):
+            runtime["sdFarmSource"] = settings["sdFarmSource"]
+        if settings.get("sdFarmImportedAt"):
+            runtime["sdFarmImportedAt"] = settings["sdFarmImportedAt"]
         if settings.get("ixBrowserApiBase"):
             runtime["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
         if settings.get("ixBrowserProxyHost"):
@@ -961,7 +1002,7 @@ def _apply_sd_farm_settings(state: Dict[str, Any], settings: Dict[str, str]) -> 
         state["auth_runtime_config"] = runtime
 
 
-def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings: Dict[str, str]) -> Optional[str]:
+def _persist_sd_farm_config_fields(config_path: Path, state: Dict[str, Any], fields: Dict[str, Any]) -> Optional[str]:
     store = state.get("db_store")
     if store is not None:
         try:
@@ -976,12 +1017,9 @@ def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings
             return f"Could not read config: {e}"
     if not isinstance(cfg, dict):
         return "Config root must be an object"
-    if settings.get("sdFarmRoot"):
-        cfg["sdFarmRoot"] = settings["sdFarmRoot"]
-    if settings.get("ixBrowserApiBase"):
-        cfg["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
-    if settings.get("ixBrowserProxyHost"):
-        cfg["ixBrowserProxyHost"] = settings["ixBrowserProxyHost"]
+    for key, value in fields.items():
+        if value is not None and value != "":
+            cfg[key] = value
     to_save = _prepare_config_for_disk(cfg)
     if store is not None:
         try:
@@ -997,10 +1035,28 @@ def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings
     return None
 
 
-def _validate_sd_farm_settings(settings: Dict[str, str]) -> Optional[str]:
+def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings: Dict[str, str]) -> Optional[str]:
+    fields: Dict[str, Any] = {}
+    if settings.get("sdFarmRoot"):
+        fields["sdFarmRoot"] = settings["sdFarmRoot"]
+    if settings.get("sdFarmSource"):
+        fields["sdFarmSource"] = settings["sdFarmSource"]
+    if settings.get("sdFarmImportedAt"):
+        fields["sdFarmImportedAt"] = settings["sdFarmImportedAt"]
+    if settings.get("ixBrowserApiBase"):
+        fields["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
+    if settings.get("ixBrowserProxyHost"):
+        fields["ixBrowserProxyHost"] = settings["ixBrowserProxyHost"]
+    return _persist_sd_farm_config_fields(config_path, state, fields)
+
+
+def _validate_sd_farm_settings(state: Dict[str, Any], settings: Dict[str, str]) -> Optional[str]:
     root_text = settings.get("sdFarmRoot") or ""
     if not root_text:
-        return "SD Farm root path is required"
+        return "SD Farm folder label is required"
+    source = sd_farm_source_value(settings.get("sdFarmSource")) if settings.get("sdFarmSource") else _sd_farm_source_from_state(state)
+    if source == "import":
+        return None
     root = resolve_sd_farm_root(root_text)
     if not root.exists():
         return f"SD Farm root does not exist: {root}"
@@ -1013,10 +1069,21 @@ def _validate_sd_farm_settings(settings: Dict[str, str]) -> Optional[str]:
     return None
 
 
-def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+def _resolve_sd_farm_db(state: Dict[str, Any]) -> Tuple[Path, List[Path], str]:
+    source = _sd_farm_source_from_state(state)
+    label = _sd_farm_root_label_from_state(state)
+    if source == "import":
+        if not IMPORTED_DB_PATH.is_file():
+            raise SDFarmError("No imported SD Farm database found. Select a folder to import accounts.sqlite.")
+        return IMPORTED_DB_PATH, [IMPORTED_DB_PATH], label or str(IMPORTED_DB_PATH)
     root = _sd_farm_root_from_state(state)
+    db_path, candidates = discover_accounts_db(root)
+    return db_path, candidates, str(root)
+
+
+def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
     try:
-        db_path, candidates = discover_accounts_db(root)
+        db_path, candidates, root_label = _resolve_sd_farm_db(state)
         accounts = load_sd_farm_accounts(db_path)
     except SDFarmError as e:
         return None, str(e), 400
@@ -1039,7 +1106,8 @@ def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
     rows = build_sd_farm_account_rows(accounts, allowed_ovpn, profiles)
     valid_count = sum(1 for row in rows if row.get("valid"))
     return {
-        "root": str(root),
+        "root": root_label,
+        "sdFarmSource": _sd_farm_source_from_state(state),
         "dbPath": str(db_path),
         "dbCandidates": [str(p) for p in candidates[:10]],
         "ixBrowserApiBase": ix_base,
@@ -4823,6 +4891,55 @@ def _control_api_handler_factory(
             }
             return payload, None, 200
 
+        def _read_sd_farm_import_form(self) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                return None, "Invalid Content-Length", 400
+            if content_length <= 0:
+                return None, "Invalid Content-Length", 400
+            if content_length > SD_FARM_IMPORT_MAX_BYTES + (256 * 1024):
+                return None, "Upload is too large", 413
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("multipart/form-data"):
+                return None, "Content-Type must be multipart/form-data", 400
+            try:
+                body = self.rfile.read(content_length)
+                raw_message = (
+                    f"Content-Type: {content_type}\r\n"
+                    "MIME-Version: 1.0\r\n\r\n"
+                ).encode("utf-8") + body
+                message = BytesParser(policy=email_policy).parsebytes(raw_message)
+            except Exception as e:
+                return None, str(e), 400
+            if not message.is_multipart():
+                return None, "Invalid multipart body", 400
+
+            text_fields: Dict[str, str] = {}
+            file_data = b""
+            for part in message.iter_parts():
+                if part.get_content_disposition() != "form-data":
+                    continue
+                name = str(part.get_param("name", header="content-disposition") or "")
+                if not name:
+                    continue
+                filename = part.get_filename()
+                payload_bytes = part.get_payload(decode=True) or b""
+                if filename is None:
+                    if name not in text_fields:
+                        charset = part.get_content_charset() or "utf-8"
+                        text_fields[name] = payload_bytes.decode(charset, errors="replace")
+                    continue
+                if name in ("file", "database", "accounts"):
+                    file_data = payload_bytes
+
+            if not file_data:
+                return None, "Missing accounts.sqlite upload", 400
+            return {
+                "sdFarmRoot": text_fields.get("sdFarmRoot", "").strip(),
+                "file": file_data,
+            }, None, 200
+
         def _runtime_config_for_apply(self) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
             runtime_config, load_err, load_status = load_disk_config_expanded(state["config_path"])
             if load_err or runtime_config is None:
@@ -5442,7 +5559,7 @@ def _control_api_handler_factory(
                 self._send_error_body(err or "Invalid request body", 400)
                 return
             settings = _normalize_sd_farm_settings(payload)
-            validation_err = _validate_sd_farm_settings(settings)
+            validation_err = _validate_sd_farm_settings(state, settings)
             if validation_err:
                 self._send_error_body(validation_err, 400)
                 return
@@ -5452,6 +5569,36 @@ def _control_api_handler_factory(
                 return
             _apply_sd_farm_settings(state, settings)
             self._send_json({"ok": True, **_sd_farm_settings_payload(state)})
+
+        def _handle_post_sd_farm_import(self) -> None:
+            payload, err, status_code = self._read_sd_farm_import_form()
+            if err or payload is None:
+                self._send_error_body(err or "Invalid import upload", status_code)
+                return
+            label = str(payload.get("sdFarmRoot") or "").strip()
+            if not label:
+                return self._send_error_body("SD Farm folder label is required", 400)
+            try:
+                account_count = save_imported_accounts_db(bytes(payload.get("file") or b""))
+            except SDFarmError as e:
+                return self._send_error_body(str(e), 400)
+            imported_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            settings = {
+                "sdFarmRoot": label,
+                "sdFarmSource": "import",
+                "sdFarmImportedAt": imported_at,
+            }
+            save_err = _persist_sd_farm_settings(state["config_path"], state, settings)
+            if save_err:
+                return self._send_error_body(save_err, 500)
+            _apply_sd_farm_settings(state, settings)
+            self._send_json(
+                {
+                    "ok": True,
+                    "accountCount": account_count,
+                    **_sd_farm_settings_payload(state),
+                }
+            )
 
         def _handle_post_sd_farm_sync(self) -> None:
             if not self._require_auth_routing():
@@ -5593,6 +5740,8 @@ def _control_api_handler_factory(
                 self._handle_post_auth_route_delete(parsed.query)
             elif path == "/api/sd-farm/settings":
                 self._handle_post_sd_farm_settings()
+            elif path == "/api/sd-farm/import":
+                self._handle_post_sd_farm_import()
             elif path == "/api/sd-farm/sync":
                 self._handle_post_sd_farm_sync()
             else:

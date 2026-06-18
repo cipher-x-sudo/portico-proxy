@@ -78,6 +78,18 @@ class SDFarmTests(unittest.TestCase):
             self.assertTrue(db_entry["hasAccountsDb"])
             self.assertEqual(Path(db_entry["accountsDbPath"]).resolve(), db.resolve())
 
+    def test_save_imported_accounts_db_writes_and_validates(self):
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "accounts.sqlite"
+            db = Path(tmp) / "source" / "DB" / "data" / "accounts.sqlite"
+            _create_accounts_db(db)
+            data = db.read_bytes()
+            count = sd_farm.save_imported_accounts_db(data, dest)
+            self.assertEqual(count, 1)
+            self.assertTrue(dest.is_file())
+            rows = sd_farm.load_accounts(dest)
+            self.assertEqual(rows[0]["UID"], "61560173093090")
+
     def test_matches_sd_farm_openvpn_to_portico_ovpn_file(self):
         matched, err = sd_farm.match_ovpn(
             "NCVPN-US-Phoenix-UDP",
@@ -177,13 +189,53 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
                 "ixBrowserProxyHost": "127.0.0.1",
             }
 
-            self.assertIsNone(gateway._validate_sd_farm_settings(settings))
+            self.assertIsNone(gateway._validate_sd_farm_settings(state, settings))
             self.assertIsNone(gateway._persist_sd_farm_settings(config_path, state, settings))
             gateway._apply_sd_farm_settings(state, settings)
 
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["sdFarmRoot"], str(root))
             self.assertEqual(gateway._sd_farm_settings_payload(state)["dbPath"], str(db))
+
+    def test_validate_import_label_does_not_require_server_path(self):
+        state = {
+            "auth_runtime_config": {"sdFarmSource": "import"},
+            "use_docker": True,
+        }
+        settings = {"sdFarmRoot": r"D:\WORK\SD Farm"}
+        self.assertIsNone(gateway._validate_sd_farm_settings(state, settings))
+
+    def test_build_payload_reads_imported_database(self):
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "accounts.sqlite"
+            db = Path(tmp) / "source" / "DB" / "data" / "accounts.sqlite"
+            _create_accounts_db(db)
+            sd_farm.save_imported_accounts_db(db.read_bytes(), dest)
+            state = {
+                "lock": threading.Lock(),
+                "config_path": BACKEND_DIR / "openvpn-proxy-config.example.json",
+                "auth_runtime_config": {
+                    "sdFarmSource": "import",
+                    "sdFarmRoot": r"D:\WORK\SD Farm",
+                },
+                "use_docker": True,
+            }
+            with (
+                patch.object(sd_farm, "IMPORTED_DB_PATH", dest),
+                patch.object(gateway, "IMPORTED_DB_PATH", dest),
+                patch.object(gateway, "load_disk_config_expanded", return_value=({"locations": []}, None, 200)),
+                patch.object(gateway, "merge_expanded_locations_from_disk", side_effect=lambda cfg, _docker: cfg),
+                patch.object(gateway, "list_allowed_ovpn_files", return_value=[]),
+                patch.object(gateway, "fetch_ixbrowser_profiles", return_value=[]),
+            ):
+                payload, err, status = gateway._build_sd_farm_payload(state)
+            self.assertIsNone(err)
+            self.assertEqual(status, 200)
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertEqual(payload["root"], r"D:\WORK\SD Farm")
+            self.assertEqual(payload["sdFarmSource"], "import")
+            self.assertEqual(payload["accountCount"], 1)
 
     def test_upsert_updates_existing_external_id_route(self):
         state = {
