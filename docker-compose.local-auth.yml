@@ -47,8 +47,8 @@ services:
     environment:
       - USE_DOCKER=1
       - AUTH_ROUTING_ENABLED=1
-      - AUTH_HTTP_PORT=58080
-      - AUTH_SOCKS_PORT=58081
+      - AUTH_HTTP_PORT=${AUTH_HTTP_PORT:-58680}
+      - AUTH_SOCKS_PORT=${AUTH_SOCKS_PORT:-58681}
       - PROXY_GLOBAL_PASSWORD=${PROXY_GLOBAL_PASSWORD:-huzaifa}
       - DOCKER_IMAGE=portico-worker
       - DOCKER_NETWORK=proxynet
@@ -57,13 +57,20 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_STATE_KEY=portico:auth-routing-state
       - DATABASE_URL=postgresql://portico:portico@postgres:5432/portico
+      - SD_FARM_ROOT=${SD_FARM_ROOT:-/sd-farm}
+      - IXBROWSER_API_BASE=${IXBROWSER_API_BASE:-http://host.docker.internal:53200/api/v2/}
+      - IXBROWSER_PROXY_HOST=${IXBROWSER_PROXY_HOST:-127.0.0.1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ovpn_data:/ovpn
+      - type: bind
+        source: ${SD_FARM_HOST_PATH:-H:/SD Farm}
+        target: /sd-farm
+        read_only: true
     ports:
       - "127.0.0.1:49999:49999"
-      - "0.0.0.0:58080:58080"
-      - "0.0.0.0:58081:58081"
+      - "0.0.0.0:${AUTH_HTTP_PORT:-58680}:${AUTH_HTTP_PORT:-58680}"
+      - "0.0.0.0:${AUTH_SOCKS_PORT:-58681}:${AUTH_SOCKS_PORT:-58681}"
     ulimits:
       nofile:
         soft: 65536

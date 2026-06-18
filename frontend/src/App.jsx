@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard';
 import Status from './pages/Status';
 import Config from './pages/Config';
 import Actions from './pages/Actions';
+import SDFarm from './pages/SDFarm';
 import './App.css';
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'portico-sidebar-collapsed';
@@ -68,6 +69,8 @@ function App() {
         return <Config />;
       case 'actions':
         return <Actions />;
+      case 'sd-farm':
+        return <SDFarm />;
       default:
         return <Dashboard />;
     }
@@ -79,6 +82,7 @@ function App() {
       case 'status': return 'System status';
       case 'config': return 'Configuration';
       case 'actions': return 'Logs & actions';
+      case 'sd-farm': return 'SD Farm';
       default: return 'Dashboard';
     }
   };

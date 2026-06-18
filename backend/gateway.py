@@ -55,6 +55,17 @@ from ovpn_filter import (
 )
 from openvpn_proxy_runner import resolve_ovpn_path, start_one_location, start_one_upstream_proxy
 from provider_auth import load_provider_auth
+from sd_farm import (
+    IXBrowserError,
+    SDFarmError,
+    build_account_rows as build_sd_farm_account_rows,
+    discover_accounts_db,
+    fetch_ixbrowser_profiles,
+    load_accounts as load_sd_farm_accounts,
+    resolve_sd_farm_root,
+    route_username_for_uid,
+    update_ixbrowser_profile_proxy,
+)
 from upstream_proxy import (
     UpstreamProxyError,
     import_proxy_lines,
@@ -869,6 +880,150 @@ def _persist_auth_routes_config(config_path: Path, state: Dict[str, Any], routes
     except OSError as e:
         return str(e)
     return None
+
+
+def _sd_farm_root_from_state(state: Dict[str, Any]) -> Path:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    configured = (
+        os.environ.get("SD_FARM_ROOT")
+        or cfg.get("sdFarmRoot")
+        or cfg.get("sd_farm_root")
+        or "/sd-farm"
+    )
+    return resolve_sd_farm_root(str(configured))
+
+
+def _ixbrowser_api_base_from_state(state: Dict[str, Any]) -> str:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    configured = (
+        os.environ.get("IXBROWSER_API_BASE")
+        or cfg.get("ixBrowserApiBase")
+        or cfg.get("ixbrowser_api_base")
+    )
+    if configured:
+        return str(configured).strip()
+    return "http://host.docker.internal:53200/api/v2/" if state.get("use_docker") else "http://127.0.0.1:53200/api/v2/"
+
+
+def _ixbrowser_proxy_host_from_state(state: Dict[str, Any]) -> str:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    return (
+        str(
+            os.environ.get("IXBROWSER_PROXY_HOST")
+            or cfg.get("ixBrowserProxyHost")
+            or cfg.get("ixbrowser_proxy_host")
+            or "127.0.0.1"
+        ).strip()
+        or "127.0.0.1"
+    )
+
+
+def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    root = _sd_farm_root_from_state(state)
+    try:
+        db_path, candidates = discover_accounts_db(root)
+        accounts = load_sd_farm_accounts(db_path)
+    except SDFarmError as e:
+        return None, str(e), 400
+
+    config_path = state["config_path"]
+    runtime_config, load_err, load_status = load_disk_config_expanded(config_path)
+    if load_err or runtime_config is None:
+        return None, load_err or "Could not load config", load_status
+    runtime_config = merge_expanded_locations_from_disk(runtime_config, bool(state.get("use_docker")))
+    allowed_ovpn = list_allowed_ovpn_files(runtime_config, config_path, bool(state.get("use_docker")))
+
+    ix_error = ""
+    profiles: List[Dict[str, Any]] = []
+    ix_base = _ixbrowser_api_base_from_state(state)
+    try:
+        profiles = fetch_ixbrowser_profiles(ix_base)
+    except IXBrowserError as e:
+        ix_error = str(e)
+
+    rows = build_sd_farm_account_rows(accounts, allowed_ovpn, profiles)
+    valid_count = sum(1 for row in rows if row.get("valid"))
+    return {
+        "root": str(root),
+        "dbPath": str(db_path),
+        "dbCandidates": [str(p) for p in candidates[:10]],
+        "ixBrowserApiBase": ix_base,
+        "ixBrowserOk": not bool(ix_error),
+        "ixBrowserError": ix_error,
+        "ixBrowserProfileCount": len(profiles),
+        "ovpnCount": len(allowed_ovpn),
+        "accountCount": len(rows),
+        "validCount": valid_count,
+        "warningCount": len(rows) - valid_count,
+        "rows": rows,
+    }, None, 200
+
+
+def _upsert_sd_farm_auth_routes(
+    state: Dict[str, Any],
+    rows: Iterable[Dict[str, Any]],
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], List[str]]:
+    target_rows = [row for row in rows if row.get("valid")]
+    with state["lock"]:
+        routes = [dict(r) for r in (state.get("auth_routes") or [])]
+    changed_usernames: List[str] = []
+    for row in target_rows:
+        uid = str(row.get("uid") or "").strip()
+        username = route_username_for_uid(uid)
+        route = {
+            "index": 0,
+            "username": username,
+            "label": str(row.get("name") or uid or username).strip() or username,
+            "externalId": uid,
+            "proxyType": "http",
+            "rotationIntervalMinutes": 0,
+            "rotationCountry": "",
+            "rotationLastRun": 0.0,
+            "enabled": True,
+            "egress": {"type": "ovpn", "ovpn": str(row.get("matchedOvpn") or "").strip()},
+        }
+        existing_idx = next(
+            (
+                i
+                for i, existing in enumerate(routes)
+                if (existing.get("username") or "") == username
+                or (uid and (existing.get("externalId") or existing.get("external_id") or "") == uid)
+            ),
+            None,
+        )
+        if existing_idx is None:
+            route["index"] = len(routes)
+            routes.append(route)
+        else:
+            old_username = str(routes[existing_idx].get("username") or "")
+            route["index"] = existing_idx
+            routes[existing_idx] = route
+            if old_username:
+                changed_usernames.append(old_username)
+        changed_usernames.append(username)
+    for i, route in enumerate(routes):
+        route["index"] = i
+
+    save_err = _persist_auth_routes_config(state["config_path"], state, routes)
+    if save_err:
+        return None, save_err, []
+    for username in sorted(set(changed_usernames)):
+        _stop_auth_route_backends(state, username, "both")
+    with state["lock"]:
+        state["auth_routes"] = routes
+        runtime = dict(state.get("auth_runtime_config") or {})
+        auth_cfg = dict(_auth_routing_dict(runtime))
+        auth_cfg.update(
+            {
+                "enabled": True,
+                "httpPort": state.get("auth_http_port"),
+                "socksPort": state.get("auth_socks_port"),
+                "routes": routes,
+            }
+        )
+        runtime["authRouting"] = auth_cfg
+        state["auth_runtime_config"] = runtime
+    return routes, None, sorted(set(changed_usernames))
 
 
 def apply_openvpn_auth_env(config: Dict[str, Any]) -> None:
@@ -4160,6 +4315,10 @@ def _control_api_handler_factory(
                 self._handle_get_ovpn_files()
             elif path == "/api/upstream-proxies":
                 self._handle_get_upstream_proxies()
+            elif path == "/api/sd-farm/accounts":
+                self._handle_get_sd_farm_accounts()
+            elif path == "/api/sd-farm/preview-sync":
+                self._handle_get_sd_farm_preview_sync()
             elif path == "/api/provider-auth":
                 self._handle_get_provider_auth()
             elif path == "/api/logs":
@@ -4445,6 +4604,32 @@ def _control_api_handler_factory(
                     "count": len(profiles),
                 }
             )
+
+        def _handle_get_sd_farm_accounts(self) -> None:
+            payload, err, status_code = _build_sd_farm_payload(state)
+            if err or payload is None:
+                self._send_error_body(err or "Could not load SD Farm accounts", status_code)
+                return
+            self._send_json(payload)
+
+        def _handle_get_sd_farm_preview_sync(self) -> None:
+            payload, err, status_code = _build_sd_farm_payload(state)
+            if err or payload is None:
+                self._send_error_body(err or "Could not build SD Farm sync preview", status_code)
+                return
+            rows = list(payload.get("rows") or [])
+            payload["syncPreview"] = [
+                {
+                    "uid": row.get("uid") or "",
+                    "routeUsername": row.get("routeUsername") or "",
+                    "browserProfileId": row.get("browserProfileId") or "",
+                    "matchedOvpn": row.get("matchedOvpn") or "",
+                    "action": "sync" if row.get("valid") else "skip",
+                    "warnings": row.get("warnings") or [],
+                }
+                for row in rows
+            ]
+            self._send_json(payload)
 
         def _read_json_body(self, max_bytes: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
             try:
@@ -5128,6 +5313,91 @@ def _control_api_handler_factory(
                 state["auth_routes"] = routes
             self._send_json({"ok": True, "username": username})
 
+        def _handle_post_sd_farm_sync(self) -> None:
+            if not self._require_auth_routing():
+                return
+            body, body_err = self._read_json_body(1024 * 1024)
+            if body_err or body is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            selected_uids_raw = body.get("uids")
+            selected_uids = {
+                str(uid).strip()
+                for uid in selected_uids_raw
+                if str(uid).strip()
+            } if isinstance(selected_uids_raw, list) else set()
+
+            payload, err, status_code = _build_sd_farm_payload(state)
+            if err or payload is None:
+                self._send_error_body(err or "Could not build SD Farm sync data", status_code)
+                return
+            if not payload.get("ixBrowserOk"):
+                self._send_error_body(payload.get("ixBrowserError") or "ixBrowser API is not available", 502)
+                return
+            rows = [
+                row
+                for row in (payload.get("rows") or [])
+                if row.get("valid") and (not selected_uids or str(row.get("uid") or "") in selected_uids)
+            ]
+            if not rows:
+                self._send_json({"ok": True, "synced": 0, "results": [], "skipped": len(payload.get("rows") or [])})
+                return
+
+            _routes, save_err, _changed = _upsert_sd_farm_auth_routes(state, rows)
+            if save_err:
+                self._send_error_body(save_err, 500)
+                return
+
+            ix_base = _ixbrowser_api_base_from_state(state)
+            proxy_host = _ixbrowser_proxy_host_from_state(state)
+            proxy_port = int(state.get("auth_http_port") or AUTH_HTTP_PORT_DEFAULT)
+            proxy_password = str(state.get("auth_global_password") or "")
+            results = []
+            for row in rows:
+                username = str(row.get("routeUsername") or route_username_for_uid(str(row.get("uid") or "")))
+                try:
+                    update_ixbrowser_profile_proxy(
+                        ix_base,
+                        str(row.get("browserProfileId") or ""),
+                        proxy_host,
+                        proxy_port,
+                        username,
+                        proxy_password,
+                    )
+                    results.append(
+                        {
+                            "uid": row.get("uid") or "",
+                            "ok": True,
+                            "routeUsername": username,
+                            "browserProfileId": row.get("browserProfileId") or "",
+                            "matchedOvpn": row.get("matchedOvpn") or "",
+                            "error": "",
+                        }
+                    )
+                except IXBrowserError as e:
+                    results.append(
+                        {
+                            "uid": row.get("uid") or "",
+                            "ok": False,
+                            "routeUsername": username,
+                            "browserProfileId": row.get("browserProfileId") or "",
+                            "matchedOvpn": row.get("matchedOvpn") or "",
+                            "error": str(e),
+                        }
+                    )
+            ok = all(item.get("ok") for item in results)
+            self._send_json(
+                {
+                    "ok": ok,
+                    "synced": sum(1 for item in results if item.get("ok")),
+                    "failed": sum(1 for item in results if not item.get("ok")),
+                    "proxyHost": proxy_host,
+                    "proxyPort": proxy_port,
+                    "results": results,
+                },
+                status=200 if ok else 207,
+            )
+
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path.rstrip("/")
@@ -5181,6 +5451,8 @@ def _control_api_handler_factory(
                 self._handle_post_auth_route_restart(parsed.query)
             elif path == "/api/auth-route-delete":
                 self._handle_post_auth_route_delete(parsed.query)
+            elif path == "/api/sd-farm/sync":
+                self._handle_post_sd_farm_sync()
             else:
                 self.send_error(404)
 

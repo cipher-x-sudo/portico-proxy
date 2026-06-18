@@ -4,6 +4,7 @@ import './Sidebar.css';
 const navItems = [
   { id: 'dashboard', icon: 'dashboard', label: 'Dashboard' },
   { id: 'status', icon: 'analytics', label: 'Status' },
+  { id: 'sd-farm', icon: 'database', label: 'SD Farm' },
   { id: 'config', icon: 'settings', label: 'Config' },
   { id: 'actions', icon: 'bolt', label: 'Actions' }
 ];
