@@ -65,6 +65,7 @@ from sd_farm import (
     discover_accounts_db,
     fetch_ixbrowser_profiles,
     load_accounts as load_sd_farm_accounts,
+    normalize_ixbrowser_proxy_type,
     resolve_sd_farm_root,
     route_username_for_uid,
     save_imported_accounts_db,
@@ -638,6 +639,139 @@ def normalize_auth_routes(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     return routes
 
 
+def _auth_route_export_dict(route: Dict[str, Any]) -> Dict[str, Any]:
+    egress = dict(route.get("egress") or {"type": "none"})
+    return {
+        "username": route.get("username") or "",
+        "label": route.get("label") or route.get("username") or "",
+        "externalId": route.get("externalId") or route.get("external_id") or "",
+        "proxyType": "socks5" if route.get("proxyType") == "socks5" else "http",
+        "rotationIntervalMinutes": int(route.get("rotationIntervalMinutes") or 0),
+        "rotationCountry": route.get("rotationCountry") or "",
+        "rotationLastRun": float(route.get("rotationLastRun") or 0.0),
+        "enabled": bool(route.get("enabled", True)),
+        "egress": egress,
+    }
+
+
+def _auth_route_export_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    with state["lock"]:
+        routes = [_auth_route_export_dict(r) for r in (state.get("auth_routes") or [])]
+    return {
+        "version": 1,
+        "kind": "portico-auth-routes",
+        "exportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "httpPort": state.get("auth_http_port"),
+        "socksPort": state.get("auth_socks_port"),
+        "routes": routes,
+    }
+
+
+def _extract_import_auth_routes_raw(payload: Dict[str, Any]) -> Optional[List[Any]]:
+    raw = payload.get("routes")
+    if isinstance(raw, list):
+        return raw
+    auth_cfg = payload.get("authRouting")
+    if isinstance(auth_cfg, dict) and isinstance(auth_cfg.get("routes"), list):
+        return auth_cfg["routes"]
+    return None
+
+
+def _validate_import_auth_routes(
+    state: Dict[str, Any],
+    raw_routes: List[Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    normalized = normalize_auth_routes({"authRouting": {"routes": raw_routes}})
+    allowed_ovpn = set(
+        list_allowed_ovpn_files(
+            dict(state.get("auth_runtime_config") or {}),
+            state["config_path"],
+            bool(state.get("use_docker")),
+        )
+    )
+    upstream_ids = set((state.get("upstream_profiles_by_id") or {}).keys())
+    valid_routes: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
+    for route in normalized:
+        username = route.get("username") or ""
+        egress = route.get("egress") or {}
+        err_parts: List[str] = []
+        if egress.get("type") == "ovpn":
+            ovpn = (egress.get("ovpn") or "").strip()
+            if Path(ovpn).suffix.lower() != ".ovpn" or not _is_safe_relative_ovpn_name(ovpn):
+                err_parts.append("invalid ovpn path")
+            elif ovpn not in allowed_ovpn:
+                err_parts.append(f"ovpn not available: {ovpn}")
+        elif egress.get("type") == "upstream":
+            upstream_id = (egress.get("upstreamProxyId") or "").strip()
+            if not upstream_id:
+                err_parts.append("upstreamProxyId is required")
+            elif upstream_id not in upstream_ids:
+                err_parts.append(f"upstream proxy not found: {upstream_id}")
+        if err_parts:
+            results.append({"username": username, "ok": False, "error": "; ".join(err_parts)})
+        else:
+            results.append({"username": username, "ok": True, "error": ""})
+            valid_routes.append(route)
+    for i, route in enumerate(valid_routes):
+        route["index"] = i
+    return valid_routes, results
+
+
+def _apply_auth_routes_import(
+    state: Dict[str, Any],
+    config_path: Path,
+    routes: List[Dict[str, Any]],
+    *,
+    mode: str = "replace",
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    with state["lock"]:
+        current = [dict(r) for r in (state.get("auth_routes") or [])]
+    if mode == "merge":
+        by_username = {r.get("username"): dict(r) for r in current if r.get("username")}
+        order = [r.get("username") for r in current if r.get("username")]
+        for route in routes:
+            username = route.get("username") or ""
+            if not username:
+                continue
+            if username not in by_username:
+                order.append(username)
+            by_username[username] = dict(route)
+        next_routes = [by_username[username] for username in order if username in by_username]
+    else:
+        next_routes = [dict(r) for r in routes]
+    for i, route in enumerate(next_routes):
+        route["index"] = i
+    affected_usernames = {
+        username
+        for username in (
+            *(r.get("username") for r in current if r.get("username")),
+            *(r.get("username") for r in next_routes if r.get("username")),
+        )
+        if username
+    }
+    for username in affected_usernames:
+        _stop_auth_route_backends(state, username, "both")
+    save_err = _persist_auth_routes_config(config_path, state, next_routes)
+    if save_err:
+        return None, save_err
+    with state["lock"]:
+        state["auth_routes"] = next_routes
+        runtime = dict(state.get("auth_runtime_config") or {})
+        auth_cfg = dict(_auth_routing_dict(runtime))
+        auth_cfg.update(
+            {
+                "enabled": True,
+                "httpPort": state.get("auth_http_port"),
+                "socksPort": state.get("auth_socks_port"),
+                "routes": next_routes,
+            }
+        )
+        runtime["authRouting"] = auth_cfg
+        state["auth_runtime_config"] = runtime
+    return next_routes, None
+
+
 def _auth_username_slug(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
     slug = re.sub(r"_+", "_", slug)
@@ -939,6 +1073,23 @@ def _ixbrowser_proxy_host_from_state(state: Dict[str, Any]) -> str:
     )
 
 
+def _ixbrowser_proxy_type_from_state(state: Dict[str, Any]) -> str:
+    cfg = dict(state.get("auth_runtime_config") or {})
+    raw = (
+        cfg.get("ixBrowserProxyType")
+        or cfg.get("ixbrowser_proxy_type")
+        or os.environ.get("IXBROWSER_PROXY_TYPE")
+        or "http"
+    )
+    return normalize_ixbrowser_proxy_type(raw)
+
+
+def _sd_farm_proxy_port(state: Dict[str, Any], proxy_type: str) -> int:
+    if normalize_ixbrowser_proxy_type(proxy_type) == "socks5":
+        return int(state.get("auth_socks_port") or AUTH_SOCKS_PORT_DEFAULT)
+    return int(state.get("auth_http_port") or AUTH_HTTP_PORT_DEFAULT)
+
+
 def _probe_ixbrowser(
     state: Dict[str, Any],
     *,
@@ -1001,6 +1152,7 @@ def _sd_farm_settings_payload(state: Dict[str, Any]) -> Dict[str, Any]:
         "hasImportedDb": has_imported_db,
         "ixBrowserApiBase": _ixbrowser_api_base_from_state(state),
         "ixBrowserProxyHost": _ixbrowser_proxy_host_from_state(state),
+        "ixBrowserProxyType": _ixbrowser_proxy_type_from_state(state),
         "ixBrowserOk": bool(ix_status.get("ok")),
         "ixBrowserError": ix_status.get("ixBrowserError") or "",
         "ixBrowserProfileCount": int(ix_status.get("ixBrowserProfileCount") or 0),
@@ -1017,6 +1169,9 @@ def _normalize_sd_farm_settings(payload: Dict[str, Any]) -> Dict[str, str]:
         "ixBrowserProxyHost": str(
             payload.get("ixBrowserProxyHost") or payload.get("ixbrowser_proxy_host") or ""
         ).strip(),
+        "ixBrowserProxyType": normalize_ixbrowser_proxy_type(
+            payload.get("ixBrowserProxyType") or payload.get("ixbrowser_proxy_type") or ""
+        ),
     }
 
 
@@ -1033,6 +1188,8 @@ def _apply_sd_farm_settings(state: Dict[str, Any], settings: Dict[str, str]) -> 
             runtime["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
         if settings.get("ixBrowserProxyHost"):
             runtime["ixBrowserProxyHost"] = settings["ixBrowserProxyHost"]
+        if settings.get("ixBrowserProxyType"):
+            runtime["ixBrowserProxyType"] = normalize_ixbrowser_proxy_type(settings["ixBrowserProxyType"])
         state["auth_runtime_config"] = runtime
 
 
@@ -1081,6 +1238,8 @@ def _persist_sd_farm_settings(config_path: Path, state: Dict[str, Any], settings
         fields["ixBrowserApiBase"] = settings["ixBrowserApiBase"]
     if settings.get("ixBrowserProxyHost"):
         fields["ixBrowserProxyHost"] = settings["ixBrowserProxyHost"]
+    if settings.get("ixBrowserProxyType"):
+        fields["ixBrowserProxyType"] = normalize_ixbrowser_proxy_type(settings["ixBrowserProxyType"])
     return _persist_sd_farm_config_fields(config_path, state, fields)
 
 
@@ -1165,8 +1324,11 @@ def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
 def _upsert_sd_farm_auth_routes(
     state: Dict[str, Any],
     rows: Iterable[Dict[str, Any]],
+    *,
+    proxy_type: Optional[str] = None,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str], List[str]]:
     target_rows = [row for row in rows if row.get("valid")]
+    route_proxy_type = normalize_ixbrowser_proxy_type(proxy_type or _ixbrowser_proxy_type_from_state(state))
     with state["lock"]:
         routes = [dict(r) for r in (state.get("auth_routes") or [])]
     changed_usernames: List[str] = []
@@ -1178,7 +1340,7 @@ def _upsert_sd_farm_auth_routes(
             "username": username,
             "label": str(row.get("name") or uid or username).strip() or username,
             "externalId": uid,
-            "proxyType": "http",
+            "proxyType": route_proxy_type,
             "rotationIntervalMinutes": 0,
             "rotationCountry": "",
             "rotationLastRun": 0.0,
@@ -4528,6 +4690,8 @@ def _control_api_handler_factory(
                 self._handle_get_sd_farm_ixbrowser_test(parsed.query)
             elif path == "/api/sd-farm/preview-sync":
                 self._handle_get_sd_farm_preview_sync()
+            elif path == "/api/export-auth-routes":
+                self._handle_get_export_auth_routes()
             elif path == "/api/provider-auth":
                 self._handle_get_provider_auth()
             elif path == "/api/logs":
@@ -5459,6 +5623,61 @@ def _control_api_handler_factory(
                     return None, f"Upstream proxy profile not found: {upstream_id}"
             return route, None
 
+        def _handle_get_export_auth_routes(self) -> None:
+            if not self._require_auth_routing():
+                return
+            self._send_json(_auth_route_export_payload(state))
+
+        def _handle_post_import_auth_routes(self) -> None:
+            if not self._require_auth_routing():
+                return
+            payload, body_err = self._read_json_body(2 * 1024 * 1024)
+            if body_err or payload is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            raw_routes = _extract_import_auth_routes_raw(payload)
+            if raw_routes is None:
+                self._send_error_body("routes must be an array", 400)
+                return
+            mode = (str(payload.get("mode") or "replace")).strip().lower()
+            if mode not in ("replace", "merge"):
+                mode = "replace"
+            valid_routes, results = _validate_import_auth_routes(state, raw_routes)
+            normalized_count = len(normalize_auth_routes({"authRouting": {"routes": raw_routes}}))
+            if mode == "replace" and len(valid_routes) != normalized_count:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "imported": 0,
+                        "mode": mode,
+                        "results": results,
+                        "error": "Import rejected: one or more routes failed validation",
+                    },
+                    status=400,
+                )
+                return
+            if mode == "merge" and not valid_routes:
+                self._send_error_body("No valid routes to import", 400)
+                return
+            next_routes, save_err = _apply_auth_routes_import(
+                state,
+                state["config_path"],
+                valid_routes,
+                mode=mode,
+            )
+            if save_err:
+                self._send_error_body(save_err, 500)
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "imported": len(valid_routes),
+                    "mode": mode,
+                    "totalRoutes": len(next_routes or []),
+                    "results": results,
+                }
+            )
+
         def _handle_post_auth_route(self) -> None:
             if not self._require_auth_routing():
                 return
@@ -5678,14 +5897,17 @@ def _control_api_handler_factory(
                 self._send_json({"ok": True, "synced": 0, "results": [], "skipped": len(payload.get("rows") or [])})
                 return
 
-            _routes, save_err, _changed = _upsert_sd_farm_auth_routes(state, rows)
+            proxy_type = normalize_ixbrowser_proxy_type(
+                body.get("proxyType") or body.get("proxy_type") or _ixbrowser_proxy_type_from_state(state)
+            )
+            _routes, save_err, _changed = _upsert_sd_farm_auth_routes(state, rows, proxy_type=proxy_type)
             if save_err:
                 self._send_error_body(save_err, 500)
                 return
 
             ix_base = _ixbrowser_api_base_from_state(state)
             proxy_host = _ixbrowser_proxy_host_from_state(state)
-            proxy_port = int(state.get("auth_http_port") or AUTH_HTTP_PORT_DEFAULT)
+            proxy_port = _sd_farm_proxy_port(state, proxy_type)
             proxy_password = str(state.get("auth_global_password") or "")
             results = []
             for row in rows:
@@ -5698,6 +5920,7 @@ def _control_api_handler_factory(
                         proxy_port,
                         username,
                         proxy_password,
+                        proxy_type=proxy_type,
                     )
                     results.append(
                         {
@@ -5728,6 +5951,7 @@ def _control_api_handler_factory(
                     "failed": sum(1 for item in results if not item.get("ok")),
                     "proxyHost": proxy_host,
                     "proxyPort": proxy_port,
+                    "proxyType": proxy_type,
                     "results": results,
                 },
                 status=200 if ok else 207,
@@ -5776,6 +6000,8 @@ def _control_api_handler_factory(
                 self._handle_post_set_rotation(parsed.query)
             elif path == "/api/set-upstream-refresh":
                 self._handle_post_set_upstream_refresh(parsed.query)
+            elif path == "/api/import-auth-routes":
+                self._handle_post_import_auth_routes()
             elif path == "/api/auth-route":
                 self._handle_post_auth_route()
             elif path == "/api/auth-route-start":

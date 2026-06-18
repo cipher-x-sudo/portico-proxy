@@ -150,7 +150,43 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(calls["url"], "http://127.0.0.1:53200/api/v2/profile-update-proxy-for-custom-proxy")
         self.assertEqual(calls["payload"]["profile_id"], 99)
         self.assertEqual(calls["payload"]["proxy_info"]["proxy_mode"], 2)
+        self.assertEqual(calls["payload"]["proxy_info"]["proxy_type"], "http")
         self.assertEqual(calls["payload"]["proxy_info"]["proxy_user"], "sd_99")
+
+    def test_ixbrowser_update_supports_socks5_proxy_type(self):
+        calls = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"error": {"code": 0}, "data": True}).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            calls["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            sd_farm.update_ixbrowser_profile_proxy(
+                "http://127.0.0.1:53200/api/v2/",
+                "99",
+                "127.0.0.1",
+                58681,
+                "sd_99",
+                "secret",
+                proxy_type="socks5",
+            )
+
+        self.assertEqual(calls["payload"]["proxy_info"]["proxy_type"], "socks5")
+
+    def test_normalize_ixbrowser_proxy_type(self):
+        self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type("socks5"), "socks5")
+        self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type("HTTP"), "http")
+        self.assertEqual(sd_farm.normalize_ixbrowser_proxy_type(""), "http")
 
 
 class SDFarmGatewaySyncTests(unittest.TestCase):
@@ -187,6 +223,7 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
                 "sdFarmRoot": str(root),
                 "ixBrowserApiBase": "http://127.0.0.1:53200/api/v2/",
                 "ixBrowserProxyHost": "127.0.0.1",
+                "ixBrowserProxyType": "socks5",
             }
 
             self.assertIsNone(gateway._validate_sd_farm_settings(state, settings))
@@ -195,6 +232,7 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
 
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["sdFarmRoot"], str(root))
+            self.assertEqual(saved["ixBrowserProxyType"], "socks5")
             self.assertEqual(gateway._sd_farm_settings_payload(state)["dbPath"], str(db))
 
     def test_validate_import_label_does_not_require_server_path(self):
@@ -278,12 +316,14 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
         with (
             patch.object(gateway, "_persist_auth_routes_config", return_value=None) as persist_mock,
             patch.object(gateway, "_stop_auth_route_backends", return_value=True) as stop_mock,
+            patch.object(gateway, "_ixbrowser_proxy_type_from_state", return_value="socks5"),
         ):
             routes, err, changed = gateway._upsert_sd_farm_auth_routes(state, rows)
 
         self.assertIsNone(err)
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["username"], "sd_61560173093090")
+        self.assertEqual(routes[0]["proxyType"], "socks5")
         self.assertEqual(routes[0]["externalId"], "61560173093090")
         self.assertEqual(routes[0]["egress"]["ovpn"], "NC/NCVPN-US-Phoenix-UDP.ovpn")
         self.assertIn("sd_61560173093090", changed)

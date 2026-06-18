@@ -254,6 +254,102 @@ select.dashboard-modal-input option {
   background: var(--bg-surface-2);
 }
 
+.dashboard-auth-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  background: var(--bg-surface-2);
+}
+
+.dashboard-auth-mode-row,
+.dashboard-auth-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.dashboard-auth-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.dashboard-auth-mode-badge.mode-local {
+  border-color: rgba(59, 130, 246, 0.35);
+  color: var(--primary-hover);
+}
+
+.dashboard-auth-mode-badge .material-symbols-outlined {
+  font-size: 1rem;
+}
+
+.dashboard-auth-mode-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.dashboard-auth-mode-select {
+  min-width: 10rem;
+  padding: 0.35rem 0.55rem;
+  font-size: 0.82rem;
+}
+
+.dashboard-auth-search {
+  flex: 1 1 14rem;
+  min-width: 12rem;
+}
+
+.dashboard-auth-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.dashboard-auth-filter {
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.dashboard-auth-filter.active,
+.dashboard-auth-filter:hover {
+  border-color: rgba(59, 130, 246, 0.45);
+  color: var(--primary-hover);
+}
+
+.dashboard-auth-filter.active {
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.dashboard-auth-check {
+  width: 2.8rem;
+  text-align: center;
+}
+
+.dashboard-auth-check input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--primary);
+}
+
 .dashboard-launcher-id-cell {
   min-width: 7rem;
   max-width: 12rem;

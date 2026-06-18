@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useConfirm, useToast } from '../components/ui/feedback-hooks.js';
 import './Dashboard.css';
 import OvpnFileSelect from '../components/OvpnFileSelect';
@@ -29,6 +29,26 @@ const slugifyProxyUsername = (value) => {
     .replace(/^_+|_+$/g, '');
   return slug || 'proxy';
 };
+
+const authRoutePayloadFromRoute = (route, overrides = {}) => {
+  const egress = route.egress || {};
+  return {
+    username: route.username || '',
+    label: route.label || route.username || '',
+    externalId: route.externalId || '',
+    proxyType: route.proxyType === 'socks5' ? 'socks5' : 'http',
+    enabled: route.enabled !== false,
+    rotationIntervalMinutes: Math.max(0, Math.floor(Number(route.rotationIntervalMinutes) || 0)),
+    rotationCountry: (route.rotationCountry || '').toUpperCase(),
+    egress:
+      egress.type === 'upstream'
+        ? { type: 'upstream', upstreamProxyId: egress.upstreamProxyId || '' }
+        : { type: 'ovpn', ovpn: egress.type === 'ovpn' ? egress.ovpn || '' : '' },
+    ...overrides,
+  };
+};
+
+const isSdFarmAuthRoute = (route) => String(route?.username || '').startsWith('sd_');
 
 export default function Dashboard() {
   const confirmAction = useConfirm();
@@ -61,6 +81,14 @@ export default function Dashboard() {
     rotationCountry: '',
   });
   const [showAuthRouteEditor, setShowAuthRouteEditor] = useState(false);
+  const authRoutesImportRef = useRef(null);
+  const [authRoutesImportBusy, setAuthRoutesImportBusy] = useState(false);
+  const [selectedAuthRoutes, setSelectedAuthRoutes] = useState([]);
+  const [authRoutesBatchBusy, setAuthRoutesBatchBusy] = useState(false);
+  const [authRouteSearch, setAuthRouteSearch] = useState('');
+  const [authRouteTypeFilter, setAuthRouteTypeFilter] = useState('all');
+  const [sdFarmProxyType, setSdFarmProxyType] = useState('http');
+  const [sdFarmProxyTypeSaving, setSdFarmProxyTypeSaving] = useState(false);
   const [showCreateProxy, setShowCreateProxy] = useState(false);
   const [createProxyEgressType, setCreateProxyEgressType] = useState('ovpn');
   const [createProxyProvider, setCreateProxyProvider] = useState('');
@@ -134,6 +162,25 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
+    if (!status?.authRouting?.enabled) return undefined;
+    fetch('/api/sd-farm/settings')
+      .then((res) => res.json())
+      .then((data) => {
+        setSdFarmProxyType(data.ixBrowserProxyType === 'socks5' ? 'socks5' : 'http');
+      })
+      .catch(() => {});
+    return undefined;
+  }, [status?.authRouting?.enabled]);
+
+  useEffect(() => {
+    if (!status?.authRouting?.enabled) return;
+    const usernames = new Set(
+      (Array.isArray(status.authRouting.routes) ? status.authRouting.routes : []).map((route) => route.username),
+    );
+    setSelectedAuthRoutes((current) => current.filter((username) => usernames.has(username)));
+  }, [status?.authRouting?.enabled, status?.authRouting?.routes]);
+
+  useEffect(() => {
     const modalOpen = showCreateEntry || showEditEntry || showCreateProxy || showAuthRouteEditor;
     const page = document.querySelector('.main-content .page-container');
     if (!page) return undefined;
@@ -155,6 +202,38 @@ export default function Dashboard() {
       })),
     [sortedOvpnFiles]
   );
+
+  const authRoutesList = useMemo(() => {
+    if (!status?.authRouting?.enabled) return [];
+    return Array.isArray(status.authRouting.routes) ? status.authRouting.routes : [];
+  }, [status?.authRouting?.enabled, status?.authRouting?.routes]);
+
+  const filteredAuthRoutes = useMemo(() => {
+    const needle = authRouteSearch.trim().toLowerCase();
+    return authRoutesList.filter((route) => {
+      const routeType = route.proxyType === 'socks5' ? 'socks5' : 'http';
+      if (authRouteTypeFilter === 'http' && routeType !== 'http') return false;
+      if (authRouteTypeFilter === 'socks5' && routeType !== 'socks5') return false;
+      if (authRouteTypeFilter === 'sd_farm' && !isSdFarmAuthRoute(route)) return false;
+      if (!needle) return true;
+      return [route.username, route.label, route.externalId]
+        .some((value) => String(value || '').toLowerCase().includes(needle));
+    });
+  }, [authRouteSearch, authRouteTypeFilter, authRoutesList]);
+
+  const visibleAuthRouteUsernames = useMemo(
+    () => filteredAuthRoutes.map((route) => route.username).filter(Boolean),
+    [filteredAuthRoutes],
+  );
+
+  const selectedAuthRoutesInView = useMemo(
+    () => selectedAuthRoutes.filter((username) => visibleAuthRouteUsernames.includes(username)),
+    [selectedAuthRoutes, visibleAuthRouteUsernames],
+  );
+
+  const allVisibleAuthRoutesSelected =
+    visibleAuthRouteUsernames.length > 0 &&
+    selectedAuthRoutesInView.length === visibleAuthRouteUsernames.length;
 
   const saveEgress = async (port, type, { ovpn = '', upstreamProxyId = '' } = {}) => {
     setBusyPort(port);
@@ -1015,6 +1094,87 @@ export default function Dashboard() {
     }
   };
 
+  const exportAuthRoutes = async () => {
+    setError('');
+    try {
+      const res = await fetch('/api/export-auth-routes');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to export auth routes');
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = 'portico-auth-routes.json';
+      anchor.click();
+      URL.revokeObjectURL(url);
+      const count = Array.isArray(data.routes) ? data.routes.length : 0;
+      toast({
+        title: 'Export complete',
+        message: `${count} auth ${count === 1 ? 'route' : 'routes'} exported.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      setError(err.message || 'Failed to export auth routes');
+      toast({ title: 'Export failed', message: err.message || 'Failed to export auth routes.', variant: 'danger' });
+    }
+  };
+
+  const importAuthRoutesFromFile = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setError('');
+    let payload;
+    try {
+      payload = JSON.parse(await file.text());
+    } catch {
+      toast({ title: 'Invalid JSON file', message: 'The imported file could not be parsed.', variant: 'danger' });
+      return;
+    }
+    const routes = Array.isArray(payload?.routes)
+      ? payload.routes
+      : Array.isArray(payload?.authRouting?.routes)
+        ? payload.authRouting.routes
+        : null;
+    if (!Array.isArray(routes)) {
+      toast({ title: 'Invalid file', message: 'Expected a routes array in the export file.', variant: 'danger' });
+      return;
+    }
+    const accepted = await confirmAction({
+      title: 'Import auth routes',
+      message: `Replace all auth routes with ${routes.length} route(s) from "${file.name}"? Running route workers will be stopped.`,
+      confirmLabel: 'Import',
+      variant: 'danger',
+    });
+    if (!accepted) return;
+    setAuthRoutesImportBusy(true);
+    try {
+      const res = await fetch('/api/import-auth-routes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'replace', routes }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const failed = Array.isArray(data.results)
+          ? data.results.filter((row) => !row.ok).map((row) => `${row.username}: ${row.error}`).join('; ')
+          : '';
+        throw new Error(data.error || failed || 'Failed to import auth routes');
+      }
+      await refreshStatus();
+      toast({
+        title: 'Import complete',
+        message: `${data.imported || routes.length} auth route(s) imported.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      setError(err.message || 'Failed to import auth routes');
+      toast({ title: 'Import failed', message: err.message || 'Failed to import auth routes.', variant: 'danger' });
+    } finally {
+      setAuthRoutesImportBusy(false);
+    }
+  };
+
   const runAuthRouteAction = async (username, action) => {
     const endpoint =
       action === 'delete'
@@ -1045,6 +1205,9 @@ export default function Dashboard() {
         setError(data.error || detail || `Failed to ${action} route`);
         return;
       }
+      if (action === 'delete') {
+        setSelectedAuthRoutes((current) => current.filter((item) => item !== username));
+      }
       await refreshStatus();
       toast({ title: 'Route updated', message: `${action}: ${username}`, variant: 'success' });
     } catch (err) {
@@ -1052,6 +1215,138 @@ export default function Dashboard() {
     } finally {
       setAuthRouteBusy(null);
     }
+  };
+
+  const toggleAuthRouteSelection = (username) => {
+    setSelectedAuthRoutes((current) =>
+      current.includes(username) ? current.filter((item) => item !== username) : [...current, username],
+    );
+  };
+
+  const toggleVisibleAuthRoutes = () => {
+    setSelectedAuthRoutes((current) => {
+      if (allVisibleAuthRoutesSelected) {
+        return current.filter((username) => !visibleAuthRouteUsernames.includes(username));
+      }
+      return Array.from(new Set([...current, ...visibleAuthRouteUsernames]));
+    });
+  };
+
+  const saveSdFarmProxyType = async (nextType) => {
+    const normalized = nextType === 'socks5' ? 'socks5' : 'http';
+    setSdFarmProxyTypeSaving(true);
+    setError('');
+    try {
+      const current = await fetch('/api/sd-farm/settings').then((res) => res.json());
+      const res = await fetch('/api/sd-farm/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdFarmRoot: current.sdFarmRoot || '',
+          sdFarmSource: current.sdFarmSource || 'import',
+          ixBrowserApiBase: current.ixBrowserApiBase || '',
+          ixBrowserProxyHost: current.ixBrowserProxyHost || '',
+          ixBrowserProxyType: normalized,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save SD Farm proxy type');
+      setSdFarmProxyType(normalized);
+      toast({
+        title: 'SD Farm proxy type saved',
+        message: `New syncs use ${normalized === 'socks5' ? 'SOCKS5' : 'HTTP'} auth-routing port.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      setError(err.message || 'Failed to save SD Farm proxy type');
+      toast({
+        title: 'Save failed',
+        message: err.message || 'Failed to save SD Farm proxy type',
+        variant: 'danger',
+      });
+    } finally {
+      setSdFarmProxyTypeSaving(false);
+    }
+  };
+
+  const batchDeleteAuthRoutes = async () => {
+    const targets = selectedAuthRoutes.filter((username) =>
+      authRoutesList.some((route) => route.username === username),
+    );
+    if (targets.length === 0) return;
+    const accepted = await confirmAction({
+      title: `Delete ${targets.length} selected ${targets.length === 1 ? 'route' : 'routes'}?`,
+      message: 'Running workers for selected routes will be stopped.',
+      confirmLabel: 'Delete selected',
+      variant: 'danger',
+    });
+    if (!accepted) return;
+    setAuthRoutesBatchBusy(true);
+    setError('');
+    try {
+      for (const username of targets) {
+        const res = await fetch(`/api/auth-route-delete?username=${encodeURIComponent(username)}`, {
+          method: 'POST',
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || `Failed to delete ${username}`);
+      }
+      setSelectedAuthRoutes([]);
+      await refreshStatus();
+      toast({
+        title: 'Routes deleted',
+        message: `${targets.length} auth ${targets.length === 1 ? 'route was' : 'routes were'} removed.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      setError('Batch delete failed: ' + err.message);
+      toast({ title: 'Batch delete failed', message: err.message, variant: 'danger' });
+    } finally {
+      setAuthRoutesBatchBusy(false);
+    }
+  };
+
+  const batchApplyAuthRouteProxyType = async (type) => {
+    const normalized = type === 'socks5' ? 'socks5' : 'http';
+    const targets = authRoutesList.filter((route) => selectedAuthRoutes.includes(route.username));
+    if (targets.length === 0) return;
+    setAuthRoutesBatchBusy(true);
+    setError('');
+    try {
+      for (const route of targets) {
+        const res = await fetch('/api/auth-route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(authRoutePayloadFromRoute(route, { proxyType: normalized })),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || `Failed to update ${route.username}`);
+      }
+      await refreshStatus();
+      toast({
+        title: 'Proxy type updated',
+        message: `${targets.length} ${targets.length === 1 ? 'route' : 'routes'} set to ${normalized.toUpperCase()}.`,
+        variant: 'success',
+      });
+    } catch (err) {
+      setError('Batch proxy update failed: ' + err.message);
+      toast({ title: 'Batch update failed', message: err.message, variant: 'danger' });
+    } finally {
+      setAuthRoutesBatchBusy(false);
+    }
+  };
+
+  const editSelectedAuthRoute = () => {
+    const targets = authRoutesList.filter((route) => selectedAuthRoutes.includes(route.username));
+    if (targets.length !== 1) {
+      toast({
+        title: 'Select one route',
+        message: 'Choose exactly one route to edit, or use Set HTTP/SOCKS5 for bulk proxy type changes.',
+        variant: 'warning',
+      });
+      return;
+    }
+    loadAuthRouteForEdit(targets[0]);
   };
 
   if (authRouting) {
@@ -1076,7 +1371,16 @@ export default function Dashboard() {
     const authPassword = authRouting.globalPassword || '';
     const httpPort = authRouting.httpPort || 58080;
     const socksPort = authRouting.socksPort || 58081;
-    const routes = Array.isArray(authRouting.routes) ? authRouting.routes : [];
+    const routes = authRoutesList;
+    const localAuthMode = authRouting.localAuthRouting
+      ? 'local'
+      : authRouting.copyHostMode || 'server';
+    const localAuthLabel =
+      localAuthMode === 'local'
+        ? 'Local auth'
+        : localAuthMode === 'configured'
+          ? 'Configured host'
+          : 'Server WAN';
     const routeColonFormat = (username, port) => `${authCopyHost}:${port}:${username}:${authPassword}`;
     const routeAtFormat = (username, port) => `${username}:${authPassword}@${authCopyHost}:${port}`;
 
@@ -1101,6 +1405,31 @@ export default function Dashboard() {
             </div>
             <div className="dashboard-row-actions">
               <span className="badge-primary">{routes.length} ROUTES</span>
+              <button
+                type="button"
+                className="btn-outline"
+                onClick={exportAuthRoutes}
+                disabled={authRoutesImportBusy}
+              >
+                <span className="material-symbols-outlined">file_download</span>
+                Export
+              </button>
+              <button
+                type="button"
+                className="btn-outline"
+                onClick={() => authRoutesImportRef.current?.click()}
+                disabled={authRoutesImportBusy}
+              >
+                <span className="material-symbols-outlined">file_upload</span>
+                {authRoutesImportBusy ? 'Importing...' : 'Import'}
+              </button>
+              <input
+                type="file"
+                ref={authRoutesImportRef}
+                onChange={importAuthRoutesFromFile}
+                accept=".json,application/json"
+                style={{ display: 'none' }}
+              />
               <button type="button" className="btn-primary" onClick={openCreateProxyModal}>
                 <span className="material-symbols-outlined">add</span>
                 Create Proxy
@@ -1115,10 +1444,131 @@ export default function Dashboard() {
             Connect host shown in proxy lines: <code className="text-mono">{authCopyHost}</code>
             {authHostSource && <span> ({authHostSource})</span>}
           </p>
+          <div className="dashboard-auth-toolbar px-4 py-3 border-t border-[var(--border-color)]">
+            <div className="dashboard-auth-mode-row">
+              <span className={`dashboard-auth-mode-badge ${localAuthMode === 'local' ? 'mode-local' : ''}`}>
+                <span className="material-symbols-outlined" aria-hidden>
+                  {localAuthMode === 'local' ? 'home' : 'public'}
+                </span>
+                {localAuthLabel}
+              </span>
+              <label className="dashboard-auth-mode-control">
+                <span>SD Farm proxy type</span>
+                <select
+                  className="input dashboard-auth-mode-select"
+                  value={sdFarmProxyType}
+                  disabled={sdFarmProxyTypeSaving || authRoutesBatchBusy}
+                  onChange={(event) => saveSdFarmProxyType(event.target.value)}
+                  aria-label="SD Farm proxy type for sync"
+                >
+                  <option value="http">HTTP ({httpPort})</option>
+                  <option value="socks5">SOCKS5 ({socksPort})</option>
+                </select>
+              </label>
+            </div>
+            <div className="dashboard-auth-filter-row">
+              <label className="dashboard-ports-launcher-search dashboard-auth-search">
+                <span className="material-symbols-outlined" aria-hidden>
+                  search
+                </span>
+                <input
+                  type="search"
+                  className="dashboard-ports-launcher-search-input"
+                  value={authRouteSearch}
+                  onChange={(event) => setAuthRouteSearch(event.target.value)}
+                  placeholder="Search route, label, ID…"
+                  aria-label="Filter auth routes"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </label>
+              <div className="dashboard-auth-filters" role="group" aria-label="Auth route filters">
+                {[
+                  { id: 'all', label: 'All' },
+                  { id: 'sd_farm', label: 'SD Farm' },
+                  { id: 'http', label: 'HTTP' },
+                  { id: 'socks5', label: 'SOCKS5' },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`dashboard-auth-filter ${authRouteTypeFilter === item.id ? 'active' : ''}`}
+                    onClick={() => setAuthRouteTypeFilter(item.id)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {selectedAuthRoutes.length > 0 && (
+            <div className="dashboard-batch-bar flex flex-wrap items-center gap-2 px-4 py-3 border-t border-[var(--border-color)]">
+              <span className="text-sm font-medium">
+                {selectedAuthRoutes.length} selected
+                {selectedAuthRoutesInView.length !== selectedAuthRoutes.length && (
+                  <span className="text-muted font-normal">
+                    {' '}
+                    ({selectedAuthRoutesInView.length} visible)
+                  </span>
+                )}
+              </span>
+              <button
+                type="button"
+                className="btn-secondary text-sm"
+                disabled={authRoutesBatchBusy || selectedAuthRoutes.length === 0}
+                onClick={() => batchApplyAuthRouteProxyType('http')}
+              >
+                Set HTTP
+              </button>
+              <button
+                type="button"
+                className="btn-secondary text-sm"
+                disabled={authRoutesBatchBusy || selectedAuthRoutes.length === 0}
+                onClick={() => batchApplyAuthRouteProxyType('socks5')}
+              >
+                Set SOCKS5
+              </button>
+              <button
+                type="button"
+                className="btn-secondary text-sm"
+                disabled={authRoutesBatchBusy || selectedAuthRoutes.length !== 1}
+                onClick={editSelectedAuthRoute}
+              >
+                Edit selected
+              </button>
+              <button
+                type="button"
+                className="btn-danger text-sm"
+                disabled={authRoutesBatchBusy || selectedAuthRoutes.length === 0}
+                onClick={batchDeleteAuthRoutes}
+              >
+                Delete selected
+              </button>
+              <button
+                type="button"
+                className="btn-secondary text-sm"
+                disabled={authRoutesBatchBusy}
+                onClick={() => setSelectedAuthRoutes([])}
+              >
+                Clear selection
+              </button>
+            </div>
+          )}
+
           <div className="table-container">
             <table className="data-table dashboard-copy-table">
               <thead>
                 <tr>
+                  <th className="dashboard-auth-check">
+                    <input
+                      type="checkbox"
+                      checked={allVisibleAuthRoutesSelected}
+                      disabled={visibleAuthRouteUsernames.length === 0 || authRoutesBatchBusy}
+                      onChange={toggleVisibleAuthRoutes}
+                      aria-label="Select visible auth routes"
+                    />
+                  </th>
                   <th>Route</th>
                   <th>Egress</th>
                   <th>Type</th>
@@ -1132,10 +1582,14 @@ export default function Dashboard() {
               <tbody>
                 {routes.length === 0 ? (
                   <tr>
-                    <td colSpan="8" className="text-center p-6 text-muted">No auth routes configured.</td>
+                    <td colSpan="9" className="text-center p-6 text-muted">No auth routes configured.</td>
+                  </tr>
+                ) : filteredAuthRoutes.length === 0 ? (
+                  <tr>
+                    <td colSpan="9" className="text-center p-6 text-muted">No auth routes match this filter.</td>
                   </tr>
                 ) : (
-                  routes.map((route) => {
+                  filteredAuthRoutes.map((route) => {
                     const routeType = route.proxyType === 'socks5' ? 'socks5' : 'http';
                     const routeProtocol = route.protocols?.[routeType] || {};
                     const routeState = routeProtocol.status || 'inactive';
@@ -1145,11 +1599,21 @@ export default function Dashboard() {
                     const routeColon = routeColonFormat(route.username, routePort);
                     const routeAt = routeAtFormat(route.username, routePort);
                     const busy = authRouteBusy && authRouteBusy.endsWith(`:${route.username}`);
+                    const rowChecked = selectedAuthRoutes.includes(route.username);
                     const rotationMinutes = Math.max(0, Math.floor(Number(route.rotationIntervalMinutes) || 0));
                     const rotationCountry = (route.rotationCountry || '').toUpperCase();
                     const isRotating = route.egress?.type === 'ovpn' && rotationMinutes > 0;
                     return (
                       <tr key={route.username} className={route.enabled ? undefined : 'opacity-60'}>
+                        <td className="dashboard-auth-check" data-label="Select">
+                          <input
+                            type="checkbox"
+                            checked={rowChecked}
+                            disabled={authRoutesBatchBusy || busy}
+                            onChange={() => toggleAuthRouteSelection(route.username)}
+                            aria-label={`Select ${route.username}`}
+                          />
+                        </td>
                         <td data-label="Route">
                           <div className="flex flex-col gap-1">
                             <span className="font-bold">{route.label || route.username}</span>

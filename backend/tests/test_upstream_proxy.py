@@ -841,6 +841,104 @@ class UpstreamLifecycleTests(unittest.TestCase):
 
         self.assertEqual(restarted, [50000])
 
+    def test_auth_route_export_payload_strips_runtime_fields(self):
+        state = {
+            "lock": threading.Lock(),
+            "auth_http_port": 58080,
+            "auth_socks_port": 58081,
+            "auth_routes": [
+                {
+                    "index": 0,
+                    "username": "us_chicago",
+                    "label": "Chicago",
+                    "externalId": "launcher-42",
+                    "proxyType": "http",
+                    "rotationIntervalMinutes": 15,
+                    "rotationCountry": "US",
+                    "rotationLastRun": 123.0,
+                    "enabled": True,
+                    "egress": {"type": "ovpn", "ovpn": "NC/chicago.ovpn"},
+                }
+            ],
+        }
+
+        payload = gateway._auth_route_export_payload(state)
+
+        self.assertEqual(payload["kind"], "portico-auth-routes")
+        self.assertEqual(len(payload["routes"]), 1)
+        self.assertEqual(payload["routes"][0]["username"], "us_chicago")
+        self.assertNotIn("protocols", payload["routes"][0])
+
+    def test_validate_import_auth_routes_rejects_missing_ovpn(self):
+        state = {
+            "config_path": BACKEND_DIR / "openvpn-proxy-config.example.json",
+            "auth_runtime_config": {},
+            "use_docker": False,
+            "upstream_profiles_by_id": {},
+        }
+        raw_routes = [
+            {
+                "username": "us_chicago",
+                "egress": {"type": "ovpn", "ovpn": "NC/missing.ovpn"},
+            }
+        ]
+
+        with patch.object(gateway, "list_allowed_ovpn_files", return_value=["NC/chicago.ovpn"]):
+            valid, results = gateway._validate_import_auth_routes(state, raw_routes)
+
+        self.assertEqual(valid, [])
+        self.assertFalse(results[0]["ok"])
+        self.assertIn("ovpn not available", results[0]["error"])
+
+    def test_apply_auth_routes_import_replaces_existing_routes(self):
+        config_path = BACKEND_DIR / "openvpn-proxy-config.example.json"
+        state = {
+            "lock": threading.Lock(),
+            "config_path": config_path,
+            "auth_http_port": 58080,
+            "auth_socks_port": 58081,
+            "auth_runtime_config": {"authRouting": {"enabled": True}},
+            "auth_routes": [
+                {
+                    "index": 0,
+                    "username": "old_route",
+                    "label": "Old",
+                    "externalId": "",
+                    "proxyType": "http",
+                    "rotationIntervalMinutes": 0,
+                    "rotationCountry": "",
+                    "rotationLastRun": 0.0,
+                    "enabled": True,
+                    "egress": {"type": "none"},
+                }
+            ],
+        }
+        imported = [
+            {
+                "index": 0,
+                "username": "new_route",
+                "label": "New",
+                "externalId": "",
+                "proxyType": "http",
+                "rotationIntervalMinutes": 0,
+                "rotationCountry": "",
+                "rotationLastRun": 0.0,
+                "enabled": True,
+                "egress": {"type": "none"},
+            }
+        ]
+
+        with (
+            patch.object(gateway, "_stop_auth_route_backends", return_value=True),
+            patch.object(gateway, "_persist_auth_routes_config", return_value=None) as persist_mock,
+        ):
+            routes, err = gateway._apply_auth_routes_import(state, config_path, imported, mode="replace")
+
+        self.assertIsNone(err)
+        self.assertEqual([r["username"] for r in routes or []], ["new_route"])
+        self.assertEqual(state["auth_routes"][0]["username"], "new_route")
+        persist_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

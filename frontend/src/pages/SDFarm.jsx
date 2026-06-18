@@ -24,6 +24,7 @@ const defaultSettings = {
   hasImportedDb: false,
   ixBrowserApiBase: '',
   ixBrowserProxyHost: '127.0.0.1',
+  ixBrowserProxyType: 'http',
   ixBrowserOk: false,
   ixBrowserError: '',
   ixBrowserProfileCount: 0,
@@ -71,6 +72,7 @@ export default function SDFarm() {
       hasImportedDb: Boolean(data.hasImportedDb),
       ixBrowserApiBase: data.ixBrowserApiBase || '',
       ixBrowserProxyHost: data.ixBrowserProxyHost || '127.0.0.1',
+      ixBrowserProxyType: data.ixBrowserProxyType === 'socks5' ? 'socks5' : 'http',
       ixBrowserOk: Boolean(data.ixBrowserOk),
       ixBrowserError: data.ixBrowserError || '',
       ixBrowserProfileCount: Number(data.ixBrowserProfileCount || 0),
@@ -194,6 +196,7 @@ export default function SDFarm() {
           sdFarmRoot: settings.sdFarmRoot,
           ixBrowserApiBase: settings.ixBrowserApiBase,
           ixBrowserProxyHost: settings.ixBrowserProxyHost,
+          ixBrowserProxyType: settings.ixBrowserProxyType,
         }),
       });
       const data = await res.json();
@@ -321,7 +324,10 @@ export default function SDFarm() {
       const res = await fetch('/api/sd-farm/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uids }),
+        body: JSON.stringify({
+          uids,
+          proxyType: settings.ixBrowserProxyType,
+        }),
       });
       const data = await res.json();
       if (!res.ok && res.status !== 207) throw new Error(data.error || 'Sync failed');
@@ -510,6 +516,24 @@ export default function SDFarm() {
                   />
                   <p className="sd-farm-settings-hint">
                     Address written into ixBrowser profile proxy settings during sync (usually 127.0.0.1).
+                  </p>
+                </div>
+                <div className="form-group">
+                  <label htmlFor="sd-farm-ix-proxy-type">Proxy type for profiles</label>
+                  <select
+                    id="sd-farm-ix-proxy-type"
+                    className="premium-input"
+                    value={settings.ixBrowserProxyType}
+                    onChange={(event) => handleSettingsChange(
+                      'ixBrowserProxyType',
+                      event.target.value === 'socks5' ? 'socks5' : 'http',
+                    )}
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="socks5">SOCKS5</option>
+                  </select>
+                  <p className="sd-farm-settings-hint">
+                    Matches the auth-routing listener used during sync (HTTP or SOCKS5 port).
                   </p>
                 </div>
               </div>

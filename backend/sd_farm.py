@@ -355,6 +355,11 @@ def build_account_rows(
     return rows
 
 
+def normalize_ixbrowser_proxy_type(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    return "socks5" if value == "socks5" else "http"
+
+
 def _coerce_ixbrowser_profile_id(profile_id_value: Any) -> int:
     text = str(profile_id_value or "").strip()
     if not text:
@@ -372,13 +377,15 @@ def update_ixbrowser_profile_proxy(
     proxy_port: int,
     proxy_user: str,
     proxy_password: str,
+    *,
+    proxy_type: str = "http",
 ) -> Dict[str, Any]:
     profile_id_number = _coerce_ixbrowser_profile_id(profile_id_value)
     payload = {
         "profile_id": profile_id_number,
         "proxy_info": {
             "proxy_mode": 2,
-            "proxy_type": "http",
+            "proxy_type": normalize_ixbrowser_proxy_type(proxy_type),
             "proxy_ip": proxy_host,
             "proxy_port": int(proxy_port),
             "proxy_user": proxy_user,
