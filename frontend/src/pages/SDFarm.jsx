@@ -410,28 +410,50 @@ export default function SDFarm() {
     URL.revokeObjectURL(url);
   };
 
-  const exportRoutes = async (format = 'json') => {
+  const exportRoutes = async (format = 'json', uids = selectedUids) => {
+    if (!uids.length) {
+      toast({
+        title: 'Nothing selected',
+        message: 'Select accounts in the table to export their routes.',
+        variant: 'warning',
+      });
+      return;
+    }
     setBusy('export-routes');
     setError('');
     try {
-      const res = await fetch(`/api/sd-farm/export-routes?format=${encodeURIComponent(format)}`);
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Export failed');
-      }
+      const exportRows = rows.filter((row) => uids.includes(row.uid));
+      const routes = exportRows.map((row) => ({
+        uid: row.uid,
+        routeUsername: row.routeUsername || `sd_${row.uid}`,
+        name: row.name || '',
+      }));
       if (format === 'csv') {
-        downloadTextFile('sd-farm-routes.csv', await res.text(), 'text/csv');
+        const lines = ['uid,routeUsername,name'];
+        routes.forEach(({ uid, routeUsername, name }) => {
+          const escaped = String(name).replace(/"/g, '""');
+          lines.push(`${uid},${routeUsername},"${escaped}"`);
+        });
+        downloadTextFile('sd-farm-routes.csv', `${lines.join('\n')}\n`, 'text/csv');
       } else {
-        const data = await res.json();
         downloadTextFile(
           'sd-farm-routes.json',
-          `${JSON.stringify(data, null, 2)}\n`,
+          `${JSON.stringify(
+            {
+              version: 1,
+              exportedAt: new Date().toISOString(),
+              routeMapCount: routes.length,
+              routes,
+            },
+            null,
+            2,
+          )}\n`,
           'application/json',
         );
       }
       toast({
         title: 'Routes exported',
-        message: 'Copy this file to your other PC and use Import routes.',
+        message: `${routes.length} selected route${routes.length === 1 ? '' : 's'} exported. Import on your other PC.`,
         variant: 'success',
       });
     } catch (err) {
@@ -729,10 +751,10 @@ export default function SDFarm() {
               type="button"
               className="btn-outline"
               onClick={() => exportRoutes('json')}
-              disabled={Boolean(busy) || rows.length === 0}
+              disabled={Boolean(busy) || selectedUids.length === 0}
             >
               <span className="material-symbols-outlined">download</span>
-              Export routes
+              Export selected routes
             </button>
             <button
               type="button"
