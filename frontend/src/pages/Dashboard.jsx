@@ -1095,19 +1095,35 @@ export default function Dashboard() {
   };
 
   const exportAuthRoutes = async () => {
+    const targets = authRoutesList.filter((route) => selectedAuthRoutes.includes(route.username));
+    if (targets.length === 0) {
+      toast({
+        title: 'Nothing selected',
+        message: 'Select at least one route to export.',
+        variant: 'warning',
+      });
+      return;
+    }
     setError('');
     try {
       const res = await fetch('/api/export-auth-routes');
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to export auth routes');
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const selectedUsernames = new Set(targets.map((route) => route.username));
+      const exportPayload = {
+        ...data,
+        routes: (Array.isArray(data.routes) ? data.routes : []).filter((route) =>
+          selectedUsernames.has(route.username),
+        ),
+      };
+      const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
       anchor.download = 'portico-auth-routes.json';
       anchor.click();
       URL.revokeObjectURL(url);
-      const count = Array.isArray(data.routes) ? data.routes.length : 0;
+      const count = exportPayload.routes.length;
       toast({
         title: 'Export complete',
         message: `${count} auth ${count === 1 ? 'route' : 'routes'} exported.`,
@@ -1409,10 +1425,10 @@ export default function Dashboard() {
                 type="button"
                 className="btn-outline"
                 onClick={exportAuthRoutes}
-                disabled={authRoutesImportBusy}
+                disabled={authRoutesImportBusy || selectedAuthRoutes.length === 0}
               >
                 <span className="material-symbols-outlined">file_download</span>
-                Export
+                Export selected
               </button>
               <button
                 type="button"

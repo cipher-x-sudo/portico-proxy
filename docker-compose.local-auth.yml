@@ -57,8 +57,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - REDIS_STATE_KEY=portico:auth-routing-state
       - DATABASE_URL=postgresql://portico:portico@postgres:5432/portico
-      # WSL Docker + ixBrowser on Windows: set IXBROWSER_API_BASE to Windows host IP
-      # from WSL (grep nameserver /etc/resolv.conf), e.g. http://10.255.255.254:53200/api/v2/
+      # WSL Docker + ixBrowser on Windows: set IXBROWSER_WINDOWS_HOST to output of
+      #   ip route show default | awk '{print $3}'   (e.g. 172.19.128.1)
+      - IXBROWSER_WINDOWS_HOST=${IXBROWSER_WINDOWS_HOST:-}
       - IXBROWSER_API_BASE=${IXBROWSER_API_BASE:-http://host.docker.internal:53200/api/v2/}
       - IXBROWSER_PROXY_HOST=${IXBROWSER_PROXY_HOST:-127.0.0.1}
     volumes:
@@ -66,7 +67,8 @@ services:
       - ovpn_data:/ovpn
       - sd_farm_data:/data/sd-farm
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      # When IXBROWSER_WINDOWS_HOST is set, map host.docker.internal to Windows (WSL Docker).
+      - "host.docker.internal:${IXBROWSER_WINDOWS_HOST:-host-gateway}"
     ports:
       - "127.0.0.1:49999:49999"
       - "0.0.0.0:${AUTH_HTTP_PORT:-58680}:${AUTH_HTTP_PORT:-58680}"

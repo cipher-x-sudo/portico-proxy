@@ -229,6 +229,10 @@ class SDFarmTests(unittest.TestCase):
         ):
             self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "10.255.255.254")
 
+    def test_discover_wsl_windows_host_ip_uses_env_override(self):
+        with patch.dict(os.environ, {"IXBROWSER_WINDOWS_HOST": "172.19.128.1"}, clear=False):
+            self.assertEqual(sd_farm.discover_wsl_windows_host_ip(), "172.19.128.1")
+
     def test_ovpn_note_from_matched_path_strips_folder_and_extension(self):
         self.assertEqual(
             sd_farm.ovpn_note_from_matched_path("NC/NCVPN-US-NewYork-UDP.ovpn"),
