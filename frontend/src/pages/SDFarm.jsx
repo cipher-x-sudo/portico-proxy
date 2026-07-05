@@ -18,6 +18,8 @@ const filters = [
   { id: 'duplicate', label: 'Duplicates' },
 ];
 
+const activeSyncStatuses = new Set(['queued', 'running']);
+
 const defaultSettings = {
   sdFarmRoot: '',
   sdFarmSource: 'import',
@@ -69,6 +71,20 @@ function parseSearchQuery(raw) {
   return { mode: 'text', needle: (lines[0] || '').toLowerCase() };
 }
 
+function syncJobIsActive(job) {
+  return Boolean(job && activeSyncStatuses.has(job.status));
+}
+
+function formatElapsed(startedAt, endedAt = '') {
+  const started = Date.parse(startedAt || '');
+  if (!Number.isFinite(started)) return '0s';
+  const ended = endedAt ? Date.parse(endedAt) : Date.now();
+  const seconds = Math.max(0, Math.floor((ended - started) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes > 0 ? `${minutes}m ${remainder}s` : `${remainder}s`;
+}
+
 export default function SDFarm() {
   const toast = useToast();
   const folderInputRef = useRef(null);
@@ -88,9 +104,24 @@ export default function SDFarm() {
   const [importing, setImporting] = useState(false);
   const [ixTesting, setIxTesting] = useState(false);
   const [copiedToken, setCopiedToken] = useState('');
+  const [activeSyncJob, setActiveSyncJob] = useState(null);
+  const [syncJobHistory, setSyncJobHistory] = useState([]);
+  const [activeSyncTargetUids, setActiveSyncTargetUids] = useState([]);
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
+  const syncActive = syncJobIsActive(activeSyncJob);
+  const activeSyncResults = useMemo(() => {
+    const mapped = {};
+    (activeSyncJob?.results || []).forEach((item) => {
+      if (item?.uid) mapped[item.uid] = item;
+    });
+    return mapped;
+  }, [activeSyncJob]);
+  const displayedSyncResults = useMemo(() => ({
+    ...syncResults,
+    ...activeSyncResults,
+  }), [activeSyncResults, syncResults]);
   const categoryOptions = useMemo(() => {
     if (Array.isArray(payload?.categoryOptions)) return payload.categoryOptions;
     return Array.from(
@@ -159,6 +190,67 @@ export default function SDFarm() {
       setCategoryFilter('all');
     }
   }, [categoryFilter, categoryOptions]);
+
+  useEffect(() => {
+    if (!syncActive || !activeSyncJob?.id) return undefined;
+    let cancelled = false;
+    let completionHandled = false;
+
+    const mergeJobResults = (job) => {
+      const nextResults = {};
+      (job?.results || []).forEach((item) => {
+        if (item?.uid) nextResults[item.uid] = item;
+      });
+      if (Object.keys(nextResults).length) {
+        setSyncResults((current) => ({ ...current, ...nextResults }));
+      }
+    };
+
+    const handleTerminalJob = async (job) => {
+      if (completionHandled) return;
+      completionHandled = true;
+      mergeJobResults(job);
+      setSyncJobHistory((current) => [job, ...current.filter((item) => item.id !== job.id)].slice(0, 5));
+      setActiveSyncTargetUids([]);
+      const hasFailures = Number(job.failed || 0) > 0;
+      const isCancelled = job.status === 'cancelled';
+      const isFailed = job.status === 'failed';
+      toast({
+        title: isCancelled ? 'Sync cancelled' : isFailed ? 'Sync failed' : hasFailures ? 'Sync completed with errors' : 'Sync completed',
+        message: isFailed
+          ? (job.error || 'The sync job failed.')
+          : `${job.synced || 0} synced${hasFailures ? `, ${job.failed || 0} failed` : ''}${job.skipped ? `, ${job.skipped} skipped` : ''}.`,
+        variant: isFailed ? 'danger' : hasFailures || isCancelled ? 'warning' : 'success',
+      });
+      await loadAccounts();
+    };
+
+    const pollJob = async () => {
+      try {
+        const res = await fetch(`/api/sd-farm/sync-jobs/${encodeURIComponent(activeSyncJob.id)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to load sync progress');
+        if (cancelled) return;
+        const job = data.job || data;
+        setActiveSyncJob(job);
+        mergeJobResults(job);
+        if (!syncJobIsActive(job)) {
+          await handleTerminalJob(job);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message || 'Failed to load sync progress');
+        }
+      }
+    };
+
+    pollJob();
+    const timer = window.setInterval(pollJob, 800);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSyncJob?.id, loadAccounts, syncActive, toast]);
 
   const handleSettingsChange = (field, value) => {
     setSettings((current) => ({ ...current, [field]: value }));
@@ -398,14 +490,14 @@ export default function SDFarm() {
   };
 
   const syncAccounts = async (uids) => {
-    setBusy(uids.length === 1 ? uids[0] : 'sync');
+    const targetUids = Array.from(new Set((uids || []).map((uid) => String(uid || '').trim()).filter(Boolean)));
     setError('');
     try {
-      const res = await fetch('/api/sd-farm/sync', {
+      const res = await fetch('/api/sd-farm/sync-jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          uids,
+          uids: targetUids,
           proxyType: settings.ixBrowserProxyType,
         }),
       });
@@ -414,29 +506,52 @@ export default function SDFarm() {
       try {
         data = raw ? JSON.parse(raw) : {};
       } catch {
-        throw new Error(raw.slice(0, 160) || 'Sync failed: server returned non-JSON response');
+        throw new Error(raw.slice(0, 160) || 'Sync start failed: server returned non-JSON response');
       }
-      if (!res.ok && res.status !== 207) throw new Error(data.error || 'Sync failed');
-      const nextResults = {};
-      (data.results || []).forEach((item) => {
-        nextResults[item.uid] = item;
-      });
-      setSyncResults((current) => ({ ...current, ...nextResults }));
+      if (!res.ok) {
+        if (res.status === 409 && data.job) {
+          setActiveSyncJob(data.job);
+          toast({
+            title: 'Sync already running',
+            message: 'Showing the active sync job.',
+            variant: 'warning',
+          });
+          return;
+        }
+        throw new Error(data.error || 'Sync start failed');
+      }
+      const job = data.job || data;
+      setActiveSyncJob(job);
+      setActiveSyncTargetUids(targetUids);
       toast({
-        title: data.failed ? 'Sync completed with errors' : 'Sync completed',
-        message: `${data.synced || 0} synced${data.failed ? `, ${data.failed} failed` : ''}.`,
-        variant: data.failed ? 'warning' : 'success',
+        title: 'Sync started',
+        message: targetUids.length === 1 ? `Syncing ${targetUids[0]}.` : `Syncing ${targetUids.length} account${targetUids.length === 1 ? '' : 's'}.`,
+        variant: 'info',
       });
-      await loadAccounts();
     } catch (err) {
-      setError(err.message || 'Sync failed');
-      toast({ title: 'Sync failed', message: err.message || 'Sync failed', variant: 'danger' });
-    } finally {
-      setBusy('');
+      setError(err.message || 'Sync start failed');
+      toast({ title: 'Sync failed', message: err.message || 'Sync start failed', variant: 'danger' });
     }
   };
 
-  const copyCookiesValue = async (value, token) => {
+  const cancelSyncJob = async () => {
+    if (!activeSyncJob?.id || !syncActive) return;
+    setError('');
+    try {
+      const res = await fetch(`/api/sd-farm/sync-jobs/${encodeURIComponent(activeSyncJob.id)}/cancel`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Cancel failed');
+      setActiveSyncJob(data.job || activeSyncJob);
+      toast({ title: 'Cancelling sync', message: 'The sync will stop after the current account.', variant: 'warning' });
+    } catch (err) {
+      setError(err.message || 'Cancel failed');
+      toast({ title: 'Cancel failed', message: err.message || 'Cancel failed', variant: 'danger' });
+    }
+  };
+
+  const copyTableValue = async (value, token, label) => {
     const text = String(value || '').trim();
     if (!text) return;
     try {
@@ -445,9 +560,9 @@ export default function SDFarm() {
       window.setTimeout(() => {
         setCopiedToken((current) => (current === token ? '' : current));
       }, 1800);
-      toast({ title: 'Copied', message: 'Cookie copied to clipboard.', variant: 'success', duration: 1800 });
+      toast({ title: 'Copied', message: `${label} copied to clipboard.`, variant: 'success', duration: 1800 });
     } catch (err) {
-      toast({ title: 'Copy failed', message: err?.message || 'Could not copy cookie.', variant: 'danger' });
+      toast({ title: 'Copy failed', message: err?.message || `Could not copy ${label.toLowerCase()}.`, variant: 'danger' });
     }
   };
 
@@ -551,6 +666,22 @@ export default function SDFarm() {
     }
   };
 
+  const syncTotal = Number(activeSyncJob?.total || 0);
+  const syncCompleted = Number(activeSyncJob?.completed || 0);
+  const syncPercent = syncTotal > 0 ? Math.min(100, Math.round((syncCompleted / syncTotal) * 100)) : 0;
+  const syncStatusLabel = activeSyncJob?.status === 'running'
+    ? 'Syncing'
+    : activeSyncJob?.status === 'queued'
+      ? 'Queued'
+      : activeSyncJob?.status === 'completed'
+        ? Number(activeSyncJob?.failed || 0) > 0 ? 'Completed with errors' : 'Completed'
+        : activeSyncJob?.status === 'cancelled'
+          ? 'Cancelled'
+          : activeSyncJob?.status === 'failed'
+            ? 'Failed'
+            : '';
+  const recentSyncResults = (activeSyncJob?.results || []).slice(-6).reverse();
+
   if (loading && !payload) {
     return (
       <div className="loading-state">
@@ -637,7 +768,7 @@ export default function SDFarm() {
                   type="button"
                   className="btn-outline sd-farm-browse-btn"
                   onClick={handlePickFolder}
-                  disabled={Boolean(busy) || importing}
+                  disabled={Boolean(busy) || importing || syncActive}
                 >
                   <span className="material-symbols-outlined">folder_open</span>
                   Select folder
@@ -646,7 +777,7 @@ export default function SDFarm() {
                   type="button"
                   className="btn-outline sd-farm-browse-btn"
                   onClick={handlePickFolder}
-                  disabled={Boolean(busy) || importing || !settings.hasImportedDb}
+                  disabled={Boolean(busy) || importing || syncActive || !settings.hasImportedDb}
                 >
                   <span className="material-symbols-outlined">sync</span>
                   Re-import
@@ -678,7 +809,7 @@ export default function SDFarm() {
                   type="button"
                   className="btn-outline"
                   onClick={testIxBrowser}
-                  disabled={Boolean(busy) || ixTesting}
+                  disabled={Boolean(busy) || ixTesting || syncActive}
                 >
                   <span className="material-symbols-outlined">
                     {ixTesting ? 'progress_activity' : 'lan'}
@@ -772,7 +903,7 @@ export default function SDFarm() {
                 type="button"
                 className="btn-primary"
                 onClick={saveSettings}
-                disabled={Boolean(busy) || importing || !settingsDirty}
+                disabled={Boolean(busy) || importing || syncActive || !settingsDirty}
               >
                 <span className="material-symbols-outlined">save</span>
                 Save settings
@@ -811,7 +942,7 @@ export default function SDFarm() {
               type="button"
               className="btn-outline"
               onClick={() => routeImportInputRef.current?.click()}
-              disabled={Boolean(busy)}
+              disabled={Boolean(busy) || syncActive}
             >
               <span className="material-symbols-outlined">upload</span>
               Import routes
@@ -823,7 +954,7 @@ export default function SDFarm() {
               className="sd-farm-folder-input"
               onChange={handleRouteImportFile}
             />
-            <button type="button" className="btn-outline" onClick={previewSync} disabled={Boolean(busy)}>
+            <button type="button" className="btn-outline" onClick={previewSync} disabled={Boolean(busy) || syncActive}>
               <span className="material-symbols-outlined">rule</span>
               Preview
             </button>
@@ -831,19 +962,19 @@ export default function SDFarm() {
               type="button"
               className="btn-primary"
               onClick={() => syncAccounts(selectedUids)}
-              disabled={Boolean(busy) || selectedValidCount === 0}
+              disabled={Boolean(busy) || syncActive || selectedValidCount === 0}
             >
-              <span className="material-symbols-outlined">sync</span>
-              Sync selected
+              <span className="material-symbols-outlined">{syncActive ? 'progress_activity' : 'sync'}</span>
+              {syncActive ? 'Sync running' : 'Sync selected'}
             </button>
             <button
               type="button"
               className="btn-primary"
               onClick={() => syncAccounts(validRows.map((row) => row.uid))}
-              disabled={Boolean(busy) || validRows.length === 0}
+              disabled={Boolean(busy) || syncActive || validRows.length === 0}
             >
-              <span className="material-symbols-outlined">done_all</span>
-              Sync all
+              <span className="material-symbols-outlined">{syncActive ? 'progress_activity' : 'done_all'}</span>
+              {syncActive ? 'Sync running' : 'Sync all'}
             </button>
           </div>
         </div>
@@ -887,6 +1018,66 @@ export default function SDFarm() {
         </div>
       </section>
 
+      {activeSyncJob && (
+        <section className={`card sd-farm-sync-panel sd-farm-sync-panel-${activeSyncJob.status || 'idle'}`}>
+          <div className="sd-farm-sync-header">
+            <div className="sd-farm-sync-title">
+              <span className="material-symbols-outlined">
+                {syncActive ? 'sync' : activeSyncJob.status === 'failed' ? 'error' : 'task_alt'}
+              </span>
+              <div>
+                <h3>{syncStatusLabel || 'Sync status'}</h3>
+                <p>
+                  {syncActive && activeSyncJob.currentUid
+                    ? `${activeSyncJob.currentName || 'Account'} (${activeSyncJob.currentUid})`
+                    : `${syncCompleted} / ${syncTotal} account${syncTotal === 1 ? '' : 's'}`}
+                </p>
+              </div>
+            </div>
+            <div className="sd-farm-sync-actions">
+              <span className="sd-farm-sync-elapsed">
+                {formatElapsed(activeSyncJob.startedAt, activeSyncJob.finishedAt)}
+              </span>
+              {syncActive && (
+                <button type="button" className="btn-outline" onClick={cancelSyncJob}>
+                  <span className="material-symbols-outlined">stop_circle</span>
+                  Cancel
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="sd-farm-sync-progress" aria-label={`Sync progress ${syncPercent}%`}>
+            <span style={{ width: `${syncPercent}%` }} />
+          </div>
+          <div className="sd-farm-sync-stats">
+            <span><strong>{syncCompleted}</strong> done</span>
+            <span><strong>{activeSyncJob.synced || 0}</strong> synced</span>
+            <span><strong>{activeSyncJob.failed || 0}</strong> failed</span>
+            <span><strong>{activeSyncJob.skipped || 0}</strong> skipped</span>
+            {activeSyncJob.proxyPort ? (
+              <span>{String(activeSyncJob.proxyType || '').toUpperCase()} {activeSyncJob.proxyHost}:{activeSyncJob.proxyPort}</span>
+            ) : null}
+          </div>
+          {activeSyncJob.error && <p className="sd-farm-sync-error">{activeSyncJob.error}</p>}
+          {recentSyncResults.length > 0 && (
+            <div className="sd-farm-sync-results">
+              {recentSyncResults.map((item) => (
+                <div key={`${item.uid}-${item.ok ? 'ok' : 'err'}`} className={`sd-farm-sync-result ${item.ok ? 'ok' : 'error'}`}>
+                  <span className="material-symbols-outlined">{item.ok ? 'check_circle' : 'error'}</span>
+                  <strong>{item.name || item.uid || 'Account'}</strong>
+                  <small>{item.ok ? item.routeUsername || 'Synced' : item.error || 'Failed'}</small>
+                </div>
+              ))}
+            </div>
+          )}
+          {!syncActive && syncJobHistory.length > 1 && (
+            <p className="sd-farm-sync-history">
+              Last sync kept here; {syncJobHistory.length - 1} earlier result{syncJobHistory.length === 2 ? '' : 's'} available in this session.
+            </p>
+          )}
+        </section>
+      )}
+
       <section className="card p-0 overflow-hidden">
         <div className="table-header">
           <div className="flex items-center gap-2">
@@ -924,10 +1115,29 @@ export default function SDFarm() {
             </thead>
             <tbody>
               {filteredRows.map((row) => {
-                const result = syncResults[row.uid];
-                const badgeClass = result ? (result.ok ? 'success' : 'danger') : statusClass(row);
+                const activeResult = activeSyncResults[row.uid];
+                const isSyncTarget = syncActive && activeSyncTargetUids.includes(row.uid);
+                const isCurrentSyncRow = syncActive && activeSyncJob?.currentUid === row.uid;
+                const result = isSyncTarget ? activeResult : displayedSyncResults[row.uid];
+                const isPendingSyncRow = isSyncTarget && !activeResult && !isCurrentSyncRow;
+                const badgeClass = isCurrentSyncRow || isPendingSyncRow
+                  ? 'warning'
+                  : result ? (result.ok ? 'success' : 'danger') : statusClass(row);
+                const statusLabel = isCurrentSyncRow
+                  ? 'Syncing'
+                  : isPendingSyncRow
+                    ? 'Pending'
+                    : result ? (result.ok ? 'Synced' : 'Failed') : row.valid ? 'Ready' : 'Warning';
+                const statusMessage = isCurrentSyncRow
+                  ? 'Updating ixBrowser profile...'
+                  : isPendingSyncRow
+                    ? 'Waiting for sync'
+                    : result?.error || rowIssue(row);
                 return (
-                  <tr key={row.uid || `${row.name}-${row.openvpn}`}>
+                  <tr
+                    key={row.uid || `${row.name}-${row.openvpn}`}
+                    className={isCurrentSyncRow ? 'sd-farm-row-syncing' : isPendingSyncRow ? 'sd-farm-row-pending' : ''}
+                  >
                     <td className="sd-farm-check">
                       <input
                         type="checkbox"
@@ -937,18 +1147,58 @@ export default function SDFarm() {
                         aria-label={`Select ${row.uid}`}
                       />
                     </td>
-                    <td className="text-mono">{row.uid || '-'}</td>
+                    <td className="text-mono">
+                      {row.uid ? (
+                        <button
+                          type="button"
+                          className="sd-farm-copy-line text-mono"
+                          title={`Click to copy: ${row.uid}`}
+                          onClick={() => copyTableValue(row.uid, `uid-${row.uid}`, 'UID')}
+                        >
+                          <span className="sd-farm-copy-code">{row.uid}</span>
+                          {copiedToken === `uid-${row.uid}` && (
+                            <span className="sd-farm-copy-toast">Copied</span>
+                          )}
+                        </button>
+                      ) : (
+                        '-'
+                      )}
+                    </td>
                     <td>{row.name || '-'}</td>
                     <td>{row.category || '-'}</td>
                     <td className="text-mono">
-                      <span className="sd-farm-table-token" title={row.password || ''}>
-                        {row.password || '-'}
-                      </span>
+                      {row.password ? (
+                        <button
+                          type="button"
+                          className="sd-farm-copy-line text-mono"
+                          title={`Click to copy: ${row.password}`}
+                          onClick={() => copyTableValue(row.password, `password-${row.uid}`, 'Password')}
+                        >
+                          <span className="sd-farm-copy-code">{row.password}</span>
+                          {copiedToken === `password-${row.uid}` && (
+                            <span className="sd-farm-copy-toast">Copied</span>
+                          )}
+                        </button>
+                      ) : (
+                        '-'
+                      )}
                     </td>
                     <td className="text-mono">
-                      <span className="sd-farm-table-token" title={row.twoFa || ''}>
-                        {row.twoFa || '-'}
-                      </span>
+                      {row.twoFa ? (
+                        <button
+                          type="button"
+                          className="sd-farm-copy-line text-mono"
+                          title={`Click to copy: ${row.twoFa}`}
+                          onClick={() => copyTableValue(row.twoFa, `twofa-${row.uid}`, '2FA')}
+                        >
+                          <span className="sd-farm-copy-code">{row.twoFa}</span>
+                          {copiedToken === `twofa-${row.uid}` && (
+                            <span className="sd-farm-copy-toast">Copied</span>
+                          )}
+                        </button>
+                      ) : (
+                        '-'
+                      )}
                     </td>
                     <td>
                       {row.cookies ? (
@@ -956,7 +1206,7 @@ export default function SDFarm() {
                           type="button"
                           className="sd-farm-copy-line text-mono"
                           title={`Click to copy: ${row.cookies}`}
-                          onClick={() => copyCookiesValue(row.cookies, `cookies-${row.uid}`)}
+                          onClick={() => copyTableValue(row.cookies, `cookies-${row.uid}`, 'Cookie')}
                         >
                           <span className="sd-farm-copy-code">{cookiesLabel(row.cookies)}</span>
                           {copiedToken === `cookies-${row.uid}` && (
@@ -981,9 +1231,9 @@ export default function SDFarm() {
                     </td>
                     <td>
                       <span className={`sd-farm-status sd-farm-status-${badgeClass}`}>
-                        {result ? (result.ok ? 'Synced' : 'Failed') : row.valid ? 'Ready' : 'Warning'}
+                        {statusLabel}
                       </span>
-                      <p className="sd-farm-issue">{result?.error || rowIssue(row)}</p>
+                      <p className="sd-farm-issue">{statusMessage}</p>
                     </td>
                     <td className="sd-farm-action-col">
                       <button
@@ -991,10 +1241,10 @@ export default function SDFarm() {
                         className="icon-btn"
                         title="Sync account"
                         onClick={() => syncAccounts([row.uid])}
-                        disabled={!row.valid || Boolean(busy)}
+                        disabled={!row.valid || Boolean(busy) || syncActive}
                       >
                         <span className="material-symbols-outlined">
-                          {busy === row.uid ? 'progress_activity' : 'sync'}
+                          {isCurrentSyncRow ? 'progress_activity' : 'sync'}
                         </span>
                       </button>
                     </td>

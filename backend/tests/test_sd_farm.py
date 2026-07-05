@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -664,6 +665,140 @@ class SDFarmTests(unittest.TestCase):
 
 
 class SDFarmGatewaySyncTests(unittest.TestCase):
+    def _sync_job_state(self):
+        return {
+            "lock": threading.Lock(),
+            "auth_runtime_config": {},
+            "auth_http_port": 58680,
+            "auth_socks_port": 58681,
+            "auth_global_password": "secret",
+            "sd_farm_sync_jobs": {},
+        }
+
+    def _sync_payload(self, rows):
+        return {
+            "ixBrowserOk": True,
+            "ixBrowserError": "",
+            "rows": rows,
+        }
+
+    def _sync_row(self, uid, name="Ali Khan"):
+        return {
+            "uid": uid,
+            "name": name,
+            "valid": True,
+            "routeUsername": f"sd_{uid}",
+            "browserProfileId": uid,
+            "matchedOvpn": "NC/NCVPN-US-Phoenix-UDP.ovpn",
+        }
+
+    def _wait_for_job_status(self, state, job_id, statuses, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job, err, status = gateway._get_sd_farm_sync_job(state, job_id)
+            self.assertIsNone(err)
+            self.assertEqual(status, 200)
+            assert job is not None
+            if job["status"] in statuses:
+                return job
+            time.sleep(0.02)
+        self.fail(f"Timed out waiting for sync job {job_id} to reach {statuses}")
+
+    def test_sync_job_completes_and_reports_progress(self):
+        state = self._sync_job_state()
+        rows = [self._sync_row("111"), self._sync_row("222", "Two")]
+        with (
+            patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
+            patch.object(gateway, "_upsert_sd_farm_auth_routes", return_value=([], None, [])),
+            patch.object(gateway, "sync_ixbrowser_profile", return_value={"ok": True, "note": "Updated"}),
+        ):
+            job, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111", "222"], "proxyType": "http"})
+            self.assertIsNone(err)
+            self.assertEqual(status, 202)
+            assert job is not None
+            finished = self._wait_for_job_status(state, job["id"], {"completed"})
+
+        self.assertEqual(finished["total"], 2)
+        self.assertEqual(finished["completed"], 2)
+        self.assertEqual(finished["synced"], 2)
+        self.assertEqual(finished["failed"], 0)
+        self.assertEqual(len(finished["results"]), 2)
+
+    def test_sync_job_rejects_second_active_job(self):
+        state = self._sync_job_state()
+        release = threading.Event()
+
+        def slow_sync(*_args, **_kwargs):
+            release.wait(1.0)
+            return {"ok": True}
+
+        rows = [self._sync_row("111")]
+        with (
+            patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
+            patch.object(gateway, "_upsert_sd_farm_auth_routes", return_value=([], None, [])),
+            patch.object(gateway, "sync_ixbrowser_profile", side_effect=slow_sync),
+        ):
+            first, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111"]})
+            self.assertIsNone(err)
+            self.assertEqual(status, 202)
+            assert first is not None
+            second, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111"]})
+            self.assertEqual(status, 409)
+            self.assertEqual(err, "An SD Farm sync is already running")
+            self.assertEqual(second["activeJobId"], first["id"])
+            release.set()
+            self._wait_for_job_status(state, first["id"], {"completed"})
+
+    def test_sync_job_cancel_stops_between_accounts(self):
+        state = self._sync_job_state()
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def sync_side_effect(*_args, **_kwargs):
+            first_started.set()
+            release_first.wait(1.0)
+            return {"ok": True}
+
+        rows = [self._sync_row("111"), self._sync_row("222", "Two")]
+        with (
+            patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
+            patch.object(gateway, "_upsert_sd_farm_auth_routes", return_value=([], None, [])),
+            patch.object(gateway, "sync_ixbrowser_profile", side_effect=sync_side_effect),
+        ):
+            job, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111", "222"]})
+            self.assertIsNone(err)
+            self.assertEqual(status, 202)
+            assert job is not None
+            self.assertTrue(first_started.wait(1.0))
+            cancelled, err, status = gateway._cancel_sd_farm_sync_job(state, job["id"])
+            self.assertIsNone(err)
+            self.assertEqual(status, 200)
+            self.assertTrue(cancelled)
+            release_first.set()
+            finished = self._wait_for_job_status(state, job["id"], {"cancelled"})
+
+        self.assertEqual(finished["completed"], 1)
+        self.assertEqual(finished["synced"], 1)
+        self.assertEqual(len(finished["results"]), 1)
+
+    def test_sync_job_records_ixbrowser_profile_failure(self):
+        state = self._sync_job_state()
+        rows = [self._sync_row("111")]
+        with (
+            patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
+            patch.object(gateway, "_upsert_sd_farm_auth_routes", return_value=([], None, [])),
+            patch.object(gateway, "sync_ixbrowser_profile", side_effect=sd_farm.IXBrowserError("profile update failed")),
+        ):
+            job, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111"]})
+            self.assertIsNone(err)
+            self.assertEqual(status, 202)
+            assert job is not None
+            finished = self._wait_for_job_status(state, job["id"], {"completed"})
+
+        self.assertEqual(finished["synced"], 0)
+        self.assertEqual(finished["failed"], 1)
+        self.assertEqual(finished["results"][0]["error"], "profile update failed")
+
     def test_sd_farm_root_prefers_config_over_env(self):
         with patch.dict(
             "os.environ",

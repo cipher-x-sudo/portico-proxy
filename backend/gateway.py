@@ -112,6 +112,9 @@ _AUTO_WAN_IP_TTL_SEC = 600.0
 _AUTO_WAN_IP_FAIL_COOLDOWN_SEC = 45.0
 _EGRESS_PUBLIC_IP_TTL_SEC = 300.0
 _EGRESS_PUBLIC_IP_FAIL_COOLDOWN_SEC = 30.0
+SD_FARM_SYNC_JOB_TTL_SECONDS = 30 * 60
+SD_FARM_SYNC_ACTIVE_STATUSES = {"queued", "running"}
+SD_FARM_SYNC_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def _is_plain_ipv4(s: str) -> bool:
@@ -1446,6 +1449,303 @@ def _upsert_sd_farm_auth_routes(
         runtime["authRouting"] = auth_cfg
         state["auth_runtime_config"] = runtime
     return routes, None, sorted(set(changed_usernames))
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _sd_farm_sync_jobs(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    jobs = state.get("sd_farm_sync_jobs")
+    if not isinstance(jobs, dict):
+        jobs = {}
+        state["sd_farm_sync_jobs"] = jobs
+    return jobs
+
+
+def _public_sd_farm_sync_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    public_keys = (
+        "id",
+        "status",
+        "total",
+        "completed",
+        "synced",
+        "failed",
+        "skipped",
+        "currentUid",
+        "currentName",
+        "proxyHost",
+        "proxyPort",
+        "proxyType",
+        "startedAt",
+        "finishedAt",
+        "updatedAt",
+        "error",
+        "results",
+    )
+    payload = {key: job.get(key) for key in public_keys}
+    payload["results"] = [dict(item) for item in (job.get("results") or []) if isinstance(item, dict)]
+    return payload
+
+
+def _cleanup_sd_farm_sync_jobs_locked(state: Dict[str, Any], now: Optional[float] = None) -> None:
+    current_time = time.time() if now is None else now
+    jobs = _sd_farm_sync_jobs(state)
+    for job_id, job in list(jobs.items()):
+        status = str(job.get("status") or "")
+        finished_at_epoch = float(job.get("finishedAtEpoch") or 0.0)
+        if status in SD_FARM_SYNC_TERMINAL_STATUSES and finished_at_epoch:
+            if current_time - finished_at_epoch > SD_FARM_SYNC_JOB_TTL_SECONDS:
+                jobs.pop(job_id, None)
+
+
+def _active_sd_farm_sync_job_locked(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for job in _sd_farm_sync_jobs(state).values():
+        if str(job.get("status") or "") in SD_FARM_SYNC_ACTIVE_STATUSES:
+            return job
+    return None
+
+
+def _update_sd_farm_sync_job(
+    state: Dict[str, Any],
+    job_id: str,
+    **updates: Any,
+) -> Optional[Dict[str, Any]]:
+    with state["lock"]:
+        job = _sd_farm_sync_jobs(state).get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        job["updatedAt"] = _utc_timestamp()
+        return dict(job)
+
+
+def _finish_sd_farm_sync_job(
+    state: Dict[str, Any],
+    job_id: str,
+    status: str,
+    *,
+    error: str = "",
+) -> None:
+    now_iso = _utc_timestamp()
+    with state["lock"]:
+        job = _sd_farm_sync_jobs(state).get(job_id)
+        if not job:
+            return
+        job["status"] = status
+        job["currentUid"] = ""
+        job["currentName"] = ""
+        job["finishedAt"] = now_iso
+        job["finishedAtEpoch"] = time.time()
+        job["updatedAt"] = now_iso
+        if error:
+            job["error"] = error
+
+
+def _sd_farm_sync_job_cancel_requested(state: Dict[str, Any], job_id: str) -> bool:
+    with state["lock"]:
+        job = _sd_farm_sync_jobs(state).get(job_id)
+        return bool(job and job.get("cancelRequested"))
+
+
+def _run_sd_farm_sync_job(state: Dict[str, Any], job_id: str) -> None:
+    _update_sd_farm_sync_job(state, job_id, status="running")
+    with state["lock"]:
+        job = _sd_farm_sync_jobs(state).get(job_id)
+        selected_uids = set(job.get("selectedUids") or []) if job else set()
+        proxy_type = normalize_ixbrowser_proxy_type((job or {}).get("proxyType") or _ixbrowser_proxy_type_from_state(state))
+
+    try:
+        payload, err, status_code = _build_sd_farm_payload(state)
+        if err or payload is None:
+            _finish_sd_farm_sync_job(
+                state,
+                job_id,
+                "failed",
+                error=err or f"Could not build SD Farm sync data ({status_code})",
+            )
+            return
+        if not payload.get("ixBrowserOk"):
+            _finish_sd_farm_sync_job(
+                state,
+                job_id,
+                "failed",
+                error=payload.get("ixBrowserError") or "ixBrowser API is not available",
+            )
+            return
+
+        all_rows = list(payload.get("rows") or [])
+        rows = [
+            row
+            for row in all_rows
+            if row.get("valid") and (not selected_uids or str(row.get("uid") or "") in selected_uids)
+        ]
+        skipped = max(0, (len(selected_uids) if selected_uids else len(all_rows)) - len(rows))
+        proxy_host = _ixbrowser_proxy_host_from_state(state)
+        proxy_port = _sd_farm_proxy_port(state, proxy_type)
+        _update_sd_farm_sync_job(
+            state,
+            job_id,
+            total=len(rows),
+            skipped=skipped,
+            proxyHost=proxy_host,
+            proxyPort=proxy_port,
+            proxyType=proxy_type,
+        )
+        if not rows:
+            _finish_sd_farm_sync_job(state, job_id, "completed")
+            return
+
+        _routes, save_err, _changed = _upsert_sd_farm_auth_routes(state, rows, proxy_type=proxy_type)
+        if save_err:
+            _finish_sd_farm_sync_job(state, job_id, "failed", error=save_err)
+            return
+
+        ix_base = _ixbrowser_api_base_from_state(state)
+        proxy_password = str(state.get("auth_global_password") or "")
+        for row in rows:
+            if _sd_farm_sync_job_cancel_requested(state, job_id):
+                _finish_sd_farm_sync_job(state, job_id, "cancelled")
+                return
+            uid = str(row.get("uid") or "")
+            name = str(row.get("name") or "")
+            username = str(row.get("routeUsername") or route_username_for_uid(uid))
+            _update_sd_farm_sync_job(
+                state,
+                job_id,
+                currentUid=uid,
+                currentName=name,
+            )
+            result = {
+                "uid": uid,
+                "name": name,
+                "ok": False,
+                "routeUsername": username,
+                "browserProfileId": row.get("browserProfileId") or "",
+                "matchedOvpn": row.get("matchedOvpn") or "",
+                "note": "",
+                "error": "",
+            }
+            try:
+                sync_result = sync_ixbrowser_profile(
+                    ix_base,
+                    str(row.get("browserProfileId") or ""),
+                    proxy_host,
+                    proxy_port,
+                    username,
+                    proxy_password,
+                    str(row.get("matchedOvpn") or ""),
+                    proxy_type=proxy_type,
+                )
+                result["ok"] = True
+                result["note"] = sync_result.get("note") or ""
+            except IXBrowserError as e:
+                result["error"] = str(e)
+
+            with state["lock"]:
+                job = _sd_farm_sync_jobs(state).get(job_id)
+                if not job:
+                    return
+                job.setdefault("results", []).append(result)
+                job["completed"] = int(job.get("completed") or 0) + 1
+                if result.get("ok"):
+                    job["synced"] = int(job.get("synced") or 0) + 1
+                else:
+                    job["failed"] = int(job.get("failed") or 0) + 1
+                job["updatedAt"] = _utc_timestamp()
+
+        _finish_sd_farm_sync_job(state, job_id, "completed")
+    except Exception as e:
+        _finish_sd_farm_sync_job(state, job_id, "failed", error=str(e))
+
+
+def _start_sd_farm_sync_job(
+    state: Dict[str, Any],
+    body: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    selected_uids_raw = body.get("uids")
+    selected_uids = {
+        str(uid).strip()
+        for uid in selected_uids_raw
+        if str(uid).strip()
+    } if isinstance(selected_uids_raw, list) else set()
+    proxy_type = normalize_ixbrowser_proxy_type(
+        body.get("proxyType") or body.get("proxy_type") or _ixbrowser_proxy_type_from_state(state)
+    )
+    now_iso = _utc_timestamp()
+    job_id = secrets.token_urlsafe(12)
+    with state["lock"]:
+        _cleanup_sd_farm_sync_jobs_locked(state)
+        active_job = _active_sd_farm_sync_job_locked(state)
+        if active_job:
+            return {
+                "activeJobId": active_job.get("id"),
+                "job": _public_sd_farm_sync_job(active_job),
+            }, "An SD Farm sync is already running", 409
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "total": 0,
+            "completed": 0,
+            "synced": 0,
+            "failed": 0,
+            "skipped": 0,
+            "currentUid": "",
+            "currentName": "",
+            "proxyHost": "",
+            "proxyPort": 0,
+            "proxyType": proxy_type,
+            "startedAt": now_iso,
+            "finishedAt": "",
+            "finishedAtEpoch": 0.0,
+            "updatedAt": now_iso,
+            "error": "",
+            "results": [],
+            "selectedUids": sorted(selected_uids),
+            "cancelRequested": False,
+        }
+        _sd_farm_sync_jobs(state)[job_id] = job
+
+    threading.Thread(
+        target=_run_sd_farm_sync_job,
+        args=(state, job_id),
+        daemon=True,
+    ).start()
+    with state["lock"]:
+        return _public_sd_farm_sync_job(_sd_farm_sync_jobs(state)[job_id]), None, 202
+
+
+def _get_sd_farm_sync_job(
+    state: Dict[str, Any],
+    job_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    with state["lock"]:
+        _cleanup_sd_farm_sync_jobs_locked(state)
+        job = _sd_farm_sync_jobs(state).get(job_id)
+        if not job:
+            return None, "Sync job not found", 404
+        return _public_sd_farm_sync_job(job), None, 200
+
+
+def _cancel_sd_farm_sync_job(
+    state: Dict[str, Any],
+    job_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    now_iso = _utc_timestamp()
+    with state["lock"]:
+        job = _sd_farm_sync_jobs(state).get(job_id)
+        if not job:
+            return None, "Sync job not found", 404
+        status = str(job.get("status") or "")
+        if status in SD_FARM_SYNC_TERMINAL_STATUSES:
+            return _public_sd_farm_sync_job(job), None, 200
+        job["cancelRequested"] = True
+        job["updatedAt"] = now_iso
+        if status == "queued":
+            job["status"] = "cancelled"
+            job["finishedAt"] = now_iso
+            job["finishedAtEpoch"] = time.time()
+        return _public_sd_farm_sync_job(job), None, 200
 
 
 def apply_openvpn_auth_env(config: Dict[str, Any]) -> None:
@@ -4842,6 +5142,8 @@ def _control_api_handler_factory(
                 self._handle_get_sd_farm_ixbrowser_test(parsed.query)
             elif path == "/api/sd-farm/preview-sync":
                 self._handle_get_sd_farm_preview_sync()
+            elif path.startswith("/api/sd-farm/sync-jobs/"):
+                self._handle_get_sd_farm_sync_job(path)
             elif path == "/api/sd-farm/export-routes":
                 self._handle_get_sd_farm_export_routes(parsed.query)
             elif path == "/api/export-auth-routes":
@@ -6182,6 +6484,54 @@ def _control_api_handler_factory(
                 status=200 if ok else 207,
             )
 
+        def _handle_post_sd_farm_sync_job(self) -> None:
+            if not self._require_auth_routing():
+                return
+            body, body_err = self._read_json_body(1024 * 1024)
+            if body_err or body is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            job, err, status_code = _start_sd_farm_sync_job(state, body)
+            if err:
+                payload = {"error": err}
+                if job:
+                    payload.update(job)
+                self._send_json(payload, status=status_code)
+                return
+            self._send_json({"ok": True, "jobId": job.get("id") if job else "", "job": job}, status=status_code)
+
+        def _handle_get_sd_farm_sync_job(self, path: str) -> None:
+            if not self._require_auth_routing():
+                return
+            prefix = "/api/sd-farm/sync-jobs/"
+            job_id = urllib.parse.unquote(path[len(prefix):]).strip()
+            if not job_id or "/" in job_id:
+                self._send_error_body("Invalid sync job id", 400)
+                return
+            job, err, status_code = _get_sd_farm_sync_job(state, job_id)
+            if err or job is None:
+                self._send_error_body(err or "Sync job not found", status_code)
+                return
+            self._send_json({"ok": True, "job": job})
+
+        def _handle_post_sd_farm_sync_job_cancel(self, path: str) -> None:
+            if not self._require_auth_routing():
+                return
+            prefix = "/api/sd-farm/sync-jobs/"
+            suffix = "/cancel"
+            if not path.startswith(prefix) or not path.endswith(suffix):
+                self._send_error_body("Invalid sync job cancel path", 400)
+                return
+            job_id = urllib.parse.unquote(path[len(prefix):-len(suffix)]).strip()
+            if not job_id or "/" in job_id:
+                self._send_error_body("Invalid sync job id", 400)
+                return
+            job, err, status_code = _cancel_sd_farm_sync_job(state, job_id)
+            if err or job is None:
+                self._send_error_body(err or "Sync job not found", status_code)
+                return
+            self._send_json({"ok": True, "job": job})
+
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path.rstrip("/")
@@ -6245,6 +6595,10 @@ def _control_api_handler_factory(
                 self._handle_post_sd_farm_import()
             elif path == "/api/sd-farm/sync":
                 self._handle_post_sd_farm_sync()
+            elif path == "/api/sd-farm/sync-jobs":
+                self._handle_post_sd_farm_sync_job()
+            elif path.startswith("/api/sd-farm/sync-jobs/") and path.endswith("/cancel"):
+                self._handle_post_sd_farm_sync_job_cancel(path)
             elif path == "/api/sd-farm/import-routes":
                 self._handle_post_sd_farm_import_routes()
             else:
@@ -7507,6 +7861,7 @@ def main() -> int:
         "auth_global_password": _auth_global_password(config),
         "auth_http_port": auth_http_port,
         "auth_socks_port": auth_socks_port,
+        "sd_farm_sync_jobs": {},
         "auth_runtime_config": dict(config),
         "auth_route_state": {},
         "auth_route_error": {},
