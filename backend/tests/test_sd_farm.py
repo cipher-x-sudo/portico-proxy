@@ -625,7 +625,17 @@ class SDFarmTests(unittest.TestCase):
         self.assertEqual(calls[0]["payload"]["profile_id"], 99)
         self.assertEqual(calls[0]["payload"]["note"], "NCVPN-US-NewYork-UDP")
 
-    def test_sync_ixbrowser_profile_updates_proxy_and_note(self):
+    def test_free_ixbrowser_profiles_detects_case_insensitive_and_sorts_by_id(self):
+        profiles = [
+            {"profile_id": "20", "name": "Busy"},
+            {"profile_id": "9", "name": " free "},
+            {"profile_id": "3", "name": "FREE"},
+            {"profile_id": "12", "name": "Free"},
+        ]
+        free_profiles = sd_farm.free_ixbrowser_profiles(profiles)
+        self.assertEqual([sd_farm.profile_id(profile) for profile in free_profiles], ["3", "9", "12"])
+
+    def test_ixbrowser_update_name_group_sends_profile_update_payload(self):
         calls = []
 
         class FakeResponse:
@@ -639,8 +649,218 @@ class SDFarmTests(unittest.TestCase):
                 return json.dumps({"error": {"code": 0}, "data": True}).encode("utf-8")
 
         def fake_urlopen(req, timeout):
+            calls.append(
+                {
+                    "url": req.full_url,
+                    "payload": json.loads(req.data.decode("utf-8")),
+                }
+            )
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.update_ixbrowser_profile_name_group(
+                "http://127.0.0.1:53200/api/v2/",
+                "42",
+                "61587999084532",
+                group_id=1,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0]["url"], "http://127.0.0.1:53200/api/v2/profile-update")
+        self.assertEqual(calls[0]["payload"], {"profile_id": 42, "name": "61587999084532", "group_id": 1})
+
+    def test_claim_free_ixbrowser_profile_renames_and_verifies(self):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def profile_list_payload(items):
+            return {"error": {"code": 0}, "data": {"total": len(items), "data": items}}
+
+        profile_lists = [
+            [{"profile_id": 42, "name": "FREE", "group_id": 9}],
+            [{"profile_id": 42, "name": "61587999084532", "group_id": 1}],
+        ]
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(profile_list_payload(profile_lists.pop(0)))
+            calls.append(json.loads(req.data.decode("utf-8")))
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.claim_free_ixbrowser_profiles(
+                "http://127.0.0.1:53200/api/v2/",
+                ["61587999084532"],
+                group_id=1,
+            )
+
+        self.assertEqual(result["claimed"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["availableFree"], 1)
+        self.assertTrue(result["results"][0]["ok"])
+        self.assertEqual(calls[0]["profile_id"], 42)
+        self.assertEqual(calls[0]["name"], "61587999084532")
+        self.assertEqual(calls[0]["group_id"], 1)
+
+    def test_claim_free_ixbrowser_profile_reports_skipped_when_not_enough_free(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        profile_lists = [
+            [{"profile_id": 10, "name": "free", "group_id": 9}],
+            [{"profile_id": 10, "name": "111", "group_id": 1}],
+        ]
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                items = profile_lists.pop(0)
+                return FakeResponse({"error": {"code": 0}, "data": {"total": len(items), "data": items}})
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.claim_free_ixbrowser_profiles(
+                "http://127.0.0.1:53200/api/v2/",
+                ["111", "222"],
+            )
+
+        self.assertEqual(result["claimed"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["results"][1]["uid"], "222")
+        self.assertIn("No FREE", result["results"][1]["error"])
+
+    def test_claim_free_ixbrowser_profile_does_not_overwrite_existing_uid(self):
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                payload = {
+                    "error": {"code": 0},
+                    "data": {
+                        "total": 2,
+                        "data": [
+                            {"profile_id": 10, "name": "FREE", "group_id": 1},
+                            {"profile_id": 11, "name": "111", "group_id": 1},
+                        ],
+                    },
+                }
+                return json.dumps(payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
             calls.append(req.full_url)
             return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.claim_free_ixbrowser_profiles(
+                "http://127.0.0.1:53200/api/v2/",
+                ["111"],
+            )
+
+        self.assertEqual(result["claimed"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(calls, ["http://127.0.0.1:53200/api/v2/profile-list"])
+        self.assertIn("already exists", result["results"][0]["error"])
+
+    def test_claim_free_ixbrowser_profile_reports_verification_failure(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        profile_lists = [
+            [{"profile_id": 10, "name": "FREE", "group_id": 9}],
+            [{"profile_id": 10, "name": "FREE", "group_id": 9}],
+        ]
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                items = profile_lists.pop(0)
+                return FakeResponse({"error": {"code": 0}, "data": {"total": len(items), "data": items}})
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.claim_free_ixbrowser_profiles(
+                "http://127.0.0.1:53200/api/v2/",
+                ["111"],
+            )
+
+        self.assertEqual(result["claimed"], 0)
+        self.assertEqual(result["failed"], 1)
+        self.assertIn("did not apply profile claim", result["results"][0]["error"])
+
+    def test_sync_ixbrowser_profile_updates_proxy_and_note(self):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            calls.append(req.full_url)
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(
+                    {
+                        "error": {"code": 0},
+                        "data": {
+                            "total": 1,
+                            "data": [
+                                {
+                                    "profile_id": 99,
+                                    "proxy_type": "http",
+                                    "proxy_ip": "127.0.0.1",
+                                    "proxy_port": "58680",
+                                    "proxy_user": "sd_99",
+                                    "proxy_password": "secret",
+                                }
+                            ],
+                        },
+                    }
+                )
+            return FakeResponse({"error": {"code": 0}, "data": True})
 
         with patch("urllib.request.urlopen", fake_urlopen):
             result = sd_farm.sync_ixbrowser_profile(
@@ -654,14 +874,327 @@ class SDFarmTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
         self.assertEqual(result["note"], "NCVPN-US-NewYork-UDP")
+        self.assertEqual(result["expectedProxy"]["host"], "127.0.0.1")
+        self.assertEqual(result["actualProxy"]["port"], "58680")
         self.assertEqual(
             calls,
             [
                 "http://127.0.0.1:53200/api/v2/profile-update-proxy-for-custom-proxy",
                 "http://127.0.0.1:53200/api/v2/profile-update",
+                "http://127.0.0.1:53200/api/v2/profile-list",
             ],
         )
+
+    def test_sync_ixbrowser_profile_verifies_when_credentials_not_reported(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(
+                    {
+                        "error": {"code": 0},
+                        "data": {
+                            "total": 1,
+                            "data": [
+                                {
+                                    "profile_id": 99,
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "127.0.0.1",
+                                    "proxy_port": "9000",
+                                    "proxy_user": "",
+                                    "proxy_password": "",
+                                }
+                            ],
+                        },
+                    }
+                )
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.sync_ixbrowser_profile(
+                "http://127.0.0.1:53200/api/v2/",
+                "99",
+                "127.0.0.1",
+                9000,
+                "sd_61587415877389",
+                "secret",
+                "NC/NCVPN-US-NewYork-UDP.ovpn",
+                proxy_type="socks5",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["actualProxy"]["user"], "")
+
+    def test_sync_ixbrowser_profile_verifies_duplicate_profile_id_by_expected_name(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(
+                    {
+                        "error": {"code": 0},
+                        "data": {
+                            "total": 3,
+                            "data": [
+                                {
+                                    "profile_id": 515,
+                                    "name": "FREE",
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "159.223.178.13",
+                                    "proxy_port": "58007",
+                                },
+                                {
+                                    "profile_id": 515,
+                                    "name": "FREE",
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "159.223.178.13",
+                                    "proxy_port": "58508",
+                                },
+                                {
+                                    "profile_id": 515,
+                                    "name": "61587565209795",
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "127.0.0.1",
+                                    "proxy_port": "9000",
+                                },
+                            ],
+                        },
+                    }
+                )
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            result = sd_farm.sync_ixbrowser_profile(
+                "http://127.0.0.1:53200/api/v2/",
+                "515",
+                "127.0.0.1",
+                9000,
+                "sd_61587565209795",
+                "secret",
+                "NC/NCVPN-US-Ashburn-TCP.ovpn",
+                proxy_type="socks5",
+                expected_profile_name="61587565209795",
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["actualProxy"]["host"], "127.0.0.1")
+        self.assertEqual(result["verifiedProfileName"], "61587565209795")
+        self.assertEqual(result["duplicateProfileCount"], 3)
+
+    def test_select_ixbrowser_profile_for_verification_prefers_expected_name(self):
+        expected = sd_farm.expected_proxy_snapshot("socks5", "127.0.0.1", 9000, "sd_1", "secret")
+        profile, verified, error = sd_farm.select_ixbrowser_profile_for_verification(
+            [
+                {
+                    "profile_id": 515,
+                    "name": "FREE",
+                    "proxy_type": "socks5",
+                    "proxy_ip": "127.0.0.1",
+                    "proxy_port": "9000",
+                },
+                {
+                    "profile_id": 515,
+                    "name": "61587565209795",
+                    "proxy_type": "socks5",
+                    "proxy_ip": "127.0.0.1",
+                    "proxy_port": "9000",
+                },
+            ],
+            expected,
+            expected_profile_name="61587565209795",
+        )
+
+        self.assertTrue(verified)
+        self.assertEqual(error, "")
+        self.assertEqual(sd_farm.profile_name(profile), "61587565209795")
+
+    def test_sync_ixbrowser_profile_duplicate_profile_id_failure_mentions_duplicate_count(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(
+                    {
+                        "error": {"code": 0},
+                        "data": {
+                            "total": 2,
+                            "data": [
+                                {
+                                    "profile_id": 515,
+                                    "name": "FREE",
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "159.223.178.13",
+                                    "proxy_port": "58007",
+                                },
+                                {
+                                    "profile_id": 515,
+                                    "name": "FREE",
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "159.223.178.13",
+                                    "proxy_port": "58508",
+                                },
+                            ],
+                        },
+                    }
+                )
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(sd_farm.IXBrowserError) as ctx:
+                sd_farm.sync_ixbrowser_profile(
+                    "http://127.0.0.1:53200/api/v2/",
+                    "515",
+                    "127.0.0.1",
+                    9000,
+                    "sd_61587565209795",
+                    "secret",
+                    "NC/NCVPN-US-Ashburn-TCP.ovpn",
+                    proxy_type="socks5",
+                    expected_profile_name="61587565209795",
+                    verify_timeout=0,
+                )
+
+        self.assertIn("got socks5 159.223.178.13:58007", str(ctx.exception))
+        self.assertIn("returned 2 records", str(ctx.exception))
+
+    def test_sync_ixbrowser_profile_fails_when_reported_proxy_user_differs(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(
+                    {
+                        "error": {"code": 0},
+                        "data": {
+                            "total": 1,
+                            "data": [
+                                {
+                                    "profile_id": 99,
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "127.0.0.1",
+                                    "proxy_port": "9000",
+                                    "proxy_user": "other_user",
+                                }
+                            ],
+                        },
+                    }
+                )
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(sd_farm.IXBrowserError) as ctx:
+                sd_farm.sync_ixbrowser_profile(
+                    "http://127.0.0.1:53200/api/v2/",
+                    "99",
+                    "127.0.0.1",
+                    9000,
+                    "sd_61587415877389",
+                    "secret",
+                    "NC/NCVPN-US-NewYork-UDP.ovpn",
+                    proxy_type="socks5",
+                    verify_timeout=0,
+                )
+
+        self.assertIn("credential mismatch", str(ctx.exception))
+        self.assertIn("other_user", str(ctx.exception))
+
+    def test_sync_ixbrowser_profile_fails_when_proxy_not_applied(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(req, timeout):
+            if req.full_url.endswith("/profile-list"):
+                return FakeResponse(
+                    {
+                        "error": {"code": 0},
+                        "data": {
+                            "total": 1,
+                            "data": [
+                                {
+                                    "profile_id": 99,
+                                    "proxy_type": "socks5",
+                                    "proxy_ip": "159.223.178.13",
+                                    "proxy_port": "58007",
+                                }
+                            ],
+                        },
+                    }
+                )
+            return FakeResponse({"error": {"code": 0}, "data": True})
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(sd_farm.IXBrowserError) as ctx:
+                sd_farm.sync_ixbrowser_profile(
+                    "http://127.0.0.1:53200/api/v2/",
+                    "99",
+                    "127.0.0.1",
+                    9000,
+                    "sd_99",
+                    "secret",
+                    "NC/NCVPN-US-NewYork-UDP.ovpn",
+                    proxy_type="socks5",
+                    verify_timeout=0,
+                )
+
+        self.assertIn("expected socks5 127.0.0.1:9000", str(ctx.exception))
+        self.assertIn("got socks5 159.223.178.13:58007", str(ctx.exception))
 
 
 class SDFarmGatewaySyncTests(unittest.TestCase):
@@ -710,7 +1243,13 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
         with (
             patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
             patch.object(gateway, "_upsert_sd_farm_auth_routes", return_value=([], None, [])),
-            patch.object(gateway, "sync_ixbrowser_profile", return_value={"ok": True, "note": "Updated"}),
+            patch.object(gateway, "sync_ixbrowser_profile", return_value={
+                "ok": True,
+                "verified": True,
+                "note": "Updated",
+                "expectedProxy": {"type": "http", "host": "127.0.0.1", "port": "58680"},
+                "actualProxy": {"type": "http", "host": "127.0.0.1", "port": "58680"},
+            }),
         ):
             job, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111", "222"], "proxyType": "http"})
             self.assertIsNone(err)
@@ -723,6 +1262,8 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
         self.assertEqual(finished["synced"], 2)
         self.assertEqual(finished["failed"], 0)
         self.assertEqual(len(finished["results"]), 2)
+        self.assertTrue(finished["results"][0]["verified"])
+        self.assertEqual(finished["results"][0]["actualProxy"]["host"], "127.0.0.1")
 
     def test_sync_job_rejects_second_active_job(self):
         state = self._sync_job_state()
@@ -798,6 +1339,90 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
         self.assertEqual(finished["synced"], 0)
         self.assertEqual(finished["failed"], 1)
         self.assertEqual(finished["results"][0]["error"], "profile update failed")
+
+    def test_sync_job_counts_proxy_verification_failure_as_failed(self):
+        state = self._sync_job_state()
+        rows = [self._sync_row("111")]
+        with (
+            patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
+            patch.object(gateway, "_upsert_sd_farm_auth_routes", return_value=([], None, [])),
+            patch.object(
+                gateway,
+                "sync_ixbrowser_profile",
+                side_effect=sd_farm.IXBrowserError(
+                    "ixBrowser did not apply proxy: expected socks5 127.0.0.1:9000, got socks5 159.223.178.13:58007"
+                ),
+            ),
+        ):
+            job, err, status = gateway._start_sd_farm_sync_job(state, {"uids": ["111"], "proxyType": "socks5"})
+            self.assertIsNone(err)
+            self.assertEqual(status, 202)
+            assert job is not None
+            finished = self._wait_for_job_status(state, job["id"], {"completed"})
+
+        self.assertEqual(finished["synced"], 0)
+        self.assertEqual(finished["failed"], 1)
+        self.assertIn("did not apply proxy", finished["results"][0]["error"])
+
+    def test_claim_free_profiles_filters_to_missing_browser_rows_with_matched_ovpn(self):
+        state = self._sync_job_state()
+        rows = [
+            {
+                "uid": "111",
+                "browserStatus": "missing",
+                "matchedOvpn": "NC/NCVPN-US-Phoenix-UDP.ovpn",
+            },
+            {
+                "uid": "222",
+                "browserStatus": "matched",
+                "matchedOvpn": "NC/NCVPN-US-Phoenix-UDP.ovpn",
+            },
+            {
+                "uid": "333",
+                "browserStatus": "missing",
+                "matchedOvpn": "",
+            },
+        ]
+        with (
+            patch.object(gateway, "_build_sd_farm_payload", return_value=(self._sync_payload(rows), None, 200)),
+            patch.object(
+                gateway,
+                "claim_free_ixbrowser_profiles",
+                return_value={
+                    "ok": True,
+                    "claimed": 1,
+                    "failed": 0,
+                    "skipped": 0,
+                    "availableFree": 2,
+                    "results": [
+                        {
+                            "uid": "111",
+                            "ok": True,
+                            "skipped": False,
+                            "browserProfileId": "10",
+                            "freeProfileId": "10",
+                            "previousName": "FREE",
+                            "groupId": "1",
+                            "error": "",
+                        }
+                    ],
+                },
+            ) as claim_mock,
+        ):
+            result, err, status = gateway._claim_sd_farm_free_profiles(
+                state,
+                {"uids": ["111", "222", "333", "444"]},
+            )
+
+        self.assertIsNone(err)
+        self.assertEqual(status, 200)
+        assert result is not None
+        claim_mock.assert_called_once()
+        self.assertEqual(list(claim_mock.call_args.args[1]), ["111"])
+        self.assertEqual(result["claimed"], 1)
+        self.assertEqual(result["skipped"], 3)
+        self.assertIn("not a missing ixBrowser profile", result["results"][1]["error"])
+        self.assertIn("SD Farm row not found", result["results"][3]["error"])
 
     def test_sd_farm_root_prefers_config_over_env(self):
         with patch.dict(

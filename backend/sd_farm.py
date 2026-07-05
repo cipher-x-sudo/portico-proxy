@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -828,6 +829,45 @@ def profile_name(profile: Dict[str, Any]) -> str:
     return ""
 
 
+def fetch_ixbrowser_profile_by_id(base_url: str, profile_id_value: str) -> Dict[str, Any]:
+    target_id = str(_coerce_ixbrowser_profile_id(profile_id_value))
+    for profile in fetch_ixbrowser_profiles(base_url):
+        if profile_id(profile) == target_id:
+            return profile
+    raise IXBrowserError(f"ixBrowser profile not found after update: {target_id}")
+
+
+def fetch_ixbrowser_profiles_by_id(base_url: str, profile_id_value: str) -> List[Dict[str, Any]]:
+    target_id = str(_coerce_ixbrowser_profile_id(profile_id_value))
+    return [profile for profile in fetch_ixbrowser_profiles(base_url) if profile_id(profile) == target_id]
+
+
+def profile_group_id(profile: Dict[str, Any]) -> str:
+    for key in ("group_id", "groupId", "group"):
+        value = profile.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def is_free_ixbrowser_profile(profile: Dict[str, Any]) -> bool:
+    return profile_name(profile).casefold() == "free"
+
+
+def free_ixbrowser_profiles(profiles: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(profile: Dict[str, Any]) -> Tuple[int, str]:
+        raw_id = profile_id(profile)
+        try:
+            return int(raw_id), raw_id
+        except ValueError:
+            return 2**31 - 1, raw_id
+
+    return sorted(
+        [profile for profile in profiles if is_free_ixbrowser_profile(profile) and profile_id(profile)],
+        key=sort_key,
+    )
+
+
 def build_account_rows(
     accounts: Iterable[Dict[str, str]],
     allowed_ovpn_files: Iterable[str],
@@ -898,6 +938,141 @@ def normalize_ixbrowser_proxy_type(raw: Any) -> str:
     return "socks5" if value == "socks5" else "http"
 
 
+def proxy_summary(proxy_type: Any, proxy_host: Any, proxy_port: Any, proxy_user: Any = "") -> str:
+    proxy = {
+        "type": normalize_ixbrowser_proxy_type(proxy_type),
+        "host": str(proxy_host or "").strip(),
+        "port": str(proxy_port or "").strip(),
+        "user": str(proxy_user or "").strip(),
+    }
+    text = f"{proxy['type']} {proxy['host']}:{proxy['port']}"
+    return f"{text} as {proxy['user']}" if proxy["user"] else text
+
+
+def profile_proxy_snapshot(profile: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "type": normalize_ixbrowser_proxy_type(profile.get("proxy_type")),
+        "host": str(profile.get("proxy_ip") or "").strip(),
+        "port": str(profile.get("proxy_port") or "").strip(),
+        "user": str(profile.get("proxy_user") or "").strip(),
+        "password": str(profile.get("proxy_password") or "").strip(),
+    }
+
+
+def expected_proxy_snapshot(
+    proxy_type: str,
+    proxy_host: str,
+    proxy_port: int,
+    proxy_user: str,
+    proxy_password: str,
+) -> Dict[str, str]:
+    return {
+        "type": normalize_ixbrowser_proxy_type(proxy_type),
+        "host": str(proxy_host or "").strip(),
+        "port": str(int(proxy_port)),
+        "user": str(proxy_user or "").strip(),
+        "password": str(proxy_password or "").strip(),
+    }
+
+
+def verify_ixbrowser_profile_proxy(
+    profile: Dict[str, Any],
+    expected: Dict[str, str],
+) -> Tuple[bool, str]:
+    actual = profile_proxy_snapshot(profile)
+    mismatches: List[str] = []
+    for key in ("type", "host", "port"):
+        if actual.get(key) != expected.get(key):
+            mismatches.append(key)
+    for key in ("user", "password"):
+        # ixBrowser may omit or blank credentials in profile-list even after
+        # applying authenticated proxy settings. Only treat credentials as
+        # authoritative when ixBrowser reports a non-empty value.
+        if actual.get(key) and actual.get(key) != expected.get(key):
+            mismatches.append(key)
+    if not mismatches:
+        return True, ""
+    message_prefix = "ixBrowser proxy credential mismatch" if set(mismatches).issubset({"user", "password"}) else "ixBrowser did not apply proxy"
+    return (
+        False,
+        f"{message_prefix}: "
+        f"expected {proxy_summary(expected.get('type'), expected.get('host'), expected.get('port'), expected.get('user'))}, "
+        f"got {proxy_summary(actual.get('type'), actual.get('host'), actual.get('port'), actual.get('user'))}",
+    )
+
+
+def select_ixbrowser_profile_for_verification(
+    profiles: Iterable[Dict[str, Any]],
+    expected: Dict[str, str],
+    *,
+    expected_profile_name: str = "",
+) -> Tuple[Dict[str, Any], bool, str]:
+    candidates = [profile for profile in profiles if isinstance(profile, dict)]
+    if not candidates:
+        return {}, False, "ixBrowser profile not found after update"
+    expected_name = str(expected_profile_name or "").strip()
+    named_candidates = [profile for profile in candidates if expected_name and profile_name(profile) == expected_name]
+    ordered: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    for group in (named_candidates, candidates):
+        for profile in group:
+            marker = id(profile)
+            if marker not in seen:
+                seen.add(marker)
+                ordered.append(profile)
+
+    selected = ordered[0]
+    selected_error = ""
+    for profile in ordered:
+        verified, verify_error = verify_ixbrowser_profile_proxy(profile, expected)
+        if verified:
+            return profile, True, ""
+        if not selected_error:
+            selected = profile
+            selected_error = verify_error
+
+    duplicate_note = ""
+    if len(candidates) > 1:
+        duplicate_note = f" (ixBrowser returned {len(candidates)} records for profile_id {profile_id(candidates[0])})"
+    return selected, False, f"{selected_error}{duplicate_note}"
+
+
+def fetch_verified_ixbrowser_profile(
+    base_url: str,
+    profile_id_value: str,
+    expected: Dict[str, str],
+    *,
+    expected_profile_name: str = "",
+    verify_timeout: float = 5.0,
+    verify_interval: float = 0.35,
+) -> Tuple[Dict[str, Any], int]:
+    target_id = str(_coerce_ixbrowser_profile_id(profile_id_value))
+    deadline = time.monotonic() + max(0.0, float(verify_timeout or 0.0))
+    last_error = ""
+    last_profile: Dict[str, Any] = {}
+    last_count = 0
+    while True:
+        profiles = fetch_ixbrowser_profiles_by_id(base_url, target_id)
+        last_count = len(profiles)
+        profile, verified, verify_error = select_ixbrowser_profile_for_verification(
+            profiles,
+            expected,
+            expected_profile_name=expected_profile_name,
+        )
+        if profile:
+            last_profile = profile
+        if verified:
+            return profile, last_count
+        last_error = verify_error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(max(0.01, verify_interval), remaining))
+    if last_profile:
+        raise IXBrowserError(last_error or "ixBrowser did not apply proxy")
+    raise IXBrowserError(f"ixBrowser profile not found after update: {target_id}")
+
+
 def _coerce_ixbrowser_profile_id(profile_id_value: Any) -> int:
     text = str(profile_id_value or "").strip()
     if not text:
@@ -954,6 +1129,115 @@ def update_ixbrowser_profile_note(
     return {"ok": True, "response": _response_data(raw)}
 
 
+def update_ixbrowser_profile_name_group(
+    base_url: str,
+    profile_id_value: str,
+    name: str,
+    *,
+    group_id: int = 1,
+) -> Dict[str, Any]:
+    profile_id_number = _coerce_ixbrowser_profile_id(profile_id_value)
+    payload = {
+        "profile_id": profile_id_number,
+        "name": str(name or "").strip(),
+        "group_id": int(group_id),
+    }
+    raw = _json_post(base_url, "profile-update", payload)
+    return {"ok": True, "response": _response_data(raw)}
+
+
+def claim_free_ixbrowser_profiles(
+    base_url: str,
+    uids: Iterable[Any],
+    *,
+    group_id: int = 1,
+) -> Dict[str, Any]:
+    target_uids: List[str] = []
+    seen: set[str] = set()
+    for raw_uid in uids:
+        uid = str(raw_uid or "").strip()
+        if uid and uid not in seen:
+            seen.add(uid)
+            target_uids.append(uid)
+
+    profiles = fetch_ixbrowser_profiles(base_url)
+    free_profiles = free_ixbrowser_profiles(profiles)
+    initial_free_count = len(free_profiles)
+    existing_names = {profile_name(profile) for profile in profiles if profile_name(profile)}
+    results: List[Dict[str, Any]] = []
+
+    for uid in target_uids:
+        if uid in existing_names:
+            results.append(
+                {
+                    "uid": uid,
+                    "ok": False,
+                    "skipped": True,
+                    "freeProfileId": "",
+                    "browserProfileId": "",
+                    "previousName": "",
+                    "groupId": "",
+                    "error": "ixBrowser profile already exists for this UID",
+                }
+            )
+            continue
+        if not free_profiles:
+            results.append(
+                {
+                    "uid": uid,
+                    "ok": False,
+                    "skipped": True,
+                    "freeProfileId": "",
+                    "browserProfileId": "",
+                    "previousName": "",
+                    "groupId": "",
+                    "error": "No FREE ixBrowser profile available",
+                }
+            )
+            continue
+
+        free_profile = free_profiles.pop(0)
+        picked_id = profile_id(free_profile)
+        previous_name = profile_name(free_profile)
+        result = {
+            "uid": uid,
+            "ok": False,
+            "skipped": False,
+            "freeProfileId": picked_id,
+            "browserProfileId": picked_id,
+            "previousName": previous_name,
+            "groupId": "",
+            "error": "",
+        }
+        try:
+            update_ixbrowser_profile_name_group(base_url, picked_id, uid, group_id=group_id)
+            verified = fetch_ixbrowser_profile_by_id(base_url, picked_id)
+            actual_name = profile_name(verified)
+            actual_group = profile_group_id(verified)
+            result["groupId"] = actual_group
+            if actual_name != uid or actual_group != str(int(group_id)):
+                result["error"] = (
+                    "ixBrowser did not apply profile claim: "
+                    f"expected name {uid} group {int(group_id)}, "
+                    f"got name {actual_name or '-'} group {actual_group or '-'}"
+                )
+            else:
+                result["ok"] = True
+                existing_names.add(uid)
+        except IXBrowserError as e:
+            result["error"] = str(e)
+        results.append(result)
+
+    return {
+        "ok": all(item.get("ok") or item.get("skipped") for item in results),
+        "claimed": sum(1 for item in results if item.get("ok")),
+        "failed": sum(1 for item in results if not item.get("ok") and not item.get("skipped")),
+        "skipped": sum(1 for item in results if item.get("skipped")),
+        "availableFree": initial_free_count,
+        "results": results,
+    }
+
+
 def sync_ixbrowser_profile(
     base_url: str,
     profile_id_value: str,
@@ -964,7 +1248,11 @@ def sync_ixbrowser_profile(
     matched_ovpn: str,
     *,
     proxy_type: str = "http",
+    expected_profile_name: str = "",
+    verify_timeout: float = 5.0,
+    verify_interval: float = 0.35,
 ) -> Dict[str, Any]:
+    expected = expected_proxy_snapshot(proxy_type, proxy_host, proxy_port, proxy_user, proxy_password)
     update_ixbrowser_profile_proxy(
         base_url,
         profile_id_value,
@@ -976,4 +1264,21 @@ def sync_ixbrowser_profile(
     )
     note = ovpn_note_from_matched_path(matched_ovpn)
     update_ixbrowser_profile_note(base_url, profile_id_value, note)
-    return {"ok": True, "note": note}
+    profile, duplicate_count = fetch_verified_ixbrowser_profile(
+        base_url,
+        profile_id_value,
+        expected,
+        expected_profile_name=expected_profile_name,
+        verify_timeout=verify_timeout,
+        verify_interval=verify_interval,
+    )
+    actual = profile_proxy_snapshot(profile)
+    return {
+        "ok": True,
+        "note": note,
+        "verified": True,
+        "expectedProxy": expected,
+        "actualProxy": actual,
+        "verifiedProfileName": profile_name(profile),
+        "duplicateProfileCount": duplicate_count,
+    }

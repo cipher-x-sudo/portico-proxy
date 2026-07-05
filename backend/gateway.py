@@ -63,6 +63,7 @@ from sd_farm import (
     apply_route_map,
     browse_directory,
     build_account_rows as build_sd_farm_account_rows,
+    claim_free_ixbrowser_profiles,
     discover_accounts_db,
     export_route_map_csv,
     export_route_rows,
@@ -1620,10 +1621,13 @@ def _run_sd_farm_sync_job(state: Dict[str, Any], job_id: str) -> None:
                 "uid": uid,
                 "name": name,
                 "ok": False,
+                "verified": False,
                 "routeUsername": username,
                 "browserProfileId": row.get("browserProfileId") or "",
                 "matchedOvpn": row.get("matchedOvpn") or "",
                 "note": "",
+                "expectedProxy": {},
+                "actualProxy": {},
                 "error": "",
             }
             try:
@@ -1636,9 +1640,13 @@ def _run_sd_farm_sync_job(state: Dict[str, Any], job_id: str) -> None:
                     proxy_password,
                     str(row.get("matchedOvpn") or ""),
                     proxy_type=proxy_type,
+                    expected_profile_name=str(row.get("browserProfileName") or row.get("uid") or ""),
                 )
                 result["ok"] = True
+                result["verified"] = bool(sync_result.get("verified"))
                 result["note"] = sync_result.get("note") or ""
+                result["expectedProxy"] = sync_result.get("expectedProxy") or {}
+                result["actualProxy"] = sync_result.get("actualProxy") or {}
             except IXBrowserError as e:
                 result["error"] = str(e)
 
@@ -1746,6 +1754,92 @@ def _cancel_sd_farm_sync_job(
             job["finishedAt"] = now_iso
             job["finishedAtEpoch"] = time.time()
         return _public_sd_farm_sync_job(job), None, 200
+
+
+def _claim_sd_farm_free_profiles(
+    state: Dict[str, Any],
+    body: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    requested_raw = body.get("uids")
+    requested_uids: List[str] = []
+    seen: set[str] = set()
+    if isinstance(requested_raw, list):
+        for raw_uid in requested_raw:
+            uid = str(raw_uid or "").strip()
+            if uid and uid not in seen:
+                seen.add(uid)
+                requested_uids.append(uid)
+
+    payload, err, status_code = _build_sd_farm_payload(state)
+    if err or payload is None:
+        return None, err or "Could not build SD Farm account data", status_code
+    if not payload.get("ixBrowserOk"):
+        return None, payload.get("ixBrowserError") or "ixBrowser API is not available", 502
+
+    rows = [row for row in (payload.get("rows") or []) if isinstance(row, dict)]
+    rows_by_uid = {str(row.get("uid") or "").strip(): row for row in rows if str(row.get("uid") or "").strip()}
+    ordered_rows = [rows_by_uid[uid] for uid in requested_uids if uid in rows_by_uid] if requested_uids else rows
+    eligible_rows = [
+        row
+        for row in ordered_rows
+        if str(row.get("browserStatus") or "") == "missing" and bool(row.get("matchedOvpn"))
+    ]
+    eligible_uids = [str(row.get("uid") or "").strip() for row in eligible_rows if str(row.get("uid") or "").strip()]
+    eligible_uid_set = set(eligible_uids)
+
+    skipped_results: List[Dict[str, Any]] = []
+    if requested_uids:
+        for uid in requested_uids:
+            row = rows_by_uid.get(uid)
+            if row is None:
+                skipped_results.append(
+                    {
+                        "uid": uid,
+                        "ok": False,
+                        "skipped": True,
+                        "freeProfileId": "",
+                        "browserProfileId": "",
+                        "previousName": "",
+                        "groupId": "",
+                        "error": "SD Farm row not found",
+                    }
+                )
+            elif uid not in eligible_uid_set:
+                skipped_results.append(
+                    {
+                        "uid": uid,
+                        "ok": False,
+                        "skipped": True,
+                        "freeProfileId": "",
+                        "browserProfileId": "",
+                        "previousName": "",
+                        "groupId": "",
+                        "error": "Row is not a missing ixBrowser profile with matched OVPN",
+                    }
+                )
+
+    try:
+        claim_result = claim_free_ixbrowser_profiles(
+            _ixbrowser_api_base_from_state(state),
+            eligible_uids,
+            group_id=1,
+        )
+    except IXBrowserError as e:
+        return None, str(e), 502
+    results = list(claim_result.get("results") or []) + skipped_results
+    claimed = sum(1 for item in results if item.get("ok"))
+    failed = sum(1 for item in results if not item.get("ok") and not item.get("skipped"))
+    skipped = sum(1 for item in results if item.get("skipped"))
+    return {
+        "ok": failed == 0,
+        "claimed": claimed,
+        "failed": failed,
+        "skipped": skipped,
+        "availableFree": claim_result.get("availableFree") or 0,
+        "requested": len(requested_uids) if requested_uids else len(eligible_uids),
+        "eligible": len(eligible_uids),
+        "results": results,
+    }, None, 200 if failed == 0 else 207
 
 
 def apply_openvpn_auth_env(config: Dict[str, Any]) -> None:
@@ -6446,15 +6540,19 @@ def _control_api_handler_factory(
                         proxy_password,
                         str(row.get("matchedOvpn") or ""),
                         proxy_type=proxy_type,
+                        expected_profile_name=str(row.get("browserProfileName") or row.get("uid") or ""),
                     )
                     results.append(
                         {
                             "uid": row.get("uid") or "",
                             "ok": True,
+                            "verified": bool(sync_result.get("verified")),
                             "routeUsername": username,
                             "browserProfileId": row.get("browserProfileId") or "",
                             "matchedOvpn": row.get("matchedOvpn") or "",
                             "note": sync_result.get("note") or "",
+                            "expectedProxy": sync_result.get("expectedProxy") or {},
+                            "actualProxy": sync_result.get("actualProxy") or {},
                             "error": "",
                         }
                     )
@@ -6463,10 +6561,13 @@ def _control_api_handler_factory(
                         {
                             "uid": row.get("uid") or "",
                             "ok": False,
+                            "verified": False,
                             "routeUsername": username,
                             "browserProfileId": row.get("browserProfileId") or "",
                             "matchedOvpn": row.get("matchedOvpn") or "",
                             "note": "",
+                            "expectedProxy": {},
+                            "actualProxy": {},
                             "error": str(e),
                         }
                     )
@@ -6531,6 +6632,19 @@ def _control_api_handler_factory(
                 self._send_error_body(err or "Sync job not found", status_code)
                 return
             self._send_json({"ok": True, "job": job})
+
+        def _handle_post_sd_farm_claim_free_profiles(self) -> None:
+            if not self._require_auth_routing():
+                return
+            body, body_err = self._read_json_body(1024 * 1024)
+            if body_err or body is None:
+                self._send_error_body(body_err or "Invalid body", 400)
+                return
+            payload, err, status_code = _claim_sd_farm_free_profiles(state, body)
+            if err or payload is None:
+                self._send_error_body(err or "Could not claim FREE profiles", status_code)
+                return
+            self._send_json(payload, status=status_code)
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
@@ -6599,6 +6713,8 @@ def _control_api_handler_factory(
                 self._handle_post_sd_farm_sync_job()
             elif path.startswith("/api/sd-farm/sync-jobs/") and path.endswith("/cancel"):
                 self._handle_post_sd_farm_sync_job_cancel(path)
+            elif path == "/api/sd-farm/claim-free-profiles":
+                self._handle_post_sd_farm_claim_free_profiles()
             elif path == "/api/sd-farm/import-routes":
                 self._handle_post_sd_farm_import_routes()
             else:

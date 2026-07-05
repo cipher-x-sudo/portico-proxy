@@ -52,6 +52,10 @@ function rowIssue(row) {
   return warnings.length ? warnings.join('; ') : 'Ready';
 }
 
+function isClaimableFreeProfileRow(row) {
+  return row?.browserStatus === 'missing' && Boolean(row?.matchedOvpn);
+}
+
 function cookiesLabel(value) {
   const text = String(value || '').trim();
   if (!text) return '-';
@@ -85,6 +89,34 @@ function formatElapsed(startedAt, endedAt = '') {
   return minutes > 0 ? `${minutes}m ${remainder}s` : `${remainder}s`;
 }
 
+function proxyText(proxy) {
+  if (!proxy || typeof proxy !== 'object') return '';
+  const type = String(proxy.type || '').toUpperCase();
+  const host = String(proxy.host || '').trim();
+  const port = String(proxy.port || '').trim();
+  if (!host && !port) return '';
+  return `${type ? `${type} ` : ''}${host}${port ? `:${port}` : ''}`;
+}
+
+function syncResultMessage(result) {
+  if (!result) return '';
+  if (result.ok && result.verified) return 'Proxy verified';
+  const expected = proxyText(result.expectedProxy);
+  const actual = proxyText(result.actualProxy);
+  if (expected || actual) {
+    return `Expected ${expected || '-'}, got ${actual || '-'}`;
+  }
+  return result.error || '';
+}
+
+function claimResultMessage(result) {
+  if (!result) return '';
+  if (result.ok) {
+    return `Profile ${result.browserProfileId || result.freeProfileId || ''} claimed`.trim();
+  }
+  return result.error || (result.skipped ? 'Skipped' : 'Failed');
+}
+
 export default function SDFarm() {
   const toast = useToast();
   const folderInputRef = useRef(null);
@@ -107,6 +139,7 @@ export default function SDFarm() {
   const [activeSyncJob, setActiveSyncJob] = useState(null);
   const [syncJobHistory, setSyncJobHistory] = useState([]);
   const [activeSyncTargetUids, setActiveSyncTargetUids] = useState([]);
+  const [claimResults, setClaimResults] = useState(null);
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
@@ -452,6 +485,16 @@ export default function SDFarm() {
   const selectedValidCount = selectedUids.filter((uid) => validRows.some((row) => row.uid === uid)).length;
   const allVisibleValidSelected =
     visibleValidUids.length > 0 && visibleValidUids.every((uid) => selectedUids.includes(uid));
+  const rowsByUid = useMemo(() => {
+    const mapped = {};
+    rows.forEach((row) => {
+      if (row.uid) mapped[row.uid] = row;
+    });
+    return mapped;
+  }, [rows]);
+  const selectedClaimRows = selectedUids.map((uid) => rowsByUid[uid]).filter(isClaimableFreeProfileRow);
+  const visibleClaimRows = filteredRows.filter(isClaimableFreeProfileRow);
+  const claimCandidateRows = selectedClaimRows.length > 0 ? selectedClaimRows : visibleClaimRows;
 
   const toggleUid = (uid) => {
     setSelectedUids((current) =>
@@ -548,6 +591,50 @@ export default function SDFarm() {
     } catch (err) {
       setError(err.message || 'Cancel failed');
       toast({ title: 'Cancel failed', message: err.message || 'Cancel failed', variant: 'danger' });
+    }
+  };
+
+  const claimFreeProfiles = async () => {
+    const targetUids = claimCandidateRows.map((row) => String(row.uid || '').trim()).filter(Boolean);
+    if (!targetUids.length) {
+      toast({
+        title: 'Nothing to claim',
+        message: 'No visible missing-browser rows have matched OVPN files.',
+        variant: 'warning',
+      });
+      return;
+    }
+    setBusy('claim-free');
+    setError('');
+    try {
+      const res = await fetch('/api/sd-farm/claim-free-profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uids: targetUids }),
+      });
+      const raw = await res.text();
+      let data;
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(raw.slice(0, 160) || 'Claim failed: server returned non-JSON response');
+      }
+      if (!res.ok && res.status !== 207) throw new Error(data.error || 'Claim failed');
+      setClaimResults(data);
+      await loadAccounts();
+      const claimed = Number(data.claimed || 0);
+      const failed = Number(data.failed || 0);
+      const skipped = Number(data.skipped || 0);
+      toast({
+        title: claimed > 0 ? 'FREE profiles claimed' : 'No profiles claimed',
+        message: `${claimed} claimed, ${failed} failed, ${skipped} skipped.`,
+        variant: failed > 0 ? 'warning' : claimed > 0 ? 'success' : 'warning',
+      });
+    } catch (err) {
+      setError(err.message || 'Claim failed');
+      toast({ title: 'Claim failed', message: err.message || 'Claim failed', variant: 'danger' });
+    } finally {
+      setBusy('');
     }
   };
 
@@ -960,6 +1047,17 @@ export default function SDFarm() {
             </button>
             <button
               type="button"
+              className="btn-outline"
+              onClick={claimFreeProfiles}
+              disabled={Boolean(busy) || syncActive || claimCandidateRows.length === 0}
+            >
+              <span className="material-symbols-outlined">
+                {busy === 'claim-free' ? 'progress_activity' : 'drive_file_rename_outline'}
+              </span>
+              {busy === 'claim-free' ? 'Claiming FREE' : 'Claim FREE profiles'}
+            </button>
+            <button
+              type="button"
               className="btn-primary"
               onClick={() => syncAccounts(selectedUids)}
               disabled={Boolean(busy) || syncActive || selectedValidCount === 0}
@@ -1018,6 +1116,38 @@ export default function SDFarm() {
         </div>
       </section>
 
+      {claimResults && (
+        <section className="card sd-farm-claim-panel">
+          <div className="sd-farm-sync-header">
+            <div className="sd-farm-sync-title">
+              <span className="material-symbols-outlined">
+                {claimResults.failed > 0 ? 'warning' : claimResults.claimed > 0 ? 'task_alt' : 'info'}
+              </span>
+              <div>
+                <h3>FREE claim result</h3>
+                <p>
+                  {claimResults.claimed || 0} claimed / {claimResults.failed || 0} failed / {claimResults.skipped || 0} skipped / {claimResults.availableFree || 0} FREE found
+                </p>
+              </div>
+            </div>
+          </div>
+          {(claimResults.results || []).length > 0 && (
+            <div className="sd-farm-sync-results">
+              {(claimResults.results || []).slice(0, 8).map((item) => (
+                <div
+                  key={`${item.uid}-${item.browserProfileId || item.freeProfileId || item.error || 'result'}`}
+                  className={`sd-farm-sync-result ${item.ok ? 'ok' : 'error'}`}
+                >
+                  <span className="material-symbols-outlined">{item.ok ? 'task_alt' : item.skipped ? 'skip_next' : 'error'}</span>
+                  <strong>{item.uid || 'Account'}</strong>
+                  <small>{claimResultMessage(item)}</small>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
       {activeSyncJob && (
         <section className={`card sd-farm-sync-panel sd-farm-sync-panel-${activeSyncJob.status || 'idle'}`}>
           <div className="sd-farm-sync-header">
@@ -1063,9 +1193,9 @@ export default function SDFarm() {
             <div className="sd-farm-sync-results">
               {recentSyncResults.map((item) => (
                 <div key={`${item.uid}-${item.ok ? 'ok' : 'err'}`} className={`sd-farm-sync-result ${item.ok ? 'ok' : 'error'}`}>
-                  <span className="material-symbols-outlined">{item.ok ? 'check_circle' : 'error'}</span>
+                  <span className="material-symbols-outlined">{item.ok ? 'verified' : 'error'}</span>
                   <strong>{item.name || item.uid || 'Account'}</strong>
-                  <small>{item.ok ? item.routeUsername || 'Synced' : item.error || 'Failed'}</small>
+                  <small>{syncResultMessage(item) || item.routeUsername || 'Done'}</small>
                 </div>
               ))}
             </div>
@@ -1127,12 +1257,12 @@ export default function SDFarm() {
                   ? 'Syncing'
                   : isPendingSyncRow
                     ? 'Pending'
-                    : result ? (result.ok ? 'Synced' : 'Failed') : row.valid ? 'Ready' : 'Warning';
+                    : result ? (result.ok ? 'Verified' : 'Failed') : row.valid ? 'Ready' : 'Warning';
                 const statusMessage = isCurrentSyncRow
                   ? 'Updating ixBrowser profile...'
                   : isPendingSyncRow
                     ? 'Waiting for sync'
-                    : result?.error || rowIssue(row);
+                    : syncResultMessage(result) || rowIssue(row);
                 return (
                   <tr
                     key={row.uid || `${row.name}-${row.openvpn}`}
