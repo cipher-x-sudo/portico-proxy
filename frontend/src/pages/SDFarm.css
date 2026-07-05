@@ -402,6 +402,24 @@
   color: var(--primary-hover);
 }
 
+.sd-farm-category-select {
+  min-height: 2rem;
+  max-width: min(18rem, 100%);
+  padding: 0 2rem 0 0.7rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-md);
+  background: var(--control-bg);
+  color: var(--text-main);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.sd-farm-category-select:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
 .sd-farm-paths {
   display: flex;
   flex-wrap: wrap;
@@ -436,7 +454,16 @@
 }
 
 .sd-farm-table {
-  min-width: 90rem;
+  min-width: 112rem;
+}
+
+.sd-farm-table-token {
+  display: inline-block;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+  white-space: nowrap;
 }
 
 .sd-farm-copy-line {

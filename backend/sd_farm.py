@@ -15,6 +15,11 @@ DEFAULT_DB_RELATIVE_PATH = Path("DB") / "data" / "accounts.sqlite"
 IMPORTED_DB_PATH = Path("/data/sd-farm/accounts.sqlite")
 SD_FARM_IMPORT_MAX_BYTES = 64 * 1024 * 1024
 BASE_ACCOUNT_COLUMNS = ("UID", "Name", "OpenVPN", "Proxy", "Status", "Current_Status")
+EXTRA_ACCOUNT_COLUMN_ALIASES = {
+    "Category": ("Category", "category"),
+    "Password": ("Password", "password"),
+    "TwoFA": ("TwoFA", "twofa", "Two_Factor", "two_factor", "2FA", "2fa"),
+}
 COOKIES_COLUMN_ALIASES = (
     "Cookie",
     "cookie",
@@ -26,7 +31,7 @@ COOKIES_COLUMN_ALIASES = (
     "CookiesPath",
     "cookies_path",
 )
-ACCOUNT_COLUMNS = BASE_ACCOUNT_COLUMNS + ("Cookies",)
+ACCOUNT_COLUMNS = BASE_ACCOUNT_COLUMNS + tuple(EXTRA_ACCOUNT_COLUMN_ALIASES) + ("Cookies",)
 
 
 def _table_column_names(conn: sqlite3.Connection) -> Tuple[str, ...]:
@@ -77,6 +82,10 @@ def account_columns_for_table(conn: sqlite3.Connection) -> Tuple[str, ...]:
     cols: List[str] = []
     for col in BASE_ACCOUNT_COLUMNS:
         resolved = _find_column_by_aliases(existing_set, (col,))
+        if resolved and resolved not in cols:
+            cols.append(resolved)
+    for aliases in EXTRA_ACCOUNT_COLUMN_ALIASES.values():
+        resolved = _find_column_by_aliases(existing_set, aliases)
         if resolved and resolved not in cols:
             cols.append(resolved)
     cookies_col = _find_cookies_column(existing_set)
@@ -856,10 +865,16 @@ def build_account_rows(
         route_username = route_username_for_uid(uid)
         valid = bool(uid and matched_ovpn and len(matches) == 1)
         cookies = account_field(account, *COOKIES_COLUMN_ALIASES)
+        category = account_field(account, *EXTRA_ACCOUNT_COLUMN_ALIASES["Category"])
+        password = account_field(account, *EXTRA_ACCOUNT_COLUMN_ALIASES["Password"])
+        two_fa = account_field(account, *EXTRA_ACCOUNT_COLUMN_ALIASES["TwoFA"])
         rows.append(
             {
                 "uid": uid,
                 "name": name,
+                "category": category,
+                "password": password,
+                "twoFa": two_fa,
                 "cookies": cookies,
                 "openvpn": openvpn,
                 "proxy": account.get("Proxy") or "",

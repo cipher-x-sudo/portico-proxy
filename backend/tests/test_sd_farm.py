@@ -190,6 +190,66 @@ class SDFarmTests(unittest.TestCase):
             self.assertEqual(rows[0]["cookies"], r"D:\SD Farm\Cookies\61569750060983.json")
             self.assertEqual(built[0]["cookies"], r"D:\SD Farm\Cookies\61569750060983.json")
 
+    def test_loads_category_password_and_twofa_columns_when_present(self):
+        with TemporaryDirectory() as tmp:
+            db = Path(tmp) / "accounts.sqlite"
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE accounts (
+                        Current_Status TEXT,
+                        Name TEXT,
+                        UID TEXT PRIMARY KEY,
+                        Status TEXT,
+                        Proxy TEXT,
+                        OpenVPN TEXT,
+                        Category TEXT,
+                        Password TEXT,
+                        TwoFA TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO accounts
+                        (UID, Name, OpenVPN, Proxy, Status, Current_Status, Category, Password, TwoFA)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "100009548499800",
+                        "Junaid Zafar",
+                        "NCVPN-US-Phoenix-UDP",
+                        "",
+                        "Live",
+                        "Success",
+                        "eman",
+                        "pass123",
+                        "ABC DEF",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            rows = sd_farm.load_accounts(db)
+            built = sd_farm.build_account_rows(rows, [], [])
+            self.assertEqual(rows[0]["Category"], "eman")
+            self.assertEqual(rows[0]["Password"], "pass123")
+            self.assertEqual(rows[0]["TwoFA"], "ABC DEF")
+            self.assertEqual(built[0]["category"], "eman")
+            self.assertEqual(built[0]["password"], "pass123")
+            self.assertEqual(built[0]["twoFa"], "ABC DEF")
+
+    def test_account_rows_include_empty_optional_fields_when_columns_absent(self):
+        accounts = [{"UID": "111", "Name": "One", "OpenVPN": "NCVPN-US-Phoenix-UDP"}]
+
+        rows = sd_farm.build_account_rows(accounts, [], [])
+
+        self.assertEqual(rows[0]["category"], "")
+        self.assertEqual(rows[0]["password"], "")
+        self.assertEqual(rows[0]["twoFa"], "")
+
     def test_browse_directory_lists_child_folders_and_db_hint(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -740,6 +800,65 @@ class SDFarmGatewaySyncTests(unittest.TestCase):
             self.assertEqual(payload["root"], r"D:\WORK\SD Farm")
             self.assertEqual(payload["sdFarmSource"], "import")
             self.assertEqual(payload["accountCount"], 1)
+
+    def test_build_payload_returns_sorted_category_options(self):
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "accounts.sqlite"
+            conn = sqlite3.connect(dest)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE accounts (
+                        Current_Status TEXT,
+                        Name TEXT,
+                        UID TEXT PRIMARY KEY,
+                        Status TEXT,
+                        Proxy TEXT,
+                        OpenVPN TEXT,
+                        Category TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO accounts (UID, Name, OpenVPN, Proxy, Status, Current_Status, Category)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("333", "Three", "NCVPN-US-Phoenix-UDP", "", "Live", "Success", "verified"),
+                        ("111", "One", "NCVPN-US-Phoenix-UDP", "", "Live", "Success", "buy account new"),
+                        ("222", "Two", "NCVPN-US-Phoenix-UDP", "", "Live", "Success", "Verified"),
+                        ("444", "Four", "NCVPN-US-Phoenix-UDP", "", "Live", "Success", ""),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            state = {
+                "lock": threading.Lock(),
+                "config_path": BACKEND_DIR / "openvpn-proxy-config.example.json",
+                "auth_runtime_config": {
+                    "sdFarmSource": "import",
+                    "sdFarmRoot": r"D:\WORK\SD Farm",
+                },
+                "use_docker": True,
+            }
+            with (
+                patch.object(sd_farm, "IMPORTED_DB_PATH", dest),
+                patch.object(gateway, "IMPORTED_DB_PATH", dest),
+                patch.object(gateway, "load_disk_config_expanded", return_value=({"locations": []}, None, 200)),
+                patch.object(gateway, "merge_expanded_locations_from_disk", side_effect=lambda cfg, _docker: cfg),
+                patch.object(gateway, "list_allowed_ovpn_files", return_value=[]),
+                patch.object(gateway, "_probe_ixbrowser", return_value={"ok": True, "ixBrowserApiBase": "http://127.0.0.1:53200/api/v2/", "ixBrowserError": "", "ixBrowserProfileCount": 0}),
+                patch.object(gateway, "fetch_ixbrowser_profiles", return_value=[]),
+            ):
+                payload, err, status = gateway._build_sd_farm_payload(state)
+
+            self.assertIsNone(err)
+            self.assertEqual(status, 200)
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertEqual(payload["categoryOptions"], ["buy account new", "Verified", "verified"])
 
     def test_upsert_updates_existing_external_id_route(self):
         state = {

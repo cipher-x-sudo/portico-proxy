@@ -78,6 +78,7 @@ export default function SDFarm() {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [filter, setFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState('all');
   const [query, setQuery] = useState('');
   const [selectedUids, setSelectedUids] = useState([]);
   const [syncResults, setSyncResults] = useState({});
@@ -90,6 +91,12 @@ export default function SDFarm() {
 
   const rows = useMemo(() => payload?.rows || [], [payload]);
   const validRows = useMemo(() => rows.filter((row) => row.valid), [rows]);
+  const categoryOptions = useMemo(() => {
+    if (Array.isArray(payload?.categoryOptions)) return payload.categoryOptions;
+    return Array.from(
+      new Set(rows.map((row) => String(row.category || '').trim()).filter(Boolean)),
+    ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }, [payload, rows]);
 
   const applySettingsPayload = useCallback((data) => {
     setSettings({
@@ -146,6 +153,12 @@ export default function SDFarm() {
     loadSettings();
     loadAccounts();
   }, [loadAccounts, loadSettings]);
+
+  useEffect(() => {
+    if (categoryFilter !== 'all' && !categoryOptions.includes(categoryFilter)) {
+      setCategoryFilter('all');
+    }
+  }, [categoryFilter, categoryOptions]);
 
   const handleSettingsChange = (field, value) => {
     setSettings((current) => ({ ...current, [field]: value }));
@@ -323,14 +336,25 @@ export default function SDFarm() {
       if (filter === 'missing' && row.browserStatus !== 'missing') return false;
       if (filter === 'ovpn' && row.ovpnStatus === 'matched') return false;
       if (filter === 'duplicate' && row.browserStatus !== 'duplicate' && row.ovpnStatus !== 'duplicate_ovpn') return false;
+      if (categoryFilter !== 'all' && String(row.category || '').trim() !== categoryFilter) return false;
       if (searchParsed.mode === 'bulkUid') {
         return searchParsed.uids.has(String(row.uid || '').trim());
       }
       if (!searchParsed.needle) return true;
-      return [row.uid, row.name, row.cookies, row.openvpn, row.browserProfileName, row.routeUsername]
+      return [
+        row.uid,
+        row.name,
+        row.category,
+        row.password,
+        row.twoFa,
+        row.cookies,
+        row.openvpn,
+        row.browserProfileName,
+        row.routeUsername,
+      ]
         .some((value) => String(value || '').toLowerCase().includes(searchParsed.needle));
     });
-  }, [filter, rows, searchParsed]);
+  }, [categoryFilter, filter, rows, searchParsed]);
 
   const visibleValidUids = filteredRows.filter((row) => row.valid).map((row) => row.uid);
   const selectedValidCount = selectedUids.filter((uid) => validRows.some((row) => row.uid === uid)).length;
@@ -834,6 +858,20 @@ export default function SDFarm() {
               {item.label}
             </button>
           ))}
+          <select
+            className="sd-farm-category-select"
+            value={categoryFilter}
+            onChange={(event) => setCategoryFilter(event.target.value)}
+            disabled={categoryOptions.length === 0}
+            aria-label="Filter by category"
+          >
+            <option value="all">All categories</option>
+            {categoryOptions.map((category) => (
+              <option key={category} value={category}>
+                {category}
+              </option>
+            ))}
+          </select>
           {searchParsed.mode === 'bulkUid' && (
             <span className="sd-farm-bulk-search-hint">
               Matching {searchParsed.uids.size} UIDs · {filteredRows.length} found
@@ -872,6 +910,9 @@ export default function SDFarm() {
                 </th>
                 <th>UID</th>
                 <th>Name</th>
+                <th>Category</th>
+                <th>Password</th>
+                <th>2FA</th>
                 <th>Cookies</th>
                 <th>SD Farm OVPN</th>
                 <th>Portico OVPN</th>
@@ -898,6 +939,17 @@ export default function SDFarm() {
                     </td>
                     <td className="text-mono">{row.uid || '-'}</td>
                     <td>{row.name || '-'}</td>
+                    <td>{row.category || '-'}</td>
+                    <td className="text-mono">
+                      <span className="sd-farm-table-token" title={row.password || ''}>
+                        {row.password || '-'}
+                      </span>
+                    </td>
+                    <td className="text-mono">
+                      <span className="sd-farm-table-token" title={row.twoFa || ''}>
+                        {row.twoFa || '-'}
+                      </span>
+                    </td>
                     <td>
                       {row.cookies ? (
                         <button
@@ -951,7 +1003,7 @@ export default function SDFarm() {
               })}
               {filteredRows.length === 0 && (
                 <tr>
-                  <td colSpan="10" className="sd-farm-empty">
+                  <td colSpan="13" className="sd-farm-empty">
                     No accounts match the current view.
                   </td>
                 </tr>

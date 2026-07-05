@@ -1352,6 +1352,14 @@ def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
     rows = build_sd_farm_account_rows(accounts, allowed_ovpn, profiles)
     apply_route_map(rows, _sd_farm_route_map_from_state(state))
     valid_count = sum(1 for row in rows if row.get("valid"))
+    category_options = sorted(
+        {
+            str(row.get("category") or "").strip()
+            for row in rows
+            if str(row.get("category") or "").strip()
+        },
+        key=lambda value: (value.casefold(), value),
+    )
     return {
         "root": root_label,
         "sdFarmSource": _sd_farm_source_from_state(state),
@@ -1365,6 +1373,7 @@ def _build_sd_farm_payload(state: Dict[str, Any]) -> Tuple[Optional[Dict[str, An
         "accountCount": len(rows),
         "validCount": valid_count,
         "warningCount": len(rows) - valid_count,
+        "categoryOptions": category_options,
         "rows": rows,
     }, None, 200
 
